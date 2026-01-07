@@ -1,0 +1,80 @@
+# Configuration for circle packing constructor evolution (n=26)
+max_iterations: 1000 # Increased iterations
+checkpoint_interval: 5
+log_level: "INFO"
+
+# LLM configuration
+llm:
+  api_base: "https://api.deepseek.com/v1"  # Or your LLM provider
+  models:
+    - name: "deepseek-chat"
+      weight: 1.0
+  # api_base: "https://api.cerebras.ai/v1"
+  temperature: 0.7
+  # top_p: 0.95
+  max_tokens: 8192
+  timeout: 600 
+
+# Prompt configuration
+prompt:
+  system_message: |
+    You are an expert coding theorist specializing in binary linear error-correcting codes.
+
+    Task:
+    - We fix a single target pair (n, k) over GF(2). Your job is to improve a constructor function that outputs a binary generator matrix G of shape (k, n).
+    - The objective is to maximize the minimum Hamming distance d of the linear code C = { mG : m in GF(2)^k }.
+
+    Hard constraints (must always hold):
+    - G must be a binary matrix with entries in {0,1}.
+    - G must have full rank k over GF(2) (i.e., define a valid [n,k] linear code).
+
+    Objective:
+    - Maximize d (the minimum Hamming weight among all non-zero codewords).
+    - Prefer deterministic constructions (no randomness at runtime). The code must be reproducible.
+
+    Useful insights / strategies:
+    - Systematic form G = [I_k | P] is allowed and often convenient, but non-systematic constructions are also allowed if they increase d.
+    - Consider structured P (circulant / quasi-cyclic / block designs), BCH-like patterns, or heuristic constructions that increase distance.
+    - Avoid low-weight codewords: design rows/columns to discourage small-weight linear combinations.
+    - Balance column weights; watch for repeated/near-dependent columns that can create small d.
+    - Keep the constructor explicit: directly output G (not a long search/optimization loop).
+
+    Output format:
+    - Implement construct_generator() that returns G as a numpy array of dtype uint8 with shape (10, 35).
+
+
+  num_top_programs: 3
+  use_template_stochasticity: true
+
+# Database configuration
+database:
+  population_size: 480  # Increased population for more diversity
+  archive_size: 72
+  num_islands: 16
+  elite_selection_ratio: 0.3
+  exploitation_ratio: 0.7
+
+# Evaluator configuration
+evaluator:
+  timeout: 60
+  cascade_evaluation: true
+  cascade_thresholds: [0.5, 0.75]
+  parallel_evaluations: 4
+  use_llm_feedback: false
+
+# Evolution settings
+diff_based_evolution: false  # Use full rewrites instead of diffs
+allow_full_rewrites: true    # Allow full rewrites for constructor functions
+
+
+# Evolution trace configuration
+
+evolution_trace:
+  enabled: true
+  format: "jsonl"
+  include_code: true
+  include_prompts: true
+  output_path: "/Users/boboyuyong/Library/CloudStorage/OneDrive-Personal/WorkSpace/AI4Coding/openevolve/traces/ecc_20_10.jsonl"
+  buffer_size: 10
+  compress: false
+
