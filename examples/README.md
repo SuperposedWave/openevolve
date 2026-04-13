@@ -259,6 +259,15 @@ cd examples/circle_packing
 python ../../openevolve-run.py initial_program.py evaluator.py --config config_phase_1.yaml
 ```
 
+#### [Binary Linear Code Feasibility Search](linear_code_binary_search/)
+**Task:** Construct small binary linear codes with target minimum distance via a systematic parity-check matrix  
+**Achievement:** Evolves only a priority heuristic while legality checks remain exact  
+**Key Lesson:** Shows how to combine fixed combinatorial search skeletons with LLM-evolved ranking functions  
+```bash
+cd examples/linear_code_binary_search
+python ../../openevolve-run.py initial_program.py evaluator.py --config config.yaml
+```
+
 ### 🔧 Algorithm Discovery
 
 #### [Signal Processing](signal_processing/)

@@ -1,0 +1,109 @@
+# Configuration for binary linear-code feasibility search
+# Override the target with environment variables before running:
+#   LINEAR_CODE_N=8 LINEAR_CODE_K=4 LINEAR_CODE_D=4 openevolve-run ...
+# Optional:
+#   LINEAR_CODE_RESTARTS=3
+max_iterations: 40
+checkpoint_interval: 10
+log_level: "INFO"
+random_seed: 123
+
+diff_based_evolution: true
+max_code_length: 12000
+
+# LLM configuration
+llm:
+  api_base: "https://api.deepseek.com/v1"  # Or your LLM provider
+  models:
+    - name: "deepseek-chat"
+      weight: 1.0
+  # api_base: "https://api.cerebras.ai/v1"
+  temperature: 0.7
+  # top_p: 0.95
+  max_tokens: 8192
+  timeout: 600 
+
+prompt:
+  system_message: |
+    Current target:
+    - n = 33
+    - k = 14
+    - d = 10
+    - r = n - k = 19
+
+    You are improving a static scoring function for a binary matrix construction problem.
+
+    We build a binary matrix in systematic form:
+
+      H = [P^T | I_r]
+
+    Here:
+    - `H` is a binary matrix of shape `r x n`
+    - `P^T` is the free part and has shape `r x k`
+    - `I_r` is fixed
+    - the search only chooses the `k` free columns in `P^T`
+
+    Goal:
+    choose free columns so that any `d - 1` columns of `H` are linearly independent.
+
+    You must improve this function only:
+
+      priority(column_mask: int, n: int, k: int, d: int) -> float
+
+    This is a FunSearch-style setup:
+    - your function scores each candidate column once
+    - the evaluator sorts all candidates by that score
+    - the fixed greedy skeleton scans that order and keeps every legal column it can add
+
+    Success criterion:
+    - best case: the greedy constructor successfully selects all `k` free columns
+    - otherwise: maximize how many legal free columns it can select
+
+    Rules:
+    - keep the same function signature
+    - do not use randomness
+    - do not import extra libraries
+    - do not reimplement legality checks
+    - do not try to construct the whole matrix directly
+
+    Useful heuristic ideas:
+    - avoid columns that are too sparse or too dense
+    - prefer balanced support across the `r` row positions
+    - reward bit patterns that look structurally useful but not overly repetitive
+    - prefer columns that are likely to remain compatible with many other columns later
+
+    Write simple, deterministic heuristic logic that ranks promising columns above weaker ones.
+  num_top_programs: 5
+  num_diverse_programs: 3
+  include_artifacts: true
+  max_artifact_bytes: 10240
+
+database:
+  population_size: 24
+  archive_size: 12
+  num_islands: 4
+  elite_selection_ratio: 0.2
+  exploration_ratio: 0.45
+  exploitation_ratio: 0.35
+  feature_dimensions: ["avg_progress", "constructed_columns"]
+  feature_bins: 6
+  migration_interval: 4
+  migration_rate: 0.25
+  similarity_threshold: 0.99
+
+
+diff_based_evolution: true
+allow_full_rewrites: false 
+
+evaluator:
+  timeout: 600
+  max_retries: 1
+  cascade_evaluation: false
+  parallel_evaluations: 4
+  use_llm_feedback: false
+  enable_artifacts: true
+
+# Stop as soon as a full valid construction is found.
+early_stopping_patience: -1
+convergence_threshold: 1.0
+early_stopping_metric: "combined_score"
