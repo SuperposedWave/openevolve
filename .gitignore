@@ -56,3 +56,6 @@ htmlcov/
 # For SR
 secrets.yaml
 problems
+
+# linear code binary search
+examples/linear_code_binary_search/batch_runs/

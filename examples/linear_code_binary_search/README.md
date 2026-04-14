@@ -32,14 +32,14 @@ The evaluator reads the target instance from environment variables:
 
 If you do not set them, the default target is `[8,4,4]_2`.
 
-The helper module also computes the exact best distance for the chosen `(n,k)` when the instance is small enough, so the artifacts show whether your requested `d` is optimal or too ambitious.
-
 ## Files
 
 - `initial_program.py`: baseline priority heuristic, with a single EVOLVE-BLOCK.
 - `search_core.py`: fixed legality checks, single-instance loader, greedy skeleton, and exact validation helpers.
 - `evaluator.py`: thin OpenEvolve adapter.
 - `config.yaml`: evolution config tuned for deterministic heuristic search.
+- `verify_distance.py`: prints the constructed `H`, the derived `G`, and the achieved `d`.
+- `run_batch.py`: sweeps many `(n,k,d)` instances from `Misc/ECCRecord.json` into separate output directories.
 
 ## Method
 
@@ -62,3 +62,23 @@ To inspect the baseline without running evolution:
 ```bash
 LINEAR_CODE_N=7 LINEAR_CODE_K=4 LINEAR_CODE_D=3 python initial_program.py
 ```
+
+To batch-run all valid `(n,k)` entries with `10 < n <= 20`, using `d = lower` from `Misc/ECCRecord.json`:
+
+```bash
+python run_batch.py \
+  --record Misc/ECCRecord.json \
+  --n-min 11 \
+  --n-max 20 \
+  --d-field lower \
+  --iterations 40 \
+  --output-root batch_runs
+```
+
+Each instance is written to its own directory such as `batch_runs/n18_k7_d7/`, including:
+
+- the OpenEvolve output,
+- `resolved_config.yaml`,
+- `run_metadata.json`,
+- `matrix_verification.txt`,
+- and root-level `summary.jsonl` / `summary.csv`.

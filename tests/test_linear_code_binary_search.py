@@ -33,6 +33,10 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
             EXAMPLE_DIR / "initial_program.py",
         )
         cls.evaluator = _load_module("linear_code_evaluator", EXAMPLE_DIR / "evaluator.py")
+        cls.run_batch = _load_module(
+            "linear_code_run_batch",
+            EXAMPLE_DIR / "run_batch.py",
+        )
 
     def test_initial_forbidden_matches_weight_threshold(self):
         """Systematic initialization should match the exact low-weight forbidden set."""
@@ -158,6 +162,54 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         second = self.evaluator.evaluate(program_path)
         self.assertEqual(first.metrics, second.metrics)
         self.assertEqual(first.artifacts, second.artifacts)
+
+    def test_load_tasks_from_record_filters_to_n_window_and_valid_k(self):
+        """Batch loading should keep only n_min <= n <= n_max and 1 <= k < n."""
+        tasks, skipped = self.run_batch.load_tasks_from_record(
+            EXAMPLE_DIR / "Misc" / "ECCRecord.json",
+            n_min=11,
+            n_max=5,
+            d_field="lower",
+        )
+        self.assertEqual(tasks, [])
+        self.assertEqual(skipped, [])
+
+        tasks, skipped = self.run_batch.load_tasks_from_record(
+            EXAMPLE_DIR / "Misc" / "ECCRecord.json",
+            n_min=11,
+            n_max=12,
+            d_field="lower",
+        )
+        self.assertTrue(tasks)
+        self.assertTrue(all(11 <= task.n <= 12 for task in tasks))
+        self.assertTrue(all(1 <= task.k < task.n for task in tasks))
+        self.assertTrue(skipped)
+        self.assertTrue(any(row["k"] == row["n"] for row in skipped))
+
+    def test_resolved_config_injects_current_target(self):
+        """Per-instance configs should rewrite the prompt header for the active instance."""
+        config_text = (EXAMPLE_DIR / "config.yaml").read_text()
+        task = self.run_batch.SweepTask(n=18, k=7, d=7, lower=7, upper=8)
+        resolved = self.run_batch.render_resolved_config(config_text, task)
+        self.assertIn("- n = 18", resolved)
+        self.assertIn("- k = 7", resolved)
+        self.assertIn("- d = 7", resolved)
+        self.assertIn("- r = n - k = 11", resolved)
+        self.assertNotIn("- n = 33", resolved)
+
+    def test_parse_verification_output_distinguishes_complete_and_partial(self):
+        """Verification parsing should classify complete and partial constructions."""
+        complete = self.run_batch.parse_verification_output("d_actual: 7\nH shape: 11 x 18\n")
+        partial = self.run_batch.parse_verification_output("d_partial: 9\nwarning: construction is incomplete\n")
+        self.assertEqual(complete["verification_status"], "complete")
+        self.assertEqual(complete["distance"], 7)
+        self.assertEqual(partial["verification_status"], "partial")
+        self.assertEqual(partial["distance"], 9)
+
+    def test_instance_name_is_stable_for_output_directories(self):
+        """Per-instance directories should be named by n/k/d and stay deterministic."""
+        task = self.run_batch.SweepTask(n=20, k=7, d=8, lower=8, upper=9)
+        self.assertEqual(task.instance_name, "n20_k7_d8")
 
 
 if __name__ == "__main__":
