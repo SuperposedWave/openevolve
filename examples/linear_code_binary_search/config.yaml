@@ -26,10 +26,10 @@ llm:
 prompt:
   system_message: |
     Current target:
-    - n = 33
-    - k = 15
-    - d = 9
-    - r = n - k = 1
+    - n = 50
+    - k = 20
+    - d = 13
+    - r = n - k = 30
 
     You are improving a static scoring function for a binary matrix construction problem.
 

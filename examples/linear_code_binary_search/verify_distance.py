@@ -11,6 +11,7 @@ from search_core import (
     best_restart_for_instance,
     generator_matrix_rows,
     instance_from_env,
+    make_instance,
     load_priority_function,
     parity_check_matrix_rows,
 )
@@ -31,11 +32,21 @@ def main() -> None:
         action="store_true",
         help="Disable progress bars.",
     )
+    parser.add_argument("--N", type=int, dest="n", help="Code length n.")
+    parser.add_argument("--K", type=int, dest="k", help="Code dimension k.")
+    parser.add_argument("--D", type=int, dest="d", help="Target minimum distance d.")
+    parser.add_argument("--restarts", type=int, help="Number of randomized restarts.")
     args = parser.parse_args()
 
     program_path = Path(args.program_path).resolve()
     priority_fn = load_priority_function(str(program_path))
-    instance = instance_from_env()
+    env_instance = instance_from_env()
+    instance = make_instance(
+        n=args.n if args.n is not None else env_instance.n,
+        k=args.k if args.k is not None else env_instance.k,
+        distance=args.d if args.d is not None else env_instance.target_distance,
+        restarts=args.restarts if args.restarts is not None else env_instance.restarts,
+    )
     attempt = best_restart_for_instance(
         instance,
         priority_fn,

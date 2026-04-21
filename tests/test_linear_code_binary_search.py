@@ -1,10 +1,14 @@
 """Tests for the binary linear-code feasibility example."""
 
 import importlib.util
+import io
 import json
+import os
 import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +40,10 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         cls.run_batch = _load_module(
             "linear_code_run_batch",
             EXAMPLE_DIR / "run_batch.py",
+        )
+        cls.verify_distance = _load_module(
+            "linear_code_verify_distance",
+            EXAMPLE_DIR / "verify_distance.py",
         )
 
     def test_initial_forbidden_matches_weight_threshold(self):
@@ -85,6 +93,8 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         result = self.search_core.evaluate_priority_function(self.initial_program.get_priority_function())
         self.assertGreater(result.metrics["combined_score"], 0.0)
         self.assertEqual(result.metrics["success_rate"], 1.0)
+        self.assertIn("evaluation_time_seconds", result.metrics)
+        self.assertGreaterEqual(result.metrics["evaluation_time_seconds"], 0.0)
 
         search_result = json.loads(result.artifacts["search_result"])
         selected = tuple(int(bits, 2) for bits in search_result["selected_free_columns"])
@@ -112,6 +122,119 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         self.assertEqual(first_order, second_order)
         self.assertEqual(first_scores, second_scores)
 
+    def test_streaming_candidate_path_matches_materialized_search_on_small_instance(self):
+        """Forced chunked processing should preserve exact greedy results on small instances."""
+        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=1)
+        priority_fn = self.initial_program.get_priority_function()
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LINEAR_CODE_FORCE_STREAMING", None)
+            baseline = self.search_core.best_restart_for_instance(instance, priority_fn)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LINEAR_CODE_FORCE_STREAMING": "1",
+                "LINEAR_CODE_CANDIDATE_CHUNK_SIZE": "3",
+            },
+            clear=False,
+        ):
+            streamed = self.search_core.best_restart_for_instance(instance, priority_fn)
+
+        self.assertEqual(streamed.success, baseline.success)
+        self.assertEqual(streamed.selected_free_columns, baseline.selected_free_columns)
+        self.assertEqual(streamed.added_free_columns, baseline.added_free_columns)
+        self.assertEqual(streamed.blocked_candidate_count, baseline.blocked_candidate_count)
+        self.assertEqual(streamed.chosen_weights, baseline.chosen_weights)
+        self.assertEqual(streamed.candidate_count, baseline.candidate_count)
+        self.assertEqual(streamed.sorted_scores[:10], baseline.sorted_scores[:10])
+
+    def test_process_scored_streaming_matches_baseline_on_small_instance(self):
+        """Optional process-based chunk scoring should preserve exact greedy results."""
+        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=1)
+        priority_fn = self.initial_program.get_priority_function()
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LINEAR_CODE_FORCE_STREAMING", None)
+            os.environ.pop("LINEAR_CODE_CANDIDATE_EXECUTOR", None)
+            baseline = self.search_core.best_restart_for_instance(instance, priority_fn)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LINEAR_CODE_FORCE_STREAMING": "1",
+                "LINEAR_CODE_CANDIDATE_CHUNK_SIZE": "3",
+                "LINEAR_CODE_CANDIDATE_EXECUTOR": "process",
+                "LINEAR_CODE_CANDIDATE_WORKERS": "2",
+                "LINEAR_CODE_PROFILE": "1",
+            },
+            clear=False,
+        ):
+            with mock.patch.object(self.search_core.logger, "info") as mock_info:
+                processed = self.search_core.best_restart_for_instance(instance, priority_fn)
+
+        self.assertEqual(processed.success, baseline.success)
+        self.assertEqual(processed.selected_free_columns, baseline.selected_free_columns)
+        self.assertEqual(processed.added_free_columns, baseline.added_free_columns)
+        self.assertEqual(processed.blocked_candidate_count, baseline.blocked_candidate_count)
+        self.assertEqual(processed.chosen_weights, baseline.chosen_weights)
+        self.assertEqual(processed.candidate_count, baseline.candidate_count)
+        self.assertEqual(processed.sorted_scores[:10], baseline.sorted_scores[:10])
+        profile_messages = [
+            call.args[0]
+            for call in mock_info.call_args_list
+            if call.args and "linear_code_profile" in call.args[0]
+        ]
+        self.assertTrue(
+            any(
+                "stage=candidate_scoring" in message and "executor_mode=process" in message
+                for message in profile_messages
+            )
+        )
+
+    def test_stage_profile_logging_is_disabled_by_default(self):
+        """Profiling logs should stay silent unless explicitly enabled."""
+        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=1)
+        priority_fn = self.initial_program.get_priority_function()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LINEAR_CODE_PROFILE", None)
+            with mock.patch.object(self.search_core.logger, "info") as mock_info:
+                self.search_core.evaluate_priority_function(priority_fn, instance)
+        profile_messages = [
+            call.args[0]
+            for call in mock_info.call_args_list
+            if call.args and "linear_code_profile" in call.args[0]
+        ]
+        self.assertEqual(profile_messages, [])
+
+    def test_stage_profile_logging_reports_major_search_phases(self):
+        """Opt-in profiling should log candidate generation, sorting, and greedy scan stages."""
+        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=1)
+        priority_fn = self.initial_program.get_priority_function()
+        with mock.patch.dict(os.environ, {"LINEAR_CODE_PROFILE": "1"}, clear=False):
+            with mock.patch.object(self.search_core.logger, "info") as mock_info:
+                self.search_core.evaluate_priority_function(priority_fn, instance)
+        profile_messages = [
+            call.args[0]
+            for call in mock_info.call_args_list
+            if call.args and "linear_code_profile" in call.args[0]
+        ]
+        self.assertTrue(
+            any("stage=candidate_generation" in message for message in profile_messages)
+        )
+        self.assertTrue(
+            any("stage=candidate_scoring" in message for message in profile_messages)
+        )
+        self.assertTrue(
+            any("stage=candidate_sort" in message for message in profile_messages)
+        )
+        self.assertTrue(
+            any("stage=greedy_scan" in message for message in profile_messages)
+        )
+        self.assertTrue(
+            any("stage=evaluation_summary" in message for message in profile_messages)
+        )
+
     def test_custom_instance_interface(self):
         """A caller should be able to set one custom (n, k, d) instance directly."""
         instance = self.search_core.make_instance(n=7, k=4, distance=3, restarts=2)
@@ -123,6 +246,8 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         self.assertEqual(result.metrics["k"], 4)
         self.assertEqual(result.metrics["target_distance"], 3)
         self.assertGreater(result.metrics["combined_score"], 0.0)
+        self.assertIn("evaluation_time_seconds", result.metrics)
+        self.assertGreaterEqual(result.metrics["evaluation_time_seconds"], 0.0)
         self.assertIn("top_ranked_columns", result.artifacts)
 
     def test_actual_minimum_distance_matches_target_for_valid_construction(self):
@@ -160,7 +285,19 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         program_path = str(EXAMPLE_DIR / "initial_program.py")
         first = self.evaluator.evaluate(program_path)
         second = self.evaluator.evaluate(program_path)
-        self.assertEqual(first.metrics, second.metrics)
+        self.assertIn("evaluation_time_seconds", first.metrics)
+        self.assertIn("evaluation_time_seconds", second.metrics)
+        comparable_first = {
+            key: value
+            for key, value in first.metrics.items()
+            if key != "evaluation_time_seconds"
+        }
+        comparable_second = {
+            key: value
+            for key, value in second.metrics.items()
+            if key != "evaluation_time_seconds"
+        }
+        self.assertEqual(comparable_first, comparable_second)
         self.assertEqual(first.artifacts, second.artifacts)
 
     def test_load_tasks_from_record_filters_to_n_window_and_valid_k(self):
@@ -210,6 +347,29 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         """Per-instance directories should be named by n/k/d and stay deterministic."""
         task = self.run_batch.SweepTask(n=20, k=7, d=8, lower=8, upper=9)
         self.assertEqual(task.instance_name, "n20_k7_d8")
+
+    def test_verify_distance_accepts_cli_instance_arguments(self):
+        """Verification CLI should accept --N/--K/--D to override instance values."""
+        program_path = str(EXAMPLE_DIR / "initial_program.py")
+        stdout = io.StringIO()
+        argv = [
+            "verify_distance.py",
+            program_path,
+            "--no-progress",
+            "--N",
+            "7",
+            "--K",
+            "4",
+            "--D",
+            "3",
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            with redirect_stdout(stdout):
+                self.verify_distance.main()
+        output = stdout.getvalue()
+        self.assertIn('"n": 7', output)
+        self.assertIn('"k": 4', output)
+        self.assertIn('"d_target": 3', output)
 
 
 if __name__ == "__main__":
