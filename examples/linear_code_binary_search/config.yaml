@@ -95,7 +95,7 @@ database:
 allow_full_rewrites: false 
 
 evaluator:
-  timeout: 600
+  timeout: 2400
   max_retries: 1
   cascade_evaluation: false
   parallel_evaluations: 4

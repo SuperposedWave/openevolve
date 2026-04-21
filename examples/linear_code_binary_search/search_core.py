@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import json
 import math
@@ -101,6 +102,28 @@ DEFAULT_INSTANCE = BenchmarkInstance(
 def popcount(mask: int) -> int:
     """Return the Hamming weight of a binary mask."""
     return mask.bit_count()
+
+
+def _env_worker_override(name: str) -> int | None:
+    """Parse an optional worker-count override from the environment."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return None
+    try:
+        return max(int(raw_value), 1)
+    except ValueError:
+        return None
+
+
+def _resolve_worker_count(task_count: int, env_name: str, minimum_parallel_tasks: int) -> int:
+    """Choose a bounded thread count for a pool-backed parallel section."""
+    override = _env_worker_override(env_name)
+    if override is not None:
+        return min(override, task_count)
+    if task_count < max(minimum_parallel_tasks, 2):
+        return 1
+    cpu_count = os.cpu_count() or 1
+    return min(cpu_count, task_count)
 
 
 @lru_cache(maxsize=None)
@@ -298,6 +321,30 @@ def _safe_priority(priority_fn: PriorityFn, candidate_mask: int, n: int, k: int,
     return value
 
 
+def _score_candidate_job(
+    job: Tuple[PriorityFn, int, int, int, int, int]
+) -> Tuple[float, int, int]:
+    """Score one candidate column and attach the restart-specific tie-break."""
+    priority_fn, candidate_mask, n, k, d, restart_index = job
+    score = _safe_priority(priority_fn, candidate_mask, n, k, d)
+    tie_break = _deterministic_tiebreak(candidate_mask, restart_index)
+    return score, tie_break, candidate_mask
+
+
+def _run_restart_job(
+    job: Tuple[BenchmarkInstance, PriorityFn, int]
+) -> SearchAttemptResult:
+    """Run one restart in isolation, keeping inner candidate scoring serial."""
+    instance, priority_fn, restart_index = job
+    return greedy_construct(
+        instance,
+        priority_fn,
+        restart_index,
+        show_progress=False,
+        candidate_workers=1,
+    )
+
+
 def _deterministic_tiebreak(candidate_mask: int, restart_index: int) -> int:
     """Restart-specific tie-break used only to perturb equal-score columns."""
     return (
@@ -308,9 +355,10 @@ def _deterministic_tiebreak(candidate_mask: int, restart_index: int) -> int:
 
 
 def _iterate_with_progress(
-    items: Sequence[int],
+    items: Iterable,
     description: str,
     show_progress: bool,
+    total: int | None = None,
 ):
     """Yield items, optionally wrapped in a tqdm progress bar."""
     if not show_progress:
@@ -321,7 +369,7 @@ def _iterate_with_progress(
     except Exception:
         return items
 
-    return tqdm(items, desc=description, leave=False)
+    return tqdm(items, desc=description, leave=False, total=total)
 
 
 def ranked_candidates(
@@ -329,24 +377,62 @@ def ranked_candidates(
     priority_fn: PriorityFn,
     restart_index: int,
     show_progress: bool = False,
+    candidate_workers: int | None = None,
 ) -> Tuple[Tuple[int, ...], Tuple[Tuple[int, float], ...]]:
     """Compute a single static ordering of all candidate columns."""
     scored_candidates = []
     candidates = candidate_masks(instance.r, instance.target_distance)
-    for candidate_mask in _iterate_with_progress(
-        candidates,
-        f"ranking restart {restart_index}",
-        show_progress,
-    ):
-        score = _safe_priority(
-            priority_fn,
-            candidate_mask,
-            instance.n,
-            instance.k,
-            instance.target_distance,
+    worker_count = candidate_workers
+    if worker_count is None:
+        worker_count = _resolve_worker_count(
+            len(candidates),
+            env_name="LINEAR_CODE_CANDIDATE_WORKERS",
+            minimum_parallel_tasks=64,
         )
-        tie_break = _deterministic_tiebreak(candidate_mask, restart_index)
-        scored_candidates.append((score, tie_break, candidate_mask))
+
+    if worker_count <= 1:
+        for candidate_mask in _iterate_with_progress(
+            candidates,
+            f"ranking restart {restart_index}",
+            show_progress,
+            total=len(candidates),
+        ):
+            scored_candidates.append(
+                _score_candidate_job(
+                    (
+                        priority_fn,
+                        candidate_mask,
+                        instance.n,
+                        instance.k,
+                        instance.target_distance,
+                        restart_index,
+                    )
+                )
+            )
+    else:
+        jobs = [
+            (
+                priority_fn,
+                candidate_mask,
+                instance.n,
+                instance.k,
+                instance.target_distance,
+                restart_index,
+            )
+            for candidate_mask in candidates
+        ]
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="linear-code-score",
+        ) as executor:
+            scored_iterator = executor.map(_score_candidate_job, jobs)
+            for scored_candidate in _iterate_with_progress(
+                scored_iterator,
+                f"ranking restart {restart_index}",
+                show_progress,
+                total=len(candidates),
+            ):
+                scored_candidates.append(scored_candidate)
     scored_candidates.sort(reverse=True)
     ordered_candidates = tuple(candidate_mask for _, _, candidate_mask in scored_candidates)
     ordered_scores = tuple((candidate_mask, score) for score, _, candidate_mask in scored_candidates)
@@ -358,6 +444,7 @@ def greedy_construct(
     priority_fn: PriorityFn,
     restart_index: int,
     show_progress: bool = False,
+    candidate_workers: int | None = None,
 ) -> SearchAttemptResult:
     """Run one fixed sorted-greedy pass for a single benchmark instance."""
     search_state = IncrementalForbiddenState(instance.r, instance.target_distance)
@@ -366,6 +453,7 @@ def greedy_construct(
         priority_fn,
         restart_index,
         show_progress=show_progress,
+        candidate_workers=candidate_workers,
     )
     blocked_candidate_count = 0
     illegal_weight_histogram: Counter[int] = Counter()
@@ -408,15 +496,31 @@ def best_restart_for_instance(
     show_progress: bool = False,
 ) -> SearchAttemptResult:
     """Evaluate all fixed restarts and keep the best deterministic attempt."""
-    attempts = [
-        greedy_construct(
-            instance,
-            priority_fn,
-            restart_index,
-            show_progress=show_progress,
-        )
-        for restart_index in range(instance.restarts)
-    ]
+    restart_worker_count = _resolve_worker_count(
+        instance.restarts,
+        env_name="LINEAR_CODE_RESTART_WORKERS",
+        minimum_parallel_tasks=2,
+    )
+    if show_progress or restart_worker_count <= 1:
+        attempts = [
+            greedy_construct(
+                instance,
+                priority_fn,
+                restart_index,
+                show_progress=show_progress,
+            )
+            for restart_index in range(instance.restarts)
+        ]
+    else:
+        restart_jobs = [
+            (instance, priority_fn, restart_index)
+            for restart_index in range(instance.restarts)
+        ]
+        with ThreadPoolExecutor(
+            max_workers=restart_worker_count,
+            thread_name_prefix="linear-code-restart",
+        ) as executor:
+            attempts = list(executor.map(_run_restart_job, restart_jobs))
     return max(
         attempts,
         key=lambda attempt: (

@@ -29,8 +29,15 @@ The evaluator reads the target instance from environment variables:
 - `LINEAR_CODE_K`
 - `LINEAR_CODE_D`
 - optional: `LINEAR_CODE_RESTARTS`
+- optional: `LINEAR_CODE_CANDIDATE_WORKERS`
+- optional: `LINEAR_CODE_RESTART_WORKERS`
 
 If you do not set them, the default target is `[8,4,4]_2`.
+
+The greedy fill itself stays sequential because each accepted column updates the exact forbidden-state. The new worker settings only parallelize:
+
+- candidate scoring inside one restart,
+- and evaluation across independent restart indices.
 
 ## Files
 
@@ -63,17 +70,19 @@ To inspect the baseline without running evolution:
 LINEAR_CODE_N=7 LINEAR_CODE_K=4 LINEAR_CODE_D=3 python initial_program.py
 ```
 
-To batch-run all valid `(n,k)` entries with `10 < n <= 20`, using `d = lower` from `Misc/ECCRecord.json`:
+To batch-run all valid `(n,k)` entries with `10 < n <= 40`, using `d = lower` from `Misc/ECCRecord.json`:
 
 ```bash
 python run_batch.py \
   --record Misc/ECCRecord.json \
   --n-min 11 \
-  --n-max 20 \
+  --n-max 40 \
   --d-field lower \
   --iterations 40 \
   --output-root batch_runs
 ```
+
+The batch runner automatically skips instances whose selected target distance is `d <= 2`. Those entries are not searched, but they are still written to the summary files as skipped rows.
 
 Each instance is written to its own directory such as `batch_runs/n18_k7_d7/`, including:
 

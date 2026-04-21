@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--n-max",
         type=int,
-        default=20,
+        default=40,
         help="Only run tasks with n <= n_max.",
     )
     parser.add_argument(
@@ -104,7 +104,7 @@ def load_record(record_path: Path) -> dict:
 def load_tasks_from_record(
     record_path: Path,
     n_min: int = 11,
-    n_max: int = 20,
+    n_max: int = 40,
     d_field: str = "lower",
 ) -> tuple[list[SweepTask], list[dict]]:
     """Load valid tasks and a list of skipped entries from ECCRecord.json."""
@@ -129,9 +129,23 @@ def load_tasks_from_record(
                     {
                         "n": n,
                         "k": k,
+                        "d": d,
                         "lower": lower,
                         "upper": upper,
                         "reason": "requires 1 <= k < n for the systematic parity-check search",
+                    }
+                )
+                continue
+
+            if d <= 2:
+                skipped.append(
+                    {
+                        "n": n,
+                        "k": k,
+                        "d": d,
+                        "lower": lower,
+                        "upper": upper,
+                        "reason": "target distance d <= 2 does not require search",
                     }
                 )
                 continue
@@ -322,7 +336,7 @@ def run_batch(
     base_config_path: Path,
     output_root: Path,
     n_min: int = 11,
-    n_max: int = 20,
+    n_max: int = 40,
     d_field: str = "lower",
     iterations: int = 40,
     force: bool = False,
@@ -343,8 +357,12 @@ def run_batch(
     for skipped_row in skipped:
         row = {
             **skipped_row,
-            "d": skipped_row[d_field],
-            "status": "skipped_invalid",
+            "d": skipped_row["d"],
+            "status": (
+                "skipped_low_distance"
+                if skipped_row["reason"] == "target distance d <= 2 does not require search"
+                else "skipped_invalid"
+            ),
             "verification_status": "skipped",
             "output_dir": "",
             "config_path": "",
