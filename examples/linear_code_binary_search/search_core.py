@@ -47,6 +47,15 @@ _PROCESS_PRIORITY_FN: PriorityFn | None = None
 
 
 @dataclass(frozen=True)
+class ParallelismPlan:
+    """Resolved worker budget for restart and candidate-level parallelism."""
+
+    restart_workers: int
+    candidate_workers: int
+    chunk_prefetch_depth: int
+
+
+@dataclass(frozen=True)
 class BenchmarkInstance:
     """Single binary feasibility instance for a systematic parity-check search."""
 
@@ -165,6 +174,11 @@ def _env_flag_enabled(name: str) -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _cpu_budget() -> int:
+    """Return the total CPU budget available to automatic worker planning."""
+    return max(os.cpu_count() or 1, 1)
+
+
 def _profiling_enabled() -> bool:
     """Return whether opt-in stage profiling logs should be emitted."""
     return _env_flag_enabled("LINEAR_CODE_PROFILE")
@@ -178,9 +192,32 @@ def _log_profile(stage: str, **fields: object) -> None:
     logger.info(f"linear_code_profile stage={stage} {payload}".strip())
 
 
+def _format_eta(total_seconds: float) -> str:
+    """Render a compact ETA string for progress logs."""
+    rounded_seconds = max(int(round(total_seconds)), 0)
+    minutes, seconds = divmod(rounded_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes:d}m{seconds:02d}s"
+    return f"{seconds:d}s"
+
+
 def _candidate_chunk_size() -> int:
     """Return the numeric mask-range chunk size for streaming candidate generation."""
     return _env_positive_int("LINEAR_CODE_CANDIDATE_CHUNK_SIZE") or (1 << 20)
+
+
+def _candidate_map_chunksize(task_count: int, worker_count: int) -> int:
+    """Choose a coarse process-pool map batch size for large candidate chunks."""
+    override = _env_positive_int("LINEAR_CODE_CANDIDATE_MAP_CHUNKSIZE")
+    if override is not None:
+        return min(max(override, 1), max(task_count, 1))
+    if task_count <= 1 or worker_count <= 1:
+        return 1
+    target_batches = max(worker_count * 16, 1)
+    return max(1, math.ceil(task_count / target_batches))
 
 
 def _streaming_mask_threshold() -> int:
@@ -202,6 +239,62 @@ def _candidate_executor_mode() -> str:
     if normalized in {"process", "thread"}:
         return normalized
     return "thread"
+
+
+def _candidate_chunk_prefetch_depth(candidate_workers: int | None) -> int:
+    """Keep one extra chunk prefetched when candidate scoring is parallelized."""
+    return 2 if (candidate_workers or 1) > 1 else 1
+
+
+def _resolve_parallelism_plan(
+    instance: BenchmarkInstance,
+    show_progress: bool = False,
+) -> ParallelismPlan:
+    """Auto-balance restart and candidate-level worker budgets."""
+    cpu_budget = _cpu_budget()
+    restart_override = _env_worker_override("LINEAR_CODE_RESTART_WORKERS")
+    candidate_override = _env_worker_override("LINEAR_CODE_CANDIDATE_WORKERS")
+    streaming = _should_stream_candidates(instance.r)
+    process_candidate_executor = _candidate_executor_mode() == "process"
+
+    if show_progress or instance.restarts <= 1:
+        restart_workers = 1
+    elif restart_override is not None:
+        restart_workers = min(restart_override, instance.restarts)
+    elif process_candidate_executor:
+        # Avoid nested fork-backed process pools from multiple restart threads.
+        restart_workers = 1
+    elif candidate_override is not None:
+        restart_workers = min(
+            instance.restarts,
+            max(cpu_budget // max(candidate_override, 1), 1),
+        )
+    elif streaming and cpu_budget < instance.restarts * 8:
+        restart_workers = 1
+    else:
+        minimum_candidate_workers = 8 if streaming else 4
+        restart_workers = min(
+            instance.restarts,
+            max(cpu_budget // minimum_candidate_workers, 1),
+        )
+
+    if candidate_override is not None:
+        candidate_workers = candidate_override
+    elif restart_override is not None:
+        candidate_workers = max(cpu_budget // max(restart_workers, 1), 1)
+    else:
+        candidate_workers = max(cpu_budget // max(restart_workers, 1), 1)
+
+    if show_progress:
+        restart_workers = 1
+    restart_workers = min(max(restart_workers, 1), instance.restarts)
+    candidate_workers = max(candidate_workers, 1)
+    chunk_prefetch_depth = 2 if streaming and candidate_workers > 1 else 1
+    return ParallelismPlan(
+        restart_workers=restart_workers,
+        candidate_workers=candidate_workers,
+        chunk_prefetch_depth=chunk_prefetch_depth,
+    )
 
 
 @lru_cache(maxsize=None)
@@ -233,6 +326,53 @@ def candidate_mask_chunks(
         )
         if chunk:
             yield chunk
+
+
+def _next_candidate_chunk(
+    iterator: Iterator[Tuple[int, ...]],
+) -> Tuple[Tuple[int, ...], float] | None:
+    """Fetch the next candidate chunk and measure generation time."""
+    started_at = time.perf_counter()
+    try:
+        chunk = next(iterator)
+    except StopIteration:
+        return None
+    return chunk, time.perf_counter() - started_at
+
+
+def _iter_candidate_mask_chunks(
+    r: int,
+    distance: int,
+    chunk_size: int,
+    prefetch_depth: int = 1,
+) -> Iterator[Tuple[int, Tuple[int, ...], float]]:
+    """Yield timed candidate chunks, optionally prefetching one chunk ahead."""
+    iterator = iter(candidate_mask_chunks(r, distance, chunk_size))
+    if prefetch_depth <= 1:
+        chunk_index = 0
+        while True:
+            next_chunk = _next_candidate_chunk(iterator)
+            if next_chunk is None:
+                break
+            chunk_candidates, generation_elapsed_seconds = next_chunk
+            yield chunk_index, chunk_candidates, generation_elapsed_seconds
+            chunk_index += 1
+        return
+
+    with ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="linear-code-chunk-prefetch",
+    ) as executor:
+        chunk_index = 0
+        next_chunk_future = executor.submit(_next_candidate_chunk, iterator)
+        while True:
+            next_chunk = next_chunk_future.result()
+            if next_chunk is None:
+                break
+            next_chunk_future = executor.submit(_next_candidate_chunk, iterator)
+            chunk_candidates, generation_elapsed_seconds = next_chunk
+            yield chunk_index, chunk_candidates, generation_elapsed_seconds
+            chunk_index += 1
 
 
 def _initialize_reachable_layers(r: int, distance: int) -> List[set[int]]:
@@ -492,6 +632,8 @@ def _score_candidate_chunk(
     worker_count: int,
     executor_mode: str = "thread",
     process_pool: ProcessPoolExecutor | None = None,
+    thread_pool: ThreadPoolExecutor | None = None,
+    map_chunksize: int = 1,
 ) -> List[Tuple[float, int, int]]:
     """Score one candidate chunk, optionally using a worker pool."""
     if worker_count <= 1:
@@ -520,7 +662,13 @@ def _score_candidate_chunk(
             )
             for candidate_mask in chunk_candidates
         )
-        return list(process_pool.map(_score_candidate_job_in_process, job_iter))
+        return list(
+            process_pool.map(
+                _score_candidate_job_in_process,
+                job_iter,
+                chunksize=map_chunksize,
+            )
+        )
 
     job_iter = (
         (
@@ -533,6 +681,8 @@ def _score_candidate_chunk(
         )
         for candidate_mask in chunk_candidates
     )
+    if thread_pool is not None:
+        return list(thread_pool.map(_score_candidate_job, job_iter))
     with ThreadPoolExecutor(
         max_workers=worker_count,
         thread_name_prefix="linear-code-score",
@@ -617,16 +767,16 @@ def _cleanup_scored_chunk_runs(runs: Sequence[ScoredChunkRun]) -> None:
 
 
 def _run_restart_job(
-    job: Tuple[BenchmarkInstance, PriorityFn, int]
+    job: Tuple[BenchmarkInstance, PriorityFn, int, int]
 ) -> SearchAttemptResult:
-    """Run one restart in isolation, keeping inner candidate scoring serial."""
-    instance, priority_fn, restart_index = job
+    """Run one restart in isolation using the resolved candidate-worker budget."""
+    instance, priority_fn, restart_index, candidate_workers = job
     return greedy_construct(
         instance,
         priority_fn,
         restart_index,
         show_progress=False,
-        candidate_workers=1,
+        candidate_workers=candidate_workers,
     )
 
 
@@ -685,6 +835,7 @@ def ranked_candidates(
             env_name="LINEAR_CODE_CANDIDATE_WORKERS",
             minimum_parallel_tasks=64,
         )
+    worker_count = min(max(worker_count, 1), max(len(candidates), 1))
 
     scoring_started_at = time.perf_counter()
     if worker_count <= 1:
@@ -763,30 +914,44 @@ def _ranked_candidate_runs(
     priority_fn: PriorityFn,
     restart_index: int,
     candidate_workers: int | None = None,
+    chunk_prefetch_depth: int = 1,
 ) -> Tuple[List[ScoredChunkRun], int]:
     """Build sorted chunk runs for the exact streaming candidate path."""
     worker_count = candidate_workers
     runs: List[ScoredChunkRun] = []
     candidate_count = 0
+    processed_chunks = 0
+    chunk_size = _candidate_chunk_size()
+    total_chunks = max(math.ceil(((1 << instance.r) - 1) / chunk_size), 1)
+    streaming_started_at = time.perf_counter()
     if worker_count is None:
         worker_count = _resolve_worker_count(
-            _candidate_chunk_size(),
+            chunk_size,
             env_name="LINEAR_CODE_CANDIDATE_WORKERS",
             minimum_parallel_tasks=64,
         )
+    worker_count = min(max(worker_count, 1), max(chunk_size, 1))
 
     executor_mode = "thread"
     process_pool = None
+    thread_pool = None
     if _candidate_executor_mode() == "process":
         process_pool = _create_process_candidate_pool(priority_fn, worker_count)
         if process_pool is not None:
             executor_mode = "process"
+    if executor_mode == "thread" and worker_count > 1:
+        thread_pool = ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="linear-code-score",
+        )
 
     try:
-        for chunk_index, chunk_candidates in enumerate(
-            candidate_mask_chunks(instance.r, instance.target_distance, _candidate_chunk_size())
+        for chunk_index, chunk_candidates, generation_elapsed_seconds in _iter_candidate_mask_chunks(
+            instance.r,
+            instance.target_distance,
+            chunk_size,
+            prefetch_depth=chunk_prefetch_depth,
         ):
-            generation_elapsed_seconds = 0.0
             _log_profile(
                 "candidate_generation",
                 n=instance.n,
@@ -801,6 +966,7 @@ def _ranked_candidate_runs(
             candidate_count += len(chunk_candidates)
 
             scoring_started_at = time.perf_counter()
+            map_chunksize = _candidate_map_chunksize(len(chunk_candidates), worker_count)
             scored_chunk = _score_candidate_chunk(
                 chunk_candidates,
                 instance,
@@ -809,7 +975,10 @@ def _ranked_candidate_runs(
                 worker_count,
                 executor_mode=executor_mode,
                 process_pool=process_pool,
+                thread_pool=thread_pool,
+                map_chunksize=map_chunksize,
             )
+            scoring_elapsed_seconds = time.perf_counter() - scoring_started_at
             _log_profile(
                 "candidate_scoring",
                 n=instance.n,
@@ -821,11 +990,13 @@ def _ranked_candidate_runs(
                 chunk_candidate_count=len(chunk_candidates),
                 worker_count=worker_count,
                 executor_mode=executor_mode,
-                elapsed_seconds=f"{time.perf_counter() - scoring_started_at:.6f}",
+                map_chunksize=map_chunksize,
+                elapsed_seconds=f"{scoring_elapsed_seconds:.6f}",
             )
 
             sort_started_at = time.perf_counter()
             scored_chunk.sort(reverse=True)
+            sort_elapsed_seconds = time.perf_counter() - sort_started_at
             _log_profile(
                 "candidate_sort",
                 n=instance.n,
@@ -835,12 +1006,46 @@ def _ranked_candidate_runs(
                 restart=restart_index,
                 chunk_index=chunk_index,
                 chunk_candidate_count=len(scored_chunk),
-                elapsed_seconds=f"{time.perf_counter() - sort_started_at:.6f}",
+                elapsed_seconds=f"{sort_elapsed_seconds:.6f}",
             )
+            write_started_at = time.perf_counter()
             runs.append(_write_scored_chunk_run(scored_chunk))
+            write_elapsed_seconds = time.perf_counter() - write_started_at
+            _log_profile(
+                "candidate_write",
+                n=instance.n,
+                k=instance.k,
+                d=instance.target_distance,
+                r=instance.r,
+                restart=restart_index,
+                chunk_index=chunk_index,
+                chunk_candidate_count=len(scored_chunk),
+                elapsed_seconds=f"{write_elapsed_seconds:.6f}",
+            )
+            processed_chunks = chunk_index + 1
+            if _profiling_enabled() or logger.isEnabledFor(logging.INFO):
+                elapsed_seconds = time.perf_counter() - streaming_started_at
+                average_chunk_seconds = elapsed_seconds / processed_chunks
+                remaining_chunks = max(total_chunks - processed_chunks, 0)
+                eta_seconds = average_chunk_seconds * remaining_chunks
+                logger.info(
+                    "streaming candidate ranking progress "
+                    f"restart={restart_index} "
+                    f"chunk={processed_chunks}/{total_chunks} "
+                    f"chunk_candidates={len(chunk_candidates)} "
+                    f"candidates_seen={candidate_count} "
+                    f"candidate_workers={worker_count} "
+                    f"executor_mode={executor_mode} "
+                    f"map_chunksize={map_chunksize} "
+                    f"inflight_chunks={max(chunk_prefetch_depth, 1)} "
+                    f"elapsed={_format_eta(elapsed_seconds)} "
+                    f"eta={_format_eta(eta_seconds)}"
+                )
     finally:
         if process_pool is not None:
             process_pool.shutdown()
+        if thread_pool is not None:
+            thread_pool.shutdown()
 
     return runs, candidate_count
 
@@ -931,6 +1136,7 @@ def _greedy_construct_streaming(
         priority_fn,
         restart_index,
         candidate_workers=candidate_workers,
+        chunk_prefetch_depth=_candidate_chunk_prefetch_depth(candidate_workers),
     )
     blocked_candidate_count = 0
     illegal_weight_histogram: Counter[int] = Counter()
@@ -989,28 +1195,45 @@ def best_restart_for_instance(
     show_progress: bool = False,
 ) -> SearchAttemptResult:
     """Evaluate all fixed restarts and keep the best deterministic attempt."""
-    restart_worker_count = _resolve_worker_count(
-        instance.restarts,
-        env_name="LINEAR_CODE_RESTART_WORKERS",
-        minimum_parallel_tasks=2,
+    parallelism_plan = _resolve_parallelism_plan(
+        instance,
+        show_progress=show_progress,
     )
-    if show_progress or restart_worker_count <= 1:
+    _log_profile(
+        "parallelism_plan",
+        n=instance.n,
+        k=instance.k,
+        d=instance.target_distance,
+        r=instance.r,
+        restarts=instance.restarts,
+        restart_workers=parallelism_plan.restart_workers,
+        candidate_workers=parallelism_plan.candidate_workers,
+        chunk_prefetch_depth=parallelism_plan.chunk_prefetch_depth,
+        cpu_budget=_cpu_budget(),
+    )
+    if show_progress or parallelism_plan.restart_workers <= 1:
         attempts = [
             greedy_construct(
                 instance,
                 priority_fn,
                 restart_index,
                 show_progress=show_progress,
+                candidate_workers=parallelism_plan.candidate_workers,
             )
             for restart_index in range(instance.restarts)
         ]
     else:
         restart_jobs = [
-            (instance, priority_fn, restart_index)
+            (
+                instance,
+                priority_fn,
+                restart_index,
+                parallelism_plan.candidate_workers,
+            )
             for restart_index in range(instance.restarts)
         ]
         with ThreadPoolExecutor(
-            max_workers=restart_worker_count,
+            max_workers=parallelism_plan.restart_workers,
             thread_name_prefix="linear-code-restart",
         ) as executor:
             attempts = list(executor.map(_run_restart_job, restart_jobs))

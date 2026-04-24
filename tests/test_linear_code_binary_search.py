@@ -185,12 +185,20 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
             for call in mock_info.call_args_list
             if call.args and "linear_code_profile" in call.args[0]
         ]
+        progress_messages = [
+            call.args[0]
+            for call in mock_info.call_args_list
+            if call.args and "streaming candidate ranking progress" in call.args[0]
+        ]
         self.assertTrue(
             any(
                 "stage=candidate_scoring" in message and "executor_mode=process" in message
                 for message in profile_messages
             )
         )
+        self.assertTrue(any("stage=candidate_write" in message for message in profile_messages))
+        self.assertTrue(any("map_chunksize=" in message for message in progress_messages))
+        self.assertTrue(any("candidate_workers=" in message for message in progress_messages))
 
     def test_stage_profile_logging_is_disabled_by_default(self):
         """Profiling logs should stay silent unless explicitly enabled."""
@@ -229,11 +237,139 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
             any("stage=candidate_sort" in message for message in profile_messages)
         )
         self.assertTrue(
+            any("stage=parallelism_plan" in message for message in profile_messages)
+        )
+        self.assertTrue(
             any("stage=greedy_scan" in message for message in profile_messages)
         )
         self.assertTrue(
             any("stage=evaluation_summary" in message for message in profile_messages)
         )
+
+    def test_parallelism_plan_prioritizes_candidate_workers_on_smaller_streaming_runs(self):
+        """Smaller CPU budgets should keep restarts sequential and spend cores on scoring."""
+        instance = self.search_core.make_instance(n=32, k=12, distance=8, restarts=3)
+        with mock.patch.dict(os.environ, {"LINEAR_CODE_FORCE_STREAMING": "1"}, clear=False):
+            with mock.patch.object(self.search_core.os, "cpu_count", return_value=8):
+                plan = self.search_core._resolve_parallelism_plan(instance)
+        self.assertEqual(plan.restart_workers, 1)
+        self.assertEqual(plan.candidate_workers, 8)
+        self.assertEqual(plan.chunk_prefetch_depth, 2)
+
+    def test_parallelism_plan_parallelizes_restarts_when_cpu_headroom_exists(self):
+        """Large CPU budgets should allow independent restarts to run in parallel."""
+        instance = self.search_core.make_instance(n=32, k=12, distance=8, restarts=3)
+        with mock.patch.dict(os.environ, {"LINEAR_CODE_FORCE_STREAMING": "1"}, clear=False):
+            with mock.patch.object(self.search_core.os, "cpu_count", return_value=128):
+                plan = self.search_core._resolve_parallelism_plan(instance)
+        self.assertEqual(plan.restart_workers, 3)
+        self.assertEqual(plan.candidate_workers, 42)
+        self.assertEqual(plan.chunk_prefetch_depth, 2)
+
+    def test_process_executor_auto_plan_keeps_restarts_serial(self):
+        """Process-backed candidate scoring should avoid nested restart-thread process pools."""
+        instance = self.search_core.make_instance(n=32, k=12, distance=8, restarts=3)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LINEAR_CODE_FORCE_STREAMING": "1",
+                "LINEAR_CODE_CANDIDATE_EXECUTOR": "process",
+            },
+            clear=False,
+        ):
+            with mock.patch.object(self.search_core.os, "cpu_count", return_value=128):
+                plan = self.search_core._resolve_parallelism_plan(instance)
+        self.assertEqual(plan.restart_workers, 1)
+        self.assertEqual(plan.candidate_workers, 128)
+        self.assertEqual(plan.chunk_prefetch_depth, 2)
+
+    def test_process_chunk_scoring_uses_auto_and_manual_map_chunksize(self):
+        """Process-backed chunk scoring should derive and honor map batch sizes."""
+        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=1)
+        priority_fn = self.initial_program.get_priority_function()
+        chunk_candidates = (7, 11, 13, 14, 15)
+        fake_pool = mock.Mock()
+        fake_pool.map.return_value = [(1.0, index, mask) for index, mask in enumerate(chunk_candidates)]
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LINEAR_CODE_CANDIDATE_MAP_CHUNKSIZE", None)
+            self.search_core._score_candidate_chunk(
+                chunk_candidates,
+                instance,
+                priority_fn,
+                restart_index=0,
+                worker_count=2,
+                executor_mode="process",
+                process_pool=fake_pool,
+                map_chunksize=self.search_core._candidate_map_chunksize(len(chunk_candidates), 2),
+            )
+        self.assertEqual(
+            fake_pool.map.call_args.kwargs["chunksize"],
+            self.search_core._candidate_map_chunksize(len(chunk_candidates), 2),
+        )
+
+        fake_pool.reset_mock()
+        fake_pool.map.return_value = [(1.0, index, mask) for index, mask in enumerate(chunk_candidates)]
+        with mock.patch.dict(os.environ, {"LINEAR_CODE_CANDIDATE_MAP_CHUNKSIZE": "3"}, clear=False):
+            self.search_core._score_candidate_chunk(
+                chunk_candidates,
+                instance,
+                priority_fn,
+                restart_index=0,
+                worker_count=2,
+                executor_mode="process",
+                process_pool=fake_pool,
+                map_chunksize=self.search_core._candidate_map_chunksize(len(chunk_candidates), 2),
+            )
+        self.assertEqual(fake_pool.map.call_args.kwargs["chunksize"], 3)
+
+    def test_parallel_restart_jobs_keep_candidate_worker_budget(self):
+        """Parallel restart execution should preserve the resolved inner scoring budget."""
+        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=2)
+        calls = []
+
+        def fake_greedy_construct(
+            instance,
+            priority_fn,
+            restart_index,
+            show_progress=False,
+            candidate_workers=None,
+        ):
+            calls.append((restart_index, show_progress, candidate_workers))
+            return self.search_core.SearchAttemptResult(
+                success=False,
+                selected_free_columns=tuple(),
+                added_free_columns=restart_index,
+                candidate_count=0,
+                restart_index=restart_index,
+                sorted_candidates=tuple(),
+                sorted_scores=tuple(),
+                blocked_candidate_count=0,
+                illegal_weight_histogram=tuple(),
+                chosen_weights=tuple(),
+            )
+
+        with mock.patch.object(
+            self.search_core,
+            "_resolve_parallelism_plan",
+            return_value=self.search_core.ParallelismPlan(
+                restart_workers=2,
+                candidate_workers=4,
+                chunk_prefetch_depth=2,
+            ),
+        ):
+            with mock.patch.object(
+                self.search_core,
+                "greedy_construct",
+                side_effect=fake_greedy_construct,
+            ):
+                result = self.search_core.best_restart_for_instance(
+                    instance,
+                    self.initial_program.get_priority_function(),
+                )
+
+        self.assertEqual(sorted(call[2] for call in calls), [4, 4])
+        self.assertEqual(result.restart_index, 1)
 
     def test_custom_instance_interface(self):
         """A caller should be able to set one custom (n, k, d) instance directly."""

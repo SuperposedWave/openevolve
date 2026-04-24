@@ -31,13 +31,23 @@ The evaluator reads the target instance from environment variables:
 - optional: `LINEAR_CODE_RESTARTS`
 - optional: `LINEAR_CODE_CANDIDATE_WORKERS`
 - optional: `LINEAR_CODE_RESTART_WORKERS`
+- optional: `LINEAR_CODE_CANDIDATE_MAP_CHUNKSIZE`
 
 If you do not set them, the default target is `[8,4,4]_2`.
 
-The greedy fill itself stays sequential because each accepted column updates the exact forbidden-state. The new worker settings only parallelize:
+The greedy fill itself stays sequential because each accepted column updates the exact forbidden-state. The worker settings only parallelize:
 
 - candidate scoring inside one restart,
 - and evaluation across independent restart indices.
+
+The streaming path now auto-tunes its parallelism by default:
+
+- it derives a shared CPU budget from `os.cpu_count()`,
+- prefers candidate scoring over restart parallelism on smaller machines,
+- enables restart parallelism only when there is enough headroom,
+- and auto-selects a coarse `ProcessPoolExecutor.map(..., chunksize=...)` to reduce IPC overhead.
+
+Most runs should not need manual tuning. `LINEAR_CODE_CANDIDATE_MAP_CHUNKSIZE` is an advanced override for large process-backed searches when you want to force a specific map batch size.
 
 ## Files
 

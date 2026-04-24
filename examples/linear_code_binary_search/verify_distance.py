@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 
 from search_core import (
@@ -17,7 +18,20 @@ from search_core import (
 )
 
 
+def _configure_console_logging() -> None:
+    """Ensure INFO-level logs are visible when this script runs standalone."""
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        root_logger.setLevel(logging.INFO)
+        return
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+    )
+
+
 def main() -> None:
+    _configure_console_logging()
     parser = argparse.ArgumentParser(
         description="Construct H from a priority program and report the actual minimum distance."
     )
