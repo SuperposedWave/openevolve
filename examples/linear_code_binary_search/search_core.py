@@ -11,6 +11,7 @@ import logging
 import math
 import multiprocessing
 import os
+import random
 import struct
 import sys
 import tempfile
@@ -76,6 +77,10 @@ class SearchAttemptResult:
     blocked_candidate_count: int
     illegal_weight_histogram: Tuple[Tuple[int, int], ...]
     chosen_weights: Tuple[int, ...]
+    search_mode: str = "exact"
+    sample_budget: int | None = None
+    sample_seed: int | None = None
+    unique_sampled_candidates: int | None = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +162,18 @@ def _env_positive_int(name: str) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _env_nonnegative_int(name: str) -> int | None:
+    """Parse an optional non-negative integer environment variable."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return None
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
 def _env_flag_enabled(name: str) -> bool:
     """Parse a conventional boolean environment flag."""
     raw_value = os.environ.get(name)
@@ -204,6 +221,37 @@ def _candidate_executor_mode() -> str:
     return "thread"
 
 
+def _search_mode() -> str:
+    """Return the requested search mode, defaulting to the exact full-ranking path."""
+    raw_value = os.environ.get("LINEAR_CODE_SEARCH_MODE", "exact")
+    normalized = raw_value.strip().lower()
+    if normalized in {"exact", "sampled"}:
+        return normalized
+    logger.warning("Unknown LINEAR_CODE_SEARCH_MODE=%r; falling back to exact", raw_value)
+    return "exact"
+
+
+def _sample_budget() -> int:
+    """Return the final sampled candidate budget per restart."""
+    return _env_positive_int("LINEAR_CODE_SAMPLE_BUDGET") or 2_000_000
+
+
+def _sample_seed() -> int:
+    """Return the deterministic base seed for sampled candidate generation."""
+    parsed = _env_nonnegative_int("LINEAR_CODE_SAMPLE_SEED")
+    return 0 if parsed is None else parsed
+
+
+def _sample_oversample_factor() -> int:
+    """Return how many candidates to pre-sample before priority truncation."""
+    return _env_positive_int("LINEAR_CODE_SAMPLE_OVERSAMPLE_FACTOR") or 4
+
+
+def _strata_per_weight() -> int | None:
+    """Return an optional minimum sampled count per eligible Hamming weight."""
+    return _env_positive_int("LINEAR_CODE_STRATA_PER_WEIGHT")
+
+
 @lru_cache(maxsize=None)
 def basis_columns(r: int) -> Tuple[int, ...]:
     """Systematic identity columns."""
@@ -233,6 +281,158 @@ def candidate_mask_chunks(
         )
         if chunk:
             yield chunk
+
+
+def _eligible_weights(r: int, distance: int) -> Tuple[int, ...]:
+    """Return candidate Hamming weights allowed by the initial distance filter."""
+    min_weight = max(distance - 1, 1)
+    return tuple(range(min_weight, r + 1))
+
+
+def _candidate_space_size_by_weight(r: int, distance: int) -> Tuple[Tuple[int, int], ...]:
+    """Return eligible Hamming weights with their exact candidate-space sizes."""
+    return tuple((weight, math.comb(r, weight)) for weight in _eligible_weights(r, distance))
+
+
+def _allocate_stratified_counts(
+    r: int,
+    distance: int,
+    target_count: int,
+) -> Tuple[Tuple[int, int], ...]:
+    """Allocate a sampled-candidate target across Hamming-weight strata."""
+    capacities = _candidate_space_size_by_weight(r, distance)
+    total_capacity = sum(capacity for _, capacity in capacities)
+    target_count = min(target_count, total_capacity)
+    if target_count <= 0 or not capacities:
+        return tuple()
+
+    allocations = {weight: 0 for weight, _ in capacities}
+    remaining = target_count
+    explicit_minimum = _strata_per_weight()
+    if explicit_minimum is None:
+        explicit_minimum = max(1, target_count // (len(capacities) * 20))
+
+    for weight, capacity in capacities:
+        if remaining <= 0:
+            break
+        allocated = min(capacity, explicit_minimum, remaining)
+        allocations[weight] = allocated
+        remaining -= allocated
+
+    while remaining > 0:
+        adjustable = [
+            (weight, capacity - allocations[weight])
+            for weight, capacity in capacities
+            if capacity > allocations[weight]
+        ]
+        if not adjustable:
+            break
+        adjustable_capacity = sum(capacity_left for _, capacity_left in adjustable)
+        distributed = 0
+        remainders = []
+        for weight, capacity_left in adjustable:
+            exact_share = remaining * capacity_left / adjustable_capacity
+            share = min(capacity_left, int(exact_share))
+            allocations[weight] += share
+            distributed += share
+            remainders.append((exact_share - share, capacity_left, weight))
+        remaining -= distributed
+        if remaining <= 0:
+            break
+        for _, _, weight in sorted(remainders, reverse=True):
+            capacity = dict(capacities)[weight]
+            if remaining <= 0:
+                break
+            if allocations[weight] < capacity:
+                allocations[weight] += 1
+                remaining -= 1
+
+    return tuple(
+        (weight, allocations[weight])
+        for weight, _ in capacities
+        if allocations[weight] > 0
+    )
+
+
+def _mask_from_bit_indexes(bit_indexes: Sequence[int]) -> int:
+    """Build a bitmask from selected bit indexes."""
+    mask = 0
+    for bit_index in bit_indexes:
+        mask |= 1 << bit_index
+    return mask
+
+
+def _all_masks_with_weight(r: int, weight: int) -> Tuple[int, ...]:
+    """Materialize all masks for a small Hamming-weight stratum."""
+    return tuple(_mask_from_bit_indexes(bits) for bits in combinations(range(r), weight))
+
+
+def _random_mask_with_weight(r: int, weight: int, rng: random.Random) -> int:
+    """Sample one mask with an exact Hamming weight."""
+    return _mask_from_bit_indexes(rng.sample(range(r), weight))
+
+
+def _sample_masks_with_weight(
+    r: int,
+    weight: int,
+    sample_count: int,
+    rng: random.Random,
+) -> Tuple[int, ...]:
+    """Sample unique masks from one Hamming-weight stratum."""
+    if sample_count <= 0:
+        return tuple()
+    capacity = math.comb(r, weight)
+    if sample_count >= capacity:
+        return _all_masks_with_weight(r, weight)
+    if capacity <= max(4096, sample_count * 4):
+        masks = list(_all_masks_with_weight(r, weight))
+        rng.shuffle(masks)
+        return tuple(masks[:sample_count])
+
+    sampled: set[int] = set()
+    max_attempts = max(sample_count * 20, 100)
+    attempts = 0
+    while len(sampled) < sample_count and attempts < max_attempts:
+        sampled.add(_random_mask_with_weight(r, weight, rng))
+        attempts += 1
+    if len(sampled) < sample_count:
+        masks = list(_all_masks_with_weight(r, weight))
+        rng.shuffle(masks)
+        for mask in masks:
+            sampled.add(mask)
+            if len(sampled) >= sample_count:
+                break
+    return tuple(sorted(sampled))
+
+
+def _sample_seed_for_restart(instance: BenchmarkInstance, restart_index: int) -> int:
+    """Derive a stable per-restart seed from the configured base seed and instance."""
+    return (
+        _sample_seed()
+        + restart_index * 1_000_003
+        + instance.n * 10_007
+        + instance.k * 1_009
+        + instance.target_distance * 101
+    )
+
+
+def stratified_sampled_candidates(
+    instance: BenchmarkInstance,
+    restart_index: int,
+) -> Tuple[Tuple[int, ...], int]:
+    """Generate a deterministic stratified candidate pool for one restart."""
+    budget = _sample_budget()
+    oversample_target = budget * _sample_oversample_factor()
+    allocations = _allocate_stratified_counts(
+        instance.r,
+        instance.target_distance,
+        oversample_target,
+    )
+    rng = random.Random(_sample_seed_for_restart(instance, restart_index))
+    sampled: set[int] = set()
+    for weight, sample_count in allocations:
+        sampled.update(_sample_masks_with_weight(instance.r, weight, sample_count, rng))
+    return tuple(sorted(sampled)), _sample_seed_for_restart(instance, restart_index)
 
 
 def _initialize_reachable_layers(r: int, distance: int) -> List[set[int]]:
@@ -476,12 +676,20 @@ def _create_process_candidate_pool(
             "'fork' multiprocessing; falling back to thread scoring"
         )
         return None
-    return ProcessPoolExecutor(
-        max_workers=worker_count,
-        mp_context=mp_context,
-        initializer=_initialize_process_priority_fn,
-        initargs=(program_path,),
-    )
+    try:
+        return ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=mp_context,
+            initializer=_initialize_process_priority_fn,
+            initargs=(program_path,),
+        )
+    except OSError as exc:
+        logger.warning(
+            "LINEAR_CODE_CANDIDATE_EXECUTOR=process requested, but process pool creation failed "
+            "(%s); falling back to thread scoring",
+            exc,
+        )
+        return None
 
 
 def _score_candidate_chunk(
@@ -845,30 +1053,106 @@ def _ranked_candidate_runs(
     return runs, candidate_count
 
 
-def greedy_construct(
+def ranked_sampled_candidates(
     instance: BenchmarkInstance,
     priority_fn: PriorityFn,
     restart_index: int,
-    show_progress: bool = False,
     candidate_workers: int | None = None,
-) -> SearchAttemptResult:
-    """Run one fixed sorted-greedy pass for a single benchmark instance."""
-    if _should_stream_candidates(instance.r):
-        return _greedy_construct_streaming(
+) -> Tuple[Tuple[int, ...], Tuple[Tuple[int, float], ...], int, int]:
+    """Compute a priority ordering from a deterministic stratified candidate sample."""
+    generation_started_at = time.perf_counter()
+    candidates, resolved_seed = stratified_sampled_candidates(instance, restart_index)
+    unique_sampled_count = len(candidates)
+    budget = _sample_budget()
+    _log_profile(
+        "sample_generation",
+        n=instance.n,
+        k=instance.k,
+        d=instance.target_distance,
+        r=instance.r,
+        restart=restart_index,
+        sample_budget=budget,
+        sample_seed=resolved_seed,
+        oversample_factor=_sample_oversample_factor(),
+        unique_sampled_candidates=unique_sampled_count,
+        elapsed_seconds=f"{time.perf_counter() - generation_started_at:.6f}",
+    )
+
+    worker_count = candidate_workers
+    if worker_count is None:
+        worker_count = _resolve_worker_count(
+            len(candidates),
+            env_name="LINEAR_CODE_CANDIDATE_WORKERS",
+            minimum_parallel_tasks=64,
+        )
+
+    executor_mode = "thread"
+    process_pool = None
+    if _candidate_executor_mode() == "process":
+        process_pool = _create_process_candidate_pool(priority_fn, worker_count)
+        if process_pool is not None:
+            executor_mode = "process"
+
+    try:
+        scoring_started_at = time.perf_counter()
+        scored_candidates = _score_candidate_chunk(
+            candidates,
             instance,
             priority_fn,
             restart_index,
-            candidate_workers=candidate_workers,
+            worker_count,
+            executor_mode=executor_mode,
+            process_pool=process_pool,
         )
-
-    search_state = IncrementalForbiddenState(instance.r, instance.target_distance)
-    ordered_candidates, ordered_scores = ranked_candidates(
-        instance,
-        priority_fn,
-        restart_index,
-        show_progress=show_progress,
-        candidate_workers=candidate_workers,
+    finally:
+        if process_pool is not None:
+            process_pool.shutdown()
+    _log_profile(
+        "sample_scoring",
+        n=instance.n,
+        k=instance.k,
+        d=instance.target_distance,
+        r=instance.r,
+        restart=restart_index,
+        candidate_count=len(candidates),
+        worker_count=worker_count,
+        executor_mode=executor_mode,
+        elapsed_seconds=f"{time.perf_counter() - scoring_started_at:.6f}",
     )
+
+    sort_started_at = time.perf_counter()
+    scored_candidates.sort(reverse=True)
+    selected_scores = scored_candidates[:budget]
+    _log_profile(
+        "sample_sort",
+        n=instance.n,
+        k=instance.k,
+        d=instance.target_distance,
+        r=instance.r,
+        restart=restart_index,
+        scored_count=len(scored_candidates),
+        retained_count=len(selected_scores),
+        elapsed_seconds=f"{time.perf_counter() - sort_started_at:.6f}",
+    )
+    ordered_candidates = tuple(candidate_mask for _, _, candidate_mask in selected_scores)
+    ordered_scores = tuple((candidate_mask, score) for score, _, candidate_mask in selected_scores)
+    return ordered_candidates, ordered_scores, unique_sampled_count, resolved_seed
+
+
+def _greedy_scan_ordered_candidates(
+    instance: BenchmarkInstance,
+    restart_index: int,
+    ordered_candidates: Sequence[int],
+    ordered_scores: Sequence[Tuple[int, float]],
+    show_progress: bool,
+    candidate_count: int,
+    search_mode: str = "exact",
+    sample_budget: int | None = None,
+    sample_seed: int | None = None,
+    unique_sampled_candidates: int | None = None,
+) -> SearchAttemptResult:
+    """Greedily scan an already ordered candidate sequence."""
+    search_state = IncrementalForbiddenState(instance.r, instance.target_distance)
     blocked_candidate_count = 0
     illegal_weight_histogram: Counter[int] = Counter()
 
@@ -894,7 +1178,8 @@ def greedy_construct(
         d=instance.target_distance,
         r=instance.r,
         restart=restart_index,
-        candidate_count=len(ordered_candidates),
+        search_mode=search_mode,
+        candidate_count=candidate_count,
         selected_count=len(selected),
         blocked_count=blocked_candidate_count,
         elapsed_seconds=f"{time.perf_counter() - greedy_started_at:.6f}",
@@ -908,13 +1193,89 @@ def greedy_construct(
         success=success,
         selected_free_columns=selected,
         added_free_columns=len(selected),
-        candidate_count=len(ordered_candidates),
+        candidate_count=candidate_count,
         restart_index=restart_index,
-        sorted_candidates=ordered_candidates,
-        sorted_scores=ordered_scores,
+        sorted_candidates=tuple(ordered_candidates),
+        sorted_scores=tuple(ordered_scores),
         blocked_candidate_count=blocked_candidate_count,
         illegal_weight_histogram=tuple(sorted(illegal_weight_histogram.items())),
         chosen_weights=tuple(popcount(mask) for mask in selected),
+        search_mode=search_mode,
+        sample_budget=sample_budget,
+        sample_seed=sample_seed,
+        unique_sampled_candidates=unique_sampled_candidates,
+    )
+
+
+def greedy_construct(
+    instance: BenchmarkInstance,
+    priority_fn: PriorityFn,
+    restart_index: int,
+    show_progress: bool = False,
+    candidate_workers: int | None = None,
+) -> SearchAttemptResult:
+    """Run one fixed sorted-greedy pass for a single benchmark instance."""
+    if _search_mode() == "sampled":
+        return _greedy_construct_sampled(
+            instance,
+            priority_fn,
+            restart_index,
+            show_progress=show_progress,
+            candidate_workers=candidate_workers,
+        )
+
+    if _should_stream_candidates(instance.r):
+        return _greedy_construct_streaming(
+            instance,
+            priority_fn,
+            restart_index,
+            candidate_workers=candidate_workers,
+        )
+
+    ordered_candidates, ordered_scores = ranked_candidates(
+        instance,
+        priority_fn,
+        restart_index,
+        show_progress=show_progress,
+        candidate_workers=candidate_workers,
+    )
+    return _greedy_scan_ordered_candidates(
+        instance,
+        restart_index,
+        ordered_candidates,
+        ordered_scores,
+        show_progress,
+        len(ordered_candidates),
+    )
+
+
+def _greedy_construct_sampled(
+    instance: BenchmarkInstance,
+    priority_fn: PriorityFn,
+    restart_index: int,
+    show_progress: bool = False,
+    candidate_workers: int | None = None,
+) -> SearchAttemptResult:
+    """Run the approximate greedy search over a stratified sampled candidate pool."""
+    ordered_candidates, ordered_scores, unique_sampled_count, resolved_seed = (
+        ranked_sampled_candidates(
+            instance,
+            priority_fn,
+            restart_index,
+            candidate_workers=candidate_workers,
+        )
+    )
+    return _greedy_scan_ordered_candidates(
+        instance,
+        restart_index,
+        ordered_candidates,
+        ordered_scores,
+        show_progress,
+        len(ordered_candidates),
+        search_mode="sampled",
+        sample_budget=_sample_budget(),
+        sample_seed=resolved_seed,
+        unique_sampled_candidates=unique_sampled_count,
     )
 
 
@@ -994,6 +1355,12 @@ def best_restart_for_instance(
         env_name="LINEAR_CODE_RESTART_WORKERS",
         minimum_parallel_tasks=2,
     )
+    if (
+        _search_mode() == "sampled"
+        and _env_worker_override("LINEAR_CODE_RESTART_WORKERS") is None
+        and _env_worker_override("LINEAR_CODE_CANDIDATE_WORKERS") is not None
+    ):
+        restart_worker_count = 1
     if show_progress or restart_worker_count <= 1:
         attempts = [
             greedy_construct(
@@ -1127,9 +1494,13 @@ def evaluate_priority_function(
                 {
                     "success": attempt.success,
                     "restart": attempt.restart_index,
+                    "search_mode": attempt.search_mode,
                     "added_free_columns": attempt.added_free_columns,
                     "candidate_count": attempt.candidate_count,
                     "blocked_candidates": attempt.blocked_candidate_count,
+                    "sample_budget": attempt.sample_budget,
+                    "sample_seed": attempt.sample_seed,
+                    "unique_sampled_candidates": attempt.unique_sampled_candidates,
                     "target_free_columns": active_instance.k,
                     "selected_free_columns": [
                         format_mask(mask, active_instance.r)

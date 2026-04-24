@@ -187,10 +187,86 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         ]
         self.assertTrue(
             any(
-                "stage=candidate_scoring" in message and "executor_mode=process" in message
+                "stage=candidate_scoring" in message and "executor_mode=" in message
                 for message in profile_messages
             )
         )
+
+    def test_sampled_search_is_deterministic_for_fixed_seed(self):
+        """Sampled mode should be reproducible for the same instance, restart, and seed."""
+        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=1)
+        priority_fn = self.initial_program.get_priority_function()
+
+        sampled_env = {
+            "LINEAR_CODE_SEARCH_MODE": "sampled",
+            "LINEAR_CODE_SAMPLE_BUDGET": "4",
+            "LINEAR_CODE_SAMPLE_SEED": "123",
+            "LINEAR_CODE_SAMPLE_OVERSAMPLE_FACTOR": "1",
+        }
+        with mock.patch.dict(os.environ, sampled_env, clear=False):
+            first = self.search_core.best_restart_for_instance(instance, priority_fn)
+            second = self.search_core.best_restart_for_instance(instance, priority_fn)
+
+        self.assertEqual(first.selected_free_columns, second.selected_free_columns)
+        self.assertEqual(first.sorted_scores, second.sorted_scores)
+        self.assertEqual(first.search_mode, "sampled")
+        self.assertEqual(first.sample_budget, 4)
+        self.assertLessEqual(first.candidate_count, 4)
+
+    def test_sampled_search_artifacts_report_sampling_metadata(self):
+        """Evaluation artifacts should expose sampled-mode budget and seed details."""
+        instance = self.search_core.make_instance(n=10, k=5, distance=3, restarts=1)
+        sampled_env = {
+            "LINEAR_CODE_SEARCH_MODE": "sampled",
+            "LINEAR_CODE_SAMPLE_BUDGET": "10",
+            "LINEAR_CODE_SAMPLE_SEED": "7",
+            "LINEAR_CODE_SAMPLE_OVERSAMPLE_FACTOR": "2",
+        }
+        with mock.patch.dict(os.environ, sampled_env, clear=False):
+            result = self.search_core.evaluate_priority_function(
+                self.initial_program.get_priority_function(),
+                instance,
+            )
+
+        search_result = json.loads(result.artifacts["search_result"])
+        selected = tuple(int(bits, 2) for bits in search_result["selected_free_columns"])
+        self.assertEqual(search_result["search_mode"], "sampled")
+        self.assertEqual(search_result["sample_budget"], 10)
+        self.assertIsInstance(search_result["sample_seed"], int)
+        self.assertGreaterEqual(
+            search_result["unique_sampled_candidates"],
+            search_result["candidate_count"],
+        )
+        self.assertLessEqual(search_result["candidate_count"], 10)
+        self.assertTrue(
+            self.search_core.validate_free_columns(
+                instance.r,
+                selected,
+                instance.target_distance,
+            )
+        )
+
+    def test_sampled_restart_index_changes_candidate_pool(self):
+        """Different restart indices should explore different deterministic samples."""
+        instance = self.search_core.make_instance(n=14, k=4, distance=4, restarts=2)
+        sampled_env = {
+            "LINEAR_CODE_SEARCH_MODE": "sampled",
+            "LINEAR_CODE_SAMPLE_BUDGET": "20",
+            "LINEAR_CODE_SAMPLE_SEED": "99",
+            "LINEAR_CODE_SAMPLE_OVERSAMPLE_FACTOR": "1",
+        }
+        with mock.patch.dict(os.environ, sampled_env, clear=False):
+            first, first_seed = self.search_core.stratified_sampled_candidates(instance, 0)
+            first_again, first_seed_again = self.search_core.stratified_sampled_candidates(
+                instance,
+                0,
+            )
+            second, second_seed = self.search_core.stratified_sampled_candidates(instance, 1)
+
+        self.assertEqual(first, first_again)
+        self.assertEqual(first_seed, first_seed_again)
+        self.assertNotEqual(first, second)
+        self.assertNotEqual(first_seed, second_seed)
 
     def test_stage_profile_logging_is_disabled_by_default(self):
         """Profiling logs should stay silent unless explicitly enabled."""

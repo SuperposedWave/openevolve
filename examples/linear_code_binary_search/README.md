@@ -31,6 +31,12 @@ The evaluator reads the target instance from environment variables:
 - optional: `LINEAR_CODE_RESTARTS`
 - optional: `LINEAR_CODE_CANDIDATE_WORKERS`
 - optional: `LINEAR_CODE_RESTART_WORKERS`
+- optional: `LINEAR_CODE_SEARCH_MODE=exact|sampled`
+- optional sampled mode controls:
+  - `LINEAR_CODE_SAMPLE_BUDGET`
+  - `LINEAR_CODE_SAMPLE_SEED`
+  - `LINEAR_CODE_STRATA_PER_WEIGHT`
+  - `LINEAR_CODE_SAMPLE_OVERSAMPLE_FACTOR`
 
 If you do not set them, the default target is `[8,4,4]_2`.
 
@@ -38,6 +44,11 @@ The greedy fill itself stays sequential because each accepted column updates the
 
 - candidate scoring inside one restart,
 - and evaluation across independent restart indices.
+
+For large instances, `LINEAR_CODE_SEARCH_MODE=sampled` enables an approximate path
+that samples candidates by Hamming-weight strata before scoring and sorting them.
+This avoids full candidate ranking and temporary run files, but it does not
+reproduce the exact full-order greedy result.
 
 ## Files
 
@@ -68,6 +79,18 @@ To inspect the baseline without running evolution:
 
 ```bash
 LINEAR_CODE_N=7 LINEAR_CODE_K=4 LINEAR_CODE_D=3 python initial_program.py
+```
+
+To try the sampled search path on a large verification run:
+
+```bash
+LINEAR_CODE_N=50 LINEAR_CODE_K=20 LINEAR_CODE_D=13 \
+LINEAR_CODE_SEARCH_MODE=sampled \
+LINEAR_CODE_SAMPLE_BUDGET=2000000 \
+LINEAR_CODE_RESTARTS=64 \
+LINEAR_CODE_CANDIDATE_WORKERS=16 \
+LINEAR_CODE_CANDIDATE_EXECUTOR=process \
+python verify_distance.py --no-progress path/to/best_program.py
 ```
 
 To batch-run all valid `(n,k)` entries with `10 < n <= 40`, using `d = lower` from `Misc/ECCRecord.json`:
