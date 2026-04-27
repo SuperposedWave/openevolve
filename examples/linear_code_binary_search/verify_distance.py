@@ -36,6 +36,15 @@ def main() -> None:
     parser.add_argument("--K", type=int, dest="k", help="Code dimension k.")
     parser.add_argument("--D", type=int, dest="d", help="Target minimum distance d.")
     parser.add_argument("--restarts", type=int, help="Number of randomized restarts.")
+    parser.add_argument(
+        "--target-only",
+        "--skip-actual-distance",
+        action="store_true",
+        help=(
+            "Skip exhaustive d_actual computation and report only whether the construction "
+            "meets the target distance certified by the greedy state."
+        ),
+    )
     args = parser.parse_args()
 
     program_path = Path(args.program_path).resolve()
@@ -52,7 +61,9 @@ def main() -> None:
         priority_fn,
         show_progress=not args.no_progress,
     )
-    d_actual = actual_minimum_distance(instance.r, attempt.selected_free_columns)
+    d_actual = None
+    if not args.target_only:
+        d_actual = actual_minimum_distance(instance.r, attempt.selected_free_columns)
     matrix_rows = parity_check_matrix_rows(instance.r, attempt.selected_free_columns)
     generator_rows = generator_matrix_rows(instance.r, attempt.selected_free_columns)
     is_complete = attempt.added_free_columns == instance.k
@@ -76,8 +87,12 @@ def main() -> None:
         json.dumps(
             {
                 "success": attempt.success,
+                "search_mode": attempt.search_mode,
                 "added_free_columns": attempt.added_free_columns,
                 "remaining_free_columns": instance.k - attempt.added_free_columns,
+                "sample_budget": attempt.sample_budget,
+                "sample_seed": attempt.sample_seed,
+                "unique_sampled_candidates": attempt.unique_sampled_candidates,
                 "selected_free_columns": [
                     format(column_mask, f"0{instance.r}b")
                     for column_mask in attempt.selected_free_columns
@@ -86,7 +101,14 @@ def main() -> None:
             sort_keys=True,
         ),
     )
-    if is_complete:
+    if args.target_only:
+        if attempt.success:
+            print(f"d_at_least: {instance.target_distance}")
+            print("note: exact d_actual computation was skipped")
+        else:
+            print("d_actual: skipped")
+            print("warning: construction did not meet the target distance")
+    elif is_complete:
         print(f"d_actual: {d_actual}")
     else:
         print(f"d_partial: {d_actual}")

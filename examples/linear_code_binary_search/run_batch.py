@@ -203,6 +203,12 @@ def parse_verification_output(stdout: str) -> dict:
         parsed["distance"] = int(match.group(1))
         return parsed
 
+    match = re.search(r"^d_at_least:\s+(\d+)$", stdout, flags=re.MULTILINE)
+    if match:
+        parsed["verification_status"] = "target_only"
+        parsed["distance_lower_bound"] = int(match.group(1))
+        return parsed
+
     if stdout.strip():
         parsed["verification_status"] = "unknown"
     return parsed

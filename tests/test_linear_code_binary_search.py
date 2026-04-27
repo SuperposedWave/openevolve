@@ -75,6 +75,25 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
             )
             self.assertEqual(state.can_add(candidate_mask), expected)
 
+    def test_lazy_can_add_matches_bruteforce_validation(self):
+        """Lazy legality checks should match brute-force validation without eager masks."""
+        r = 5
+        distance = 4
+        selected = (7, 11, 13)
+        with mock.patch.dict(os.environ, {"LINEAR_CODE_EAGER_FORBIDDEN_LIMIT": "1"}, clear=False):
+            state = self.search_core.IncrementalForbiddenState(r, distance)
+            self.assertFalse(state.use_eager_forbidden)
+            for column_mask in selected:
+                state.add(column_mask)
+
+            for candidate_mask in self.search_core.candidate_masks(r, distance):
+                expected = self.search_core.validate_free_columns(
+                    r,
+                    selected + (candidate_mask,),
+                    distance,
+                )
+                self.assertEqual(state.can_add(candidate_mask), expected)
+
     def test_reachable_update_matches_rebuild(self):
         """Incremental xor-layer updates must agree with a full recomputation."""
         r = 5
@@ -268,6 +287,22 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertNotEqual(first_seed, second_seed)
 
+    def test_final_validation_can_be_skipped_for_large_searches(self):
+        """The greedy state can certify success without redundant exhaustive validation."""
+        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=1)
+        with mock.patch.dict(os.environ, {"LINEAR_CODE_SKIP_FINAL_VALIDATION": "1"}, clear=False):
+            with mock.patch.object(
+                self.search_core,
+                "validate_free_columns",
+                side_effect=AssertionError("validation should be skipped"),
+            ):
+                attempt = self.search_core.best_restart_for_instance(
+                    instance,
+                    self.initial_program.get_priority_function(),
+                )
+
+        self.assertTrue(attempt.success)
+
     def test_stage_profile_logging_is_disabled_by_default(self):
         """Profiling logs should stay silent unless explicitly enabled."""
         instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=1)
@@ -414,10 +449,13 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         """Verification parsing should classify complete and partial constructions."""
         complete = self.run_batch.parse_verification_output("d_actual: 7\nH shape: 11 x 18\n")
         partial = self.run_batch.parse_verification_output("d_partial: 9\nwarning: construction is incomplete\n")
+        target_only = self.run_batch.parse_verification_output("d_at_least: 13\n")
         self.assertEqual(complete["verification_status"], "complete")
         self.assertEqual(complete["distance"], 7)
         self.assertEqual(partial["verification_status"], "partial")
         self.assertEqual(partial["distance"], 9)
+        self.assertEqual(target_only["verification_status"], "target_only")
+        self.assertEqual(target_only["distance_lower_bound"], 13)
 
     def test_instance_name_is_stable_for_output_directories(self):
         """Per-instance directories should be named by n/k/d and stay deterministic."""
@@ -446,6 +484,29 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         self.assertIn('"n": 7', output)
         self.assertIn('"k": 4', output)
         self.assertIn('"d_target": 3', output)
+
+    def test_verify_distance_target_only_skips_exact_distance(self):
+        """Target-only verification should avoid exact d_actual enumeration."""
+        program_path = str(EXAMPLE_DIR / "initial_program.py")
+        stdout = io.StringIO()
+        argv = [
+            "verify_distance.py",
+            program_path,
+            "--no-progress",
+            "--target-only",
+            "--N",
+            "7",
+            "--K",
+            "4",
+            "--D",
+            "3",
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            with redirect_stdout(stdout):
+                self.verify_distance.main()
+        output = stdout.getvalue()
+        self.assertIn("d_at_least: 3", output)
+        self.assertNotIn("d_actual:", output)
 
 
 if __name__ == "__main__":

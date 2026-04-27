@@ -98,18 +98,33 @@ class IncrementalForbiddenState:
         self.r = r
         self.distance = distance
         self.max_subset_size = max(distance - 2, 0)
-        self.reachable = _initialize_reachable_layers(r, distance)
-        self.forbidden = set().union(*self.reachable)
+        self.use_eager_forbidden = (
+            _initial_forbidden_workload(r, distance) <= _eager_forbidden_limit()
+        )
+        if self.use_eager_forbidden:
+            self.reachable = _initialize_reachable_layers(r, distance)
+            self.forbidden = set().union(*self.reachable)
+        else:
+            self.reachable = [set() for _ in range(self.max_subset_size + 1)]
+            self.reachable[0].add(0)
+            self.forbidden: set[int] = set()
         self.selected_free_columns: List[int] = []
 
     def can_add(self, column_mask: int) -> bool:
-        return column_mask not in self.forbidden
+        if self.use_eager_forbidden:
+            return column_mask not in self.forbidden
+        return not _is_forbidden_by_lazy_layers(
+            column_mask,
+            self.reachable,
+            self.max_subset_size,
+        )
 
     def add(self, column_mask: int) -> None:
         if not self.can_add(column_mask):
             raise ValueError(f"Illegal free column {column_mask}")
         _add_column_to_reachable(self.reachable, column_mask, self.max_subset_size)
-        self.forbidden = set().union(*self.reachable)
+        if self.use_eager_forbidden:
+            self.forbidden = set().union(*self.reachable)
         self.selected_free_columns.append(column_mask)
 
 
@@ -252,6 +267,26 @@ def _strata_per_weight() -> int | None:
     return _env_positive_int("LINEAR_CODE_STRATA_PER_WEIGHT")
 
 
+def _final_validation_limit() -> int:
+    """Return the largest exhaustive validation workload allowed by default."""
+    return _env_positive_int("LINEAR_CODE_FINAL_VALIDATION_LIMIT") or 5_000_000
+
+
+def _force_final_validation() -> bool:
+    """Return whether to force the redundant exhaustive validation pass."""
+    return _env_flag_enabled("LINEAR_CODE_FORCE_FINAL_VALIDATION")
+
+
+def _skip_final_validation() -> bool:
+    """Return whether to skip the redundant exhaustive validation pass."""
+    return _env_flag_enabled("LINEAR_CODE_SKIP_FINAL_VALIDATION")
+
+
+def _eager_forbidden_limit() -> int:
+    """Return the largest initial forbidden set to materialize eagerly."""
+    return _env_positive_int("LINEAR_CODE_EAGER_FORBIDDEN_LIMIT") or 2_000_000
+
+
 @lru_cache(maxsize=None)
 def basis_columns(r: int) -> Tuple[int, ...]:
     """Systematic identity columns."""
@@ -292,6 +327,12 @@ def _eligible_weights(r: int, distance: int) -> Tuple[int, ...]:
 def _candidate_space_size_by_weight(r: int, distance: int) -> Tuple[Tuple[int, int], ...]:
     """Return eligible Hamming weights with their exact candidate-space sizes."""
     return tuple((weight, math.comb(r, weight)) for weight in _eligible_weights(r, distance))
+
+
+def _initial_forbidden_workload(r: int, distance: int) -> int:
+    """Return the number of identity-induced low-weight masks."""
+    max_subset_size = max(distance - 2, 0)
+    return sum(math.comb(r, weight) for weight in range(max_subset_size + 1))
 
 
 def _allocate_stratified_counts(
@@ -457,6 +498,22 @@ def _add_column_to_reachable(
             )
 
 
+def _is_forbidden_by_lazy_layers(
+    column_mask: int,
+    selected_reachable: Sequence[set[int]],
+    max_subset_size: int,
+) -> bool:
+    """Check legality against free-column xor layers plus implicit basis columns."""
+    for selected_subset_size, xor_values in enumerate(selected_reachable):
+        remaining_basis_columns = max_subset_size - selected_subset_size
+        if remaining_basis_columns < 0:
+            break
+        for xor_value in xor_values:
+            if popcount(column_mask ^ xor_value) <= remaining_basis_columns:
+                return True
+    return False
+
+
 def rebuild_reachable_layers(r: int, distance: int, free_columns: Sequence[int]) -> List[set[int]]:
     """Recompute xor layers from scratch for validation and tests."""
     reachable = _initialize_reachable_layers(r, distance)
@@ -496,6 +553,65 @@ def columns_meet_distance_requirement(columns: Sequence[int], distance: int) -> 
 def validate_free_columns(r: int, free_columns: Sequence[int], distance: int) -> bool:
     """Validate a systematic construction independently of the greedy state."""
     return columns_meet_distance_requirement(all_columns(r, free_columns), distance)
+
+
+def _independent_validation_workload(total_columns: int, distance: int) -> int:
+    """Return how many subsets an exhaustive distance validation would inspect."""
+    return sum(math.comb(total_columns, subset_size) for subset_size in range(1, distance))
+
+
+def _should_run_independent_validation(instance: BenchmarkInstance, selected_count: int) -> bool:
+    """Choose whether to run the redundant exhaustive validation pass."""
+    if _force_final_validation():
+        return True
+    if _skip_final_validation():
+        return False
+    total_columns = selected_count + instance.r
+    return (
+        _independent_validation_workload(total_columns, instance.target_distance)
+        <= _final_validation_limit()
+    )
+
+
+def _success_from_incremental_construction(
+    instance: BenchmarkInstance,
+    selected_free_columns: Sequence[int],
+) -> bool:
+    """Classify success without forcing an intractable redundant validation pass."""
+    if len(selected_free_columns) != instance.k:
+        return False
+    if not _should_run_independent_validation(instance, len(selected_free_columns)):
+        _log_profile(
+            "final_validation",
+            n=instance.n,
+            k=instance.k,
+            d=instance.target_distance,
+            r=instance.r,
+            validation="skipped",
+            workload=_independent_validation_workload(
+                len(selected_free_columns) + instance.r,
+                instance.target_distance,
+            ),
+            limit=_final_validation_limit(),
+        )
+        return True
+    validation_started_at = time.perf_counter()
+    is_valid = validate_free_columns(
+        instance.r,
+        selected_free_columns,
+        instance.target_distance,
+    )
+    _log_profile(
+        "final_validation",
+        n=instance.n,
+        k=instance.k,
+        d=instance.target_distance,
+        r=instance.r,
+        validation="exhaustive",
+        valid=int(is_valid),
+        elapsed_seconds=f"{time.perf_counter() - validation_started_at:.6f}",
+    )
+    return is_valid
 
 
 def actual_minimum_distance_from_columns(columns: Sequence[int]) -> int:
@@ -1184,11 +1300,7 @@ def _greedy_scan_ordered_candidates(
         blocked_count=blocked_candidate_count,
         elapsed_seconds=f"{time.perf_counter() - greedy_started_at:.6f}",
     )
-    success = len(selected) == instance.k and validate_free_columns(
-        instance.r,
-        selected,
-        instance.target_distance,
-    )
+    success = _success_from_incremental_construction(instance, selected)
     return SearchAttemptResult(
         success=success,
         selected_free_columns=selected,
@@ -1325,11 +1437,7 @@ def _greedy_construct_streaming(
         blocked_count=blocked_candidate_count,
         elapsed_seconds=f"{time.perf_counter() - greedy_started_at:.6f}",
     )
-    success = len(selected) == instance.k and validate_free_columns(
-        instance.r,
-        selected,
-        instance.target_distance,
-    )
+    success = _success_from_incremental_construction(instance, selected)
     return SearchAttemptResult(
         success=success,
         selected_free_columns=selected,

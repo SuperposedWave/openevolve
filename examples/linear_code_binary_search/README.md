@@ -90,8 +90,11 @@ LINEAR_CODE_SAMPLE_BUDGET=2000000 \
 LINEAR_CODE_RESTARTS=64 \
 LINEAR_CODE_CANDIDATE_WORKERS=16 \
 LINEAR_CODE_CANDIDATE_EXECUTOR=process \
-python verify_distance.py --no-progress path/to/best_program.py
+python verify_distance.py --no-progress --target-only path/to/best_program.py
 ```
+
+The `--target-only` flag skips exhaustive `d_actual` enumeration and reports the
+target-distance certificate from the greedy construction.
 
 To batch-run all valid `(n,k)` entries with `10 < n <= 40`, using `d = lower` from `Misc/ECCRecord.json`:
 
