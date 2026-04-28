@@ -1,4 +1,4 @@
-"""FunSearch-style static-priority search for binary matrix construction."""
+"""FunSearch-style static-priority search for ternary matrix construction."""
 
 from __future__ import annotations
 
@@ -42,6 +42,8 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 PriorityFn = Callable[[int, int, int, int], float]
+FIELD_ORDER = 3
+NONZERO_FIELD_ELEMENTS = tuple(range(1, FIELD_ORDER))
 _SCORED_RECORD_STRUCT = struct.Struct(">dQQ")
 _PROCESS_PRIORITY_FN: PriorityFn | None = None
 
@@ -57,7 +59,7 @@ class ParallelismPlan:
 
 @dataclass(frozen=True)
 class BenchmarkInstance:
-    """Single binary feasibility instance for a systematic parity-check search."""
+    """Single GF(3) feasibility instance for a systematic parity-check search."""
 
     name: str
     n: int
@@ -96,40 +98,120 @@ class ScoredChunkRun:
 
 
 class IncrementalForbiddenState:
-    """Maintains exact low-order xor layers for binary legality checks."""
+    """Maintains exact low-order GF(3) combination layers for legality checks."""
 
     def __init__(self, r: int, distance: int):
         self.r = r
         self.distance = distance
         self.max_subset_size = max(distance - 2, 0)
         self.reachable = _initialize_reachable_layers(r, distance)
-        self.forbidden = set().union(*self.reachable)
+        self.forbidden = forbidden_masks_from_layers(self.reachable)
         self.selected_free_columns: List[int] = []
 
-    def can_add(self, column_mask: int) -> bool:
-        return column_mask not in self.forbidden
+    def can_add(self, column_code: int) -> bool:
+        return normalize_column_code(column_code, self.r) not in self.forbidden
 
-    def add(self, column_mask: int) -> None:
-        if not self.can_add(column_mask):
-            raise ValueError(f"Illegal free column {column_mask}")
-        _add_column_to_reachable(self.reachable, column_mask, self.max_subset_size)
-        self.forbidden = set().union(*self.reachable)
-        self.selected_free_columns.append(column_mask)
+    def add(self, column_code: int) -> None:
+        normalized_code = normalize_column_code(column_code, self.r)
+        if not self.can_add(normalized_code):
+            raise ValueError(f"Illegal free column {column_code}")
+        _add_column_to_reachable(
+            self.reachable,
+            normalized_code,
+            self.r,
+            self.max_subset_size,
+        )
+        self.forbidden = forbidden_masks_from_layers(self.reachable)
+        self.selected_free_columns.append(normalized_code)
 
 
 DEFAULT_INSTANCE = BenchmarkInstance(
-    name="default_[8,4,4]",
-    n=8,
-    k=4,
+    name="default_[7,3,4]_3",
+    n=7,
+    k=3,
     target_distance=4,
     restarts=3,
     description="Default single-instance target used by the example.",
 )
 
 
-def popcount(mask: int) -> int:
-    """Return the Hamming weight of a binary mask."""
-    return mask.bit_count()
+def encode_column(digits: Sequence[int]) -> int:
+    """Encode a GF(3) column vector as a little-endian base-3 integer."""
+    code = 0
+    factor = 1
+    for digit in digits:
+        value = int(digit)
+        if value < 0 or value >= FIELD_ORDER:
+            raise ValueError(f"GF(3) digit out of range: {digit}")
+        code += value * factor
+        factor *= FIELD_ORDER
+    return code
+
+
+def decode_column(column_code: int, r: int) -> Tuple[int, ...]:
+    """Decode a base-3 integer into an r-coordinate GF(3) column vector."""
+    if column_code < 0:
+        raise ValueError("column_code must be non-negative")
+    digits = []
+    remaining = column_code
+    for _ in range(r):
+        digits.append(remaining % FIELD_ORDER)
+        remaining //= FIELD_ORDER
+    if remaining:
+        raise ValueError(f"column_code {column_code} does not fit in {r} GF(3) coordinates")
+    return tuple(digits)
+
+
+def _scale_digits(digits: Sequence[int], scalar: int) -> Tuple[int, ...]:
+    """Scale one GF(3) vector by a field scalar."""
+    return tuple((scalar * digit) % FIELD_ORDER for digit in digits)
+
+
+def _add_digits(left: Sequence[int], right: Sequence[int]) -> Tuple[int, ...]:
+    """Add two GF(3) vectors coordinate-wise."""
+    return tuple((a + b) % FIELD_ORDER for a, b in zip(left, right))
+
+
+def normalize_digits(digits: Sequence[int]) -> Tuple[int, ...]:
+    """Return the projective representative whose first non-zero coordinate is 1."""
+    normalized = tuple(digit % FIELD_ORDER for digit in digits)
+    for digit in normalized:
+        if digit:
+            if digit == 1:
+                return normalized
+            return _scale_digits(normalized, digit)
+    return normalized
+
+
+def normalize_column_code(column_code: int, r: int) -> int:
+    """Normalize a GF(3) column code up to non-zero scalar multiplication."""
+    return encode_column(normalize_digits(decode_column(column_code, r)))
+
+
+def support_weight(column_code: int, r: int) -> int:
+    """Return the Hamming support weight of a GF(3) column."""
+    return sum(1 for digit in decode_column(column_code, r) if digit)
+
+
+def popcount(column_code: int) -> int:
+    """Return support weight for a base-3 column without requiring trailing-zero width."""
+    count = 0
+    remaining = column_code
+    while remaining:
+        if remaining % FIELD_ORDER:
+            count += 1
+        remaining //= FIELD_ORDER
+    return count
+
+
+def format_column(column_code: int, r: int) -> str:
+    """GF(3) string representation in row order."""
+    return "".join(str(digit) for digit in decode_column(column_code, r))
+
+
+def parse_column(column_text: str) -> int:
+    """Parse a row-order GF(3) column string."""
+    return encode_column(tuple(int(digit) for digit in column_text.strip()))
 
 
 def _env_worker_override(name: str) -> int | None:
@@ -205,7 +287,7 @@ def _format_eta(total_seconds: float) -> str:
 
 
 def _candidate_chunk_size() -> int:
-    """Return the numeric mask-range chunk size for streaming candidate generation."""
+    """Return the numeric code-range chunk size for streaming candidate generation."""
     return _env_positive_int("LINEAR_CODE_CANDIDATE_CHUNK_SIZE") or (1 << 20)
 
 
@@ -221,7 +303,7 @@ def _candidate_map_chunksize(task_count: int, worker_count: int) -> int:
 
 
 def _streaming_mask_threshold() -> int:
-    """Return the mask-space threshold above which candidate streaming is enabled by default."""
+    """Return the code-space threshold above which candidate streaming is enabled by default."""
     return _env_positive_int("LINEAR_CODE_STREAMING_THRESHOLD_MASKS") or (1 << 22)
 
 
@@ -229,7 +311,7 @@ def _should_stream_candidates(r: int) -> bool:
     """Choose the candidate-processing strategy for the current redundancy."""
     if _env_flag_enabled("LINEAR_CODE_FORCE_STREAMING"):
         return True
-    return (1 << r) > _streaming_mask_threshold()
+    return (FIELD_ORDER**r) > _streaming_mask_threshold()
 
 
 def _candidate_executor_mode() -> str:
@@ -300,14 +382,22 @@ def _resolve_parallelism_plan(
 @lru_cache(maxsize=None)
 def basis_columns(r: int) -> Tuple[int, ...]:
     """Systematic identity columns."""
-    return tuple(1 << bit_index for bit_index in range(r))
+    return tuple(
+        encode_column(1 if coordinate == bit_index else 0 for coordinate in range(r))
+        for bit_index in range(r)
+    )
 
 
 @lru_cache(maxsize=None)
 def candidate_masks(r: int, distance: int) -> Tuple[int, ...]:
-    """All non-zero free columns that pass the initial weight filter."""
+    """All projective GF(3) free columns that pass the initial weight filter."""
     min_weight = max(distance - 1, 1)
-    return tuple(mask for mask in range(1, 1 << r) if popcount(mask) >= min_weight)
+    return tuple(
+        column_code
+        for column_code in range(1, FIELD_ORDER**r)
+        if column_code == normalize_column_code(column_code, r)
+        and support_weight(column_code, r) >= min_weight
+    )
 
 
 def candidate_mask_chunks(
@@ -315,14 +405,17 @@ def candidate_mask_chunks(
     distance: int,
     chunk_size: int | None = None,
 ) -> Iterator[Tuple[int, ...]]:
-    """Yield candidate masks in numeric-range chunks instead of one giant tuple."""
+    """Yield candidate codes in numeric-range chunks instead of one giant tuple."""
     min_weight = max(distance - 1, 1)
     resolved_chunk_size = chunk_size or _candidate_chunk_size()
-    upper_bound = 1 << r
+    upper_bound = FIELD_ORDER**r
     for chunk_start in range(1, upper_bound, resolved_chunk_size):
         chunk_end = min(chunk_start + resolved_chunk_size, upper_bound)
         chunk = tuple(
-            mask for mask in range(chunk_start, chunk_end) if popcount(mask) >= min_weight
+            column_code
+            for column_code in range(chunk_start, chunk_end)
+            if column_code == normalize_column_code(column_code, r)
+            and support_weight(column_code, r) >= min_weight
         )
         if chunk:
             yield chunk
@@ -376,39 +469,57 @@ def _iter_candidate_mask_chunks(
 
 
 def _initialize_reachable_layers(r: int, distance: int) -> List[set[int]]:
-    """Build exact xor layers for the initial systematic columns."""
+    """Build exact GF(3) projective span layers for the initial systematic columns."""
     max_subset_size = max(distance - 2, 0)
     reachable = [set() for _ in range(max_subset_size + 1)]
     reachable[0].add(0)
-    for column_mask in basis_columns(r):
-        _add_column_to_reachable(reachable, column_mask, max_subset_size)
+    for column_code in basis_columns(r):
+        _add_column_to_reachable(reachable, column_code, r, max_subset_size)
     return reachable
 
 
 def _add_column_to_reachable(
-    reachable: List[set[int]], column_mask: int, max_subset_size: int
+    reachable: List[set[int]], column_code: int, r: int, max_subset_size: int
 ) -> None:
-    """Incrementally update xor layers after accepting a new column."""
+    """Incrementally update GF(3) combination layers after accepting a new column."""
+    column_digits = decode_column(normalize_column_code(column_code, r), r)
     for subset_size in range(max_subset_size, 0, -1):
         previous_layer = reachable[subset_size - 1]
         if previous_layer:
-            reachable[subset_size].update(
-                xor_value ^ column_mask for xor_value in previous_layer
-            )
+            additions = set()
+            for prior_code in previous_layer:
+                prior_digits = decode_column(prior_code, r)
+                prior_scalars = (1,) if prior_code == 0 else NONZERO_FIELD_ELEMENTS
+                for prior_scalar in prior_scalars:
+                    scaled_prior = _scale_digits(prior_digits, prior_scalar)
+                    for column_scalar in NONZERO_FIELD_ELEMENTS:
+                        combined = _add_digits(
+                            scaled_prior,
+                            _scale_digits(column_digits, column_scalar),
+                        )
+                        combined_code = encode_column(combined)
+                        if combined_code:
+                            additions.add(normalize_column_code(combined_code, r))
+            reachable[subset_size].update(additions)
 
 
 def rebuild_reachable_layers(r: int, distance: int, free_columns: Sequence[int]) -> List[set[int]]:
-    """Recompute xor layers from scratch for validation and tests."""
+    """Recompute GF(3) combination layers from scratch for validation and tests."""
     reachable = _initialize_reachable_layers(r, distance)
     max_subset_size = max(distance - 2, 0)
-    for column_mask in free_columns:
-        _add_column_to_reachable(reachable, column_mask, max_subset_size)
+    for column_code in free_columns:
+        _add_column_to_reachable(
+            reachable,
+            normalize_column_code(column_code, r),
+            r,
+            max_subset_size,
+        )
     return reachable
 
 
 def forbidden_masks_from_layers(reachable: Sequence[set[int]]) -> set[int]:
-    """Flatten xor layers into the exact forbidden set."""
-    return set().union(*reachable)
+    """Flatten GF(3) combination layers into the exact forbidden set."""
+    return set().union(*reachable).difference({0})
 
 
 def initial_forbidden_masks(r: int, distance: int) -> set[int]:
@@ -418,46 +529,70 @@ def initial_forbidden_masks(r: int, distance: int) -> set[int]:
 
 def all_columns(r: int, free_columns: Sequence[int]) -> Tuple[int, ...]:
     """All columns in the systematic parity-check matrix."""
-    return tuple(free_columns) + basis_columns(r)
+    return tuple(normalize_column_code(column_code, r) for column_code in free_columns) + basis_columns(r)
 
 
-def columns_meet_distance_requirement(columns: Sequence[int], distance: int) -> bool:
-    """Exact distance check via exhaustive xor tests up to distance - 1."""
+def gf3_rank(columns: Sequence[int], r: int) -> int:
+    """Return the rank of GF(3) column vectors."""
+    rows = [list(decode_column(column_code, r)) for column_code in columns if column_code]
+    rank = 0
+    for coordinate in range(r):
+        pivot_index = None
+        for row_index in range(rank, len(rows)):
+            if rows[row_index][coordinate] % FIELD_ORDER:
+                pivot_index = row_index
+                break
+        if pivot_index is None:
+            continue
+        rows[rank], rows[pivot_index] = rows[pivot_index], rows[rank]
+        inverse = 1 if rows[rank][coordinate] == 1 else 2
+        rows[rank] = [(value * inverse) % FIELD_ORDER for value in rows[rank]]
+        for row_index in range(len(rows)):
+            if row_index == rank:
+                continue
+            factor = rows[row_index][coordinate] % FIELD_ORDER
+            if factor:
+                rows[row_index] = [
+                    (value - factor * pivot_value) % FIELD_ORDER
+                    for value, pivot_value in zip(rows[row_index], rows[rank])
+                ]
+        rank += 1
+        if rank == len(rows):
+            break
+    return rank
+
+
+def columns_meet_distance_requirement(columns: Sequence[int], distance: int, r: int) -> bool:
+    """Exact distance check via exhaustive GF(3) rank tests up to distance - 1."""
     for subset_size in range(1, distance):
         for subset in combinations(columns, subset_size):
-            xor_value = 0
-            for column_mask in subset:
-                xor_value ^= column_mask
-            if xor_value == 0:
+            if gf3_rank(subset, r) < subset_size:
                 return False
     return True
 
 
 def validate_free_columns(r: int, free_columns: Sequence[int], distance: int) -> bool:
     """Validate a systematic construction independently of the greedy state."""
-    return columns_meet_distance_requirement(all_columns(r, free_columns), distance)
+    return columns_meet_distance_requirement(all_columns(r, free_columns), distance, r)
 
 
-def actual_minimum_distance_from_columns(columns: Sequence[int]) -> int:
+def actual_minimum_distance_from_columns(columns: Sequence[int], r: int) -> int:
     """Return the exact minimum distance induced by a parity-check matrix column set."""
     total_columns = len(columns)
     for subset_size in range(1, total_columns + 1):
         for subset in combinations(columns, subset_size):
-            xor_value = 0
-            for column_mask in subset:
-                xor_value ^= column_mask
-            if xor_value == 0:
+            if gf3_rank(subset, r) < subset_size:
                 return subset_size
     return total_columns + 1
 
 
 def actual_minimum_distance(r: int, free_columns: Sequence[int]) -> int:
     """Return the exact minimum distance for H = [P^T | I_r]."""
-    return actual_minimum_distance_from_columns(all_columns(r, free_columns))
+    return actual_minimum_distance_from_columns(all_columns(r, free_columns), r)
 
 
 def exact_find_feasible_free_columns(r: int, k: int, distance: int) -> Tuple[int, ...] | None:
-    """Exact brute-force witness search for small binary instances."""
+    """Exact brute-force witness search for small GF(3) instances."""
     for free_columns in combinations(candidate_masks(r, distance), k):
         if validate_free_columns(r, free_columns, distance):
             return tuple(free_columns)
@@ -465,7 +600,7 @@ def exact_find_feasible_free_columns(r: int, k: int, distance: int) -> Tuple[int
 
 
 def exact_best_distance(n: int, k: int) -> Tuple[int, Tuple[int, ...]]:
-    """Exact best-distance search for small binary instances."""
+    """Exact best-distance search for small GF(3) instances."""
     r = n - k
     for distance in range(n, 1, -1):
         witness = exact_find_feasible_free_columns(r, k, distance)
@@ -490,9 +625,9 @@ def make_instance(
         raise ValueError("Require d <= n")
     r = n - k
     if distance - 1 > r and k > 1:
-        # This is not mathematically impossible in every case, but for this binary
+        # This is not mathematically impossible in every case, but for this ternary
         # systematic free-column search it leaves no eligible candidates beyond trivial cases.
-        raise ValueError("Requested d is too large for this binary free-column search regime")
+        raise ValueError("Requested d is too large for this ternary free-column search regime")
     return BenchmarkInstance(
         name=name or f"instance_[{n},{k},{distance}]",
         n=n,
@@ -512,33 +647,33 @@ def instance_from_env(prefix: str = "LINEAR_CODE_") -> BenchmarkInstance:
 
 
 def format_mask(mask: int, r: int) -> str:
-    """Binary string representation with fixed width."""
-    return format(mask, f"0{r}b")
+    """GF(3) column string representation with fixed width."""
+    return format_column(mask, r)
 
 
 def parity_check_matrix_rows(r: int, free_columns: Sequence[int]) -> Tuple[str, ...]:
-    """Return the parity-check matrix as row strings over F_2."""
+    """Return the parity-check matrix as row strings over GF(3)."""
     columns = all_columns(r, free_columns)
     rows = []
     for row_index in range(r):
-        row_bits = []
-        for column_mask in columns:
-            row_bits.append("1" if (column_mask >> row_index) & 1 else "0")
-        rows.append("".join(row_bits))
+        row_digits = []
+        for column_code in columns:
+            row_digits.append(str(decode_column(column_code, r)[row_index]))
+        rows.append("".join(row_digits))
     return tuple(rows)
 
 
 def generator_matrix_rows(r: int, free_columns: Sequence[int]) -> Tuple[str, ...]:
-    """Return the systematic generator matrix G = [I_k | P] as row strings over F_2."""
+    """Return the systematic generator matrix G = [I_k | -P] as row strings over GF(3)."""
     k = len(free_columns)
     rows = []
-    for row_index, column_mask in enumerate(free_columns):
-        identity_bits = ["1" if i == row_index else "0" for i in range(k)]
-        parity_bits = [
-            "1" if (column_mask >> bit_index) & 1 else "0"
-            for bit_index in range(r)
+    for row_index, column_code in enumerate(free_columns):
+        identity_digits = ["1" if i == row_index else "0" for i in range(k)]
+        parity_digits = [
+            str((-digit) % FIELD_ORDER)
+            for digit in decode_column(normalize_column_code(column_code, r), r)
         ]
-        rows.append("".join(identity_bits + parity_bits))
+        rows.append("".join(identity_digits + parity_digits))
     return tuple(rows)
 
 
@@ -547,13 +682,13 @@ def _safe_priority(priority_fn: PriorityFn, candidate_mask: int, n: int, k: int,
     try:
         value = priority_fn(candidate_mask, n, k, d)
     except Exception:
-        value = popcount(candidate_mask)
+        value = support_weight(candidate_mask, n - k)
     try:
         value = float(value)
     except (TypeError, ValueError):
-        value = float(popcount(candidate_mask))
+        value = float(support_weight(candidate_mask, n - k))
     if not math.isfinite(value):
-        return float(popcount(candidate_mask))
+        return float(support_weight(candidate_mask, n - k))
     return value
 
 
@@ -691,7 +826,7 @@ def _score_candidate_chunk(
 
 
 def _write_scored_chunk_run(records: Sequence[Tuple[float, int, int]]) -> ScoredChunkRun:
-    """Persist one scored candidate chunk as a sorted binary run on disk."""
+    """Persist one scored candidate chunk as a sorted binary file run on disk."""
     fd, path = tempfile.mkstemp(prefix="linear-code-run-", suffix=".bin")
     record_count = 0
     try:
@@ -922,7 +1057,7 @@ def _ranked_candidate_runs(
     candidate_count = 0
     processed_chunks = 0
     chunk_size = _candidate_chunk_size()
-    total_chunks = max(math.ceil(((1 << instance.r) - 1) / chunk_size), 1)
+    total_chunks = max(math.ceil(((FIELD_ORDER**instance.r) - 1) / chunk_size), 1)
     streaming_started_at = time.perf_counter()
     if worker_count is None:
         worker_count = _resolve_worker_count(
@@ -1089,7 +1224,7 @@ def greedy_construct(
             search_state.add(candidate_mask)
         else:
             blocked_candidate_count += 1
-            illegal_weight_histogram[popcount(candidate_mask)] += 1
+            illegal_weight_histogram[support_weight(candidate_mask, instance.r)] += 1
 
     selected = tuple(search_state.selected_free_columns)
     _log_profile(
@@ -1119,7 +1254,7 @@ def greedy_construct(
         sorted_scores=ordered_scores,
         blocked_candidate_count=blocked_candidate_count,
         illegal_weight_histogram=tuple(sorted(illegal_weight_histogram.items())),
-        chosen_weights=tuple(popcount(mask) for mask in selected),
+        chosen_weights=tuple(support_weight(mask, instance.r) for mask in selected),
     )
 
 
@@ -1148,12 +1283,16 @@ def _greedy_construct_streaming(
             if len(top_ranked_scores) < 10:
                 top_ranked_scores.append((candidate_mask, score))
             if len(search_state.selected_free_columns) >= instance.k:
-                break
+                if len(top_ranked_scores) >= 10:
+                    break
+                continue
             if search_state.can_add(candidate_mask):
                 search_state.add(candidate_mask)
             else:
                 blocked_candidate_count += 1
-                illegal_weight_histogram[popcount(candidate_mask)] += 1
+                illegal_weight_histogram[support_weight(candidate_mask, instance.r)] += 1
+            if len(search_state.selected_free_columns) >= instance.k and len(top_ranked_scores) >= 10:
+                break
     finally:
         _cleanup_scored_chunk_runs(runs)
 
@@ -1185,7 +1324,7 @@ def _greedy_construct_streaming(
         sorted_scores=tuple(top_ranked_scores),
         blocked_candidate_count=blocked_candidate_count,
         illegal_weight_histogram=tuple(sorted(illegal_weight_histogram.items())),
-        chosen_weights=tuple(popcount(mask) for mask in selected),
+        chosen_weights=tuple(support_weight(mask, instance.r) for mask in selected),
     )
 
 
@@ -1277,7 +1416,7 @@ def load_priority_function(program_path: str) -> PriorityFn:
     spec.loader.exec_module(module)
 
     if not hasattr(module, "priority"):
-        raise AttributeError("Program must define a priority(column_mask, n, k, d) function")
+        raise AttributeError("Program must define a priority(column_code, n, k, d) function")
     return module.priority
 
 

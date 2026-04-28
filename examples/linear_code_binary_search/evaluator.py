@@ -1,4 +1,4 @@
-"""OpenEvolve evaluator for binary linear-code feasibility search."""
+"""OpenEvolve evaluator for ternary linear-code feasibility search."""
 
 from search_core import evaluate_program_path
 

@@ -10,6 +10,7 @@ from pathlib import Path
 from search_core import (
     actual_minimum_distance,
     best_restart_for_instance,
+    format_mask,
     generator_matrix_rows,
     instance_from_env,
     make_instance,
@@ -33,13 +34,13 @@ def _configure_console_logging() -> None:
 def main() -> None:
     _configure_console_logging()
     parser = argparse.ArgumentParser(
-        description="Construct H from a priority program and report the actual minimum distance."
+        description="Construct a GF(3) H from a priority program and report the actual minimum distance."
     )
     parser.add_argument(
         "program_path",
         nargs="?",
         default="initial_program.py",
-        help="Path to a Python file that defines priority(column_mask, n, k, d).",
+        help="Path to a Python file that defines priority(column_code, n, k, d).",
     )
     parser.add_argument(
         "--no-progress",
@@ -93,7 +94,7 @@ def main() -> None:
                 "added_free_columns": attempt.added_free_columns,
                 "remaining_free_columns": instance.k - attempt.added_free_columns,
                 "selected_free_columns": [
-                    format(column_mask, f"0{instance.r}b")
+                    format_mask(column_mask, instance.r)
                     for column_mask in attempt.selected_free_columns
                 ],
             },
@@ -106,7 +107,7 @@ def main() -> None:
         print(f"d_partial: {d_actual}")
         print("warning: construction is incomplete, so this distance only applies to the partial column set")
 
-    print(f"H shape: {instance.r} x {attempt.added_free_columns + instance.r}")
+    print(f"H shape: {instance.r} x {attempt.added_free_columns + instance.r} over GF(3)")
     if is_complete:
         print("H rows:")
     else:
@@ -115,10 +116,13 @@ def main() -> None:
         print(row)
 
     if is_complete:
-        print(f"G shape: {instance.k} x {instance.n}")
+        print(f"G shape: {instance.k} x {instance.n} over GF(3)")
         print("G rows:")
     else:
-        print(f"Partial G shape: {attempt.added_free_columns} x {attempt.added_free_columns + instance.r}")
+        print(
+            "Partial G shape: "
+            f"{attempt.added_free_columns} x {attempt.added_free_columns + instance.r} over GF(3)"
+        )
         print("Partial G rows:")
     for row in generator_rows:
         print(row)

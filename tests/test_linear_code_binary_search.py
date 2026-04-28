@@ -1,4 +1,4 @@
-"""Tests for the binary linear-code feasibility example."""
+"""Tests for the ternary linear-code feasibility example."""
 
 import importlib.util
 import io
@@ -26,8 +26,8 @@ def _load_module(module_name: str, path: Path):
     return module
 
 
-class TestLinearCodeBinarySearch(unittest.TestCase):
-    """Regression coverage for the new linear-code example."""
+class TestLinearCodeTernarySearch(unittest.TestCase):
+    """Regression coverage for the GF(3) linear-code example."""
 
     @classmethod
     def setUpClass(cls):
@@ -46,50 +46,86 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
             EXAMPLE_DIR / "verify_distance.py",
         )
 
-    def test_initial_forbidden_matches_weight_threshold(self):
-        """Systematic initialization should match the exact low-weight forbidden set."""
-        r = 5
-        distance = 4
-        forbidden = self.search_core.initial_forbidden_masks(r, distance)
-        expected = {
-            mask
-            for mask in range(1 << r)
-            if self.search_core.popcount(mask) <= distance - 2
-        }
-        self.assertEqual(forbidden, expected)
+    def _code(self, digits):
+        return self.search_core.encode_column(tuple(digits))
 
-    def test_can_add_matches_bruteforce_validation(self):
-        """Incremental membership checks must match an independent brute-force test."""
+    def _projective_codes_with_support_at_most(self, r, max_weight):
+        expected = set()
+        for code in range(1, 3**r):
+            normalized = self.search_core.normalize_column_code(code, r)
+            if code == normalized and self.search_core.support_weight(code, r) <= max_weight:
+                expected.add(code)
+        return expected
+
+    def test_base3_encoding_and_projective_normalization(self):
+        """Column helpers should encode base-3 vectors and collapse scalar multiples."""
+        code = self._code((2, 0, 1, 2))
+        self.assertEqual(self.search_core.decode_column(code, 4), (2, 0, 1, 2))
+        self.assertEqual(self.search_core.support_weight(code, 4), 3)
+        self.assertEqual(
+            self.search_core.decode_column(
+                self.search_core.normalize_column_code(code, 4),
+                4,
+            ),
+            (1, 0, 2, 1),
+        )
+        self.assertEqual(
+            self.search_core.normalize_column_code(self._code((1, 2, 0)), 3),
+            self.search_core.normalize_column_code(self._code((2, 1, 0)), 3),
+        )
+
+    def test_initial_forbidden_matches_projective_low_weight_vectors(self):
+        """Systematic initialization should forbid low-weight GF(3) projective columns."""
         r = 4
         distance = 4
-        selected = (7, 11)
-        state = self.search_core.IncrementalForbiddenState(r, distance)
-        for column_mask in selected:
-            state.add(column_mask)
+        forbidden = self.search_core.initial_forbidden_masks(r, distance)
+        expected = self._projective_codes_with_support_at_most(r, distance - 2)
+        self.assertEqual(forbidden, expected)
 
-        for candidate_mask in self.search_core.candidate_masks(r, distance):
+    def test_can_add_matches_gf3_bruteforce_validation(self):
+        """Incremental membership checks must match independent GF(3) rank validation."""
+        r = 3
+        distance = 3
+        selected = (self._code((1, 1, 0)),)
+        state = self.search_core.IncrementalForbiddenState(r, distance)
+        for column_code in selected:
+            state.add(column_code)
+
+        for candidate_code in self.search_core.candidate_masks(r, distance):
             expected = self.search_core.validate_free_columns(
                 r,
-                selected + (candidate_mask,),
+                selected + (candidate_code,),
                 distance,
             )
-            self.assertEqual(state.can_add(candidate_mask), expected)
+            self.assertEqual(state.can_add(candidate_code), expected)
 
     def test_reachable_update_matches_rebuild(self):
-        """Incremental xor-layer updates must agree with a full recomputation."""
-        r = 5
+        """Incremental GF(3) combination layers must agree with a full recomputation."""
+        r = 4
         distance = 4
-        selected = (7, 11, 13)
+        selected = (
+            self._code((1, 1, 1, 0)),
+            self._code((1, 2, 0, 1)),
+        )
         state = self.search_core.IncrementalForbiddenState(r, distance)
-        for column_mask in selected:
-            state.add(column_mask)
+        for column_code in selected:
+            state.add(column_code)
 
         rebuilt = self.search_core.rebuild_reachable_layers(r, distance, selected)
         self.assertEqual(state.reachable, rebuilt)
         self.assertEqual(state.forbidden, self.search_core.forbidden_masks_from_layers(rebuilt))
 
+    def test_candidate_generation_uses_projective_ternary_columns(self):
+        """Candidate generation should keep one representative per GF(3) projective point."""
+        candidates = self.search_core.candidate_masks(r=3, distance=3)
+        self.assertEqual(len(candidates), 10)
+        self.assertTrue(all(self.search_core.support_weight(code, 3) >= 2 for code in candidates))
+        self.assertEqual(len(candidates), len({self.search_core.normalize_column_code(code, 3) for code in candidates}))
+        self.assertIn(self._code((1, 2, 0)), candidates)
+        self.assertNotIn(self._code((2, 1, 0)), candidates)
+
     def test_baseline_priority_builds_valid_code_on_default_instance(self):
-        """The baseline priority heuristic should solve the default single instance."""
+        """The baseline ternary priority heuristic should solve the default instance."""
         result = self.search_core.evaluate_priority_function(self.initial_program.get_priority_function())
         self.assertGreater(result.metrics["combined_score"], 0.0)
         self.assertEqual(result.metrics["success_rate"], 1.0)
@@ -97,7 +133,10 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         self.assertGreaterEqual(result.metrics["evaluation_time_seconds"], 0.0)
 
         search_result = json.loads(result.artifacts["search_result"])
-        selected = tuple(int(bits, 2) for bits in search_result["selected_free_columns"])
+        selected = tuple(
+            self.search_core.parse_column(bits)
+            for bits in search_result["selected_free_columns"]
+        )
         instance = self.search_core.DEFAULT_INSTANCE
         self.assertTrue(
             self.search_core.validate_free_columns(
@@ -108,14 +147,14 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         )
 
     def test_static_priority_signature_is_supported(self):
-        """The evaluator should accept a static priority(column_mask, n, k, d) interface."""
+        """The evaluator should accept a static priority(column_code, n, k, d) interface."""
         priority_fn = self.initial_program.get_priority_function()
-        score = priority_fn(0b1110, 8, 4, 4)
+        score = priority_fn(self._code((1, 2, 0, 1)), 7, 3, 4)
         self.assertIsInstance(score, (int, float))
 
     def test_candidate_ranking_is_deterministic(self):
-        """The full candidate ordering should be stable for a fixed instance."""
-        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=1)
+        """The full candidate ordering should be stable for a fixed ternary instance."""
+        instance = self.search_core.make_instance(n=7, k=3, distance=4, restarts=1)
         priority_fn = self.initial_program.get_priority_function()
         first_order, first_scores = self.search_core.ranked_candidates(instance, priority_fn, 0)
         second_order, second_scores = self.search_core.ranked_candidates(instance, priority_fn, 0)
@@ -124,7 +163,7 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
 
     def test_streaming_candidate_path_matches_materialized_search_on_small_instance(self):
         """Forced chunked processing should preserve exact greedy results on small instances."""
-        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=1)
+        instance = self.search_core.make_instance(n=7, k=3, distance=4, restarts=1)
         priority_fn = self.initial_program.get_priority_function()
 
         with mock.patch.dict(os.environ, {}, clear=False):
@@ -135,7 +174,7 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
             os.environ,
             {
                 "LINEAR_CODE_FORCE_STREAMING": "1",
-                "LINEAR_CODE_CANDIDATE_CHUNK_SIZE": "3",
+                "LINEAR_CODE_CANDIDATE_CHUNK_SIZE": "5",
             },
             clear=False,
         ):
@@ -151,7 +190,7 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
 
     def test_process_scored_streaming_matches_baseline_on_small_instance(self):
         """Optional process-based chunk scoring should preserve exact greedy results."""
-        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=1)
+        instance = self.search_core.make_instance(n=7, k=3, distance=4, restarts=1)
         priority_fn = self.initial_program.get_priority_function()
 
         with mock.patch.dict(os.environ, {}, clear=False):
@@ -163,7 +202,7 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
             os.environ,
             {
                 "LINEAR_CODE_FORCE_STREAMING": "1",
-                "LINEAR_CODE_CANDIDATE_CHUNK_SIZE": "3",
+                "LINEAR_CODE_CANDIDATE_CHUNK_SIZE": "5",
                 "LINEAR_CODE_CANDIDATE_EXECUTOR": "process",
                 "LINEAR_CODE_CANDIDATE_WORKERS": "2",
                 "LINEAR_CODE_PROFILE": "1",
@@ -202,7 +241,7 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
 
     def test_stage_profile_logging_is_disabled_by_default(self):
         """Profiling logs should stay silent unless explicitly enabled."""
-        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=1)
+        instance = self.search_core.make_instance(n=7, k=3, distance=4, restarts=1)
         priority_fn = self.initial_program.get_priority_function()
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("LINEAR_CODE_PROFILE", None)
@@ -217,7 +256,7 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
 
     def test_stage_profile_logging_reports_major_search_phases(self):
         """Opt-in profiling should log candidate generation, sorting, and greedy scan stages."""
-        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=1)
+        instance = self.search_core.make_instance(n=7, k=3, distance=4, restarts=1)
         priority_fn = self.initial_program.get_priority_function()
         with mock.patch.dict(os.environ, {"LINEAR_CODE_PROFILE": "1"}, clear=False):
             with mock.patch.object(self.search_core.logger, "info") as mock_info:
@@ -227,24 +266,12 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
             for call in mock_info.call_args_list
             if call.args and "linear_code_profile" in call.args[0]
         ]
-        self.assertTrue(
-            any("stage=candidate_generation" in message for message in profile_messages)
-        )
-        self.assertTrue(
-            any("stage=candidate_scoring" in message for message in profile_messages)
-        )
-        self.assertTrue(
-            any("stage=candidate_sort" in message for message in profile_messages)
-        )
-        self.assertTrue(
-            any("stage=parallelism_plan" in message for message in profile_messages)
-        )
-        self.assertTrue(
-            any("stage=greedy_scan" in message for message in profile_messages)
-        )
-        self.assertTrue(
-            any("stage=evaluation_summary" in message for message in profile_messages)
-        )
+        self.assertTrue(any("stage=candidate_generation" in message for message in profile_messages))
+        self.assertTrue(any("stage=candidate_scoring" in message for message in profile_messages))
+        self.assertTrue(any("stage=candidate_sort" in message for message in profile_messages))
+        self.assertTrue(any("stage=parallelism_plan" in message for message in profile_messages))
+        self.assertTrue(any("stage=greedy_scan" in message for message in profile_messages))
+        self.assertTrue(any("stage=evaluation_summary" in message for message in profile_messages))
 
     def test_parallelism_plan_prioritizes_candidate_workers_on_smaller_streaming_runs(self):
         """Smaller CPU budgets should keep restarts sequential and spend cores on scoring."""
@@ -285,11 +312,17 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
 
     def test_process_chunk_scoring_uses_auto_and_manual_map_chunksize(self):
         """Process-backed chunk scoring should derive and honor map batch sizes."""
-        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=1)
+        instance = self.search_core.make_instance(n=7, k=3, distance=4, restarts=1)
         priority_fn = self.initial_program.get_priority_function()
-        chunk_candidates = (7, 11, 13, 14, 15)
+        chunk_candidates = (
+            self._code((1, 1, 1, 0)),
+            self._code((1, 1, 2, 0)),
+            self._code((1, 2, 1, 0)),
+            self._code((1, 2, 2, 0)),
+            self._code((1, 1, 0, 1)),
+        )
         fake_pool = mock.Mock()
-        fake_pool.map.return_value = [(1.0, index, mask) for index, mask in enumerate(chunk_candidates)]
+        fake_pool.map.return_value = [(1.0, index, code) for index, code in enumerate(chunk_candidates)]
 
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("LINEAR_CODE_CANDIDATE_MAP_CHUNKSIZE", None)
@@ -309,7 +342,7 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         )
 
         fake_pool.reset_mock()
-        fake_pool.map.return_value = [(1.0, index, mask) for index, mask in enumerate(chunk_candidates)]
+        fake_pool.map.return_value = [(1.0, index, code) for index, code in enumerate(chunk_candidates)]
         with mock.patch.dict(os.environ, {"LINEAR_CODE_CANDIDATE_MAP_CHUNKSIZE": "3"}, clear=False):
             self.search_core._score_candidate_chunk(
                 chunk_candidates,
@@ -325,7 +358,7 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
 
     def test_parallel_restart_jobs_keep_candidate_worker_budget(self):
         """Parallel restart execution should preserve the resolved inner scoring budget."""
-        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=2)
+        instance = self.search_core.make_instance(n=7, k=3, distance=4, restarts=2)
         calls = []
 
         def fake_greedy_construct(
@@ -372,14 +405,14 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         self.assertEqual(result.restart_index, 1)
 
     def test_custom_instance_interface(self):
-        """A caller should be able to set one custom (n, k, d) instance directly."""
-        instance = self.search_core.make_instance(n=7, k=4, distance=3, restarts=2)
+        """A caller should be able to set one custom ternary instance directly."""
+        instance = self.search_core.make_instance(n=6, k=3, distance=3, restarts=2)
         result = self.search_core.evaluate_priority_function(
             self.initial_program.get_priority_function(),
             instance,
         )
-        self.assertEqual(result.metrics["n"], 7)
-        self.assertEqual(result.metrics["k"], 4)
+        self.assertEqual(result.metrics["n"], 6)
+        self.assertEqual(result.metrics["k"], 3)
         self.assertEqual(result.metrics["target_distance"], 3)
         self.assertGreater(result.metrics["combined_score"], 0.0)
         self.assertIn("evaluation_time_seconds", result.metrics)
@@ -387,8 +420,8 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         self.assertIn("top_ranked_columns", result.artifacts)
 
     def test_actual_minimum_distance_matches_target_for_valid_construction(self):
-        """The exact d computed from constructed columns should match the target on success."""
-        instance = self.search_core.make_instance(n=7, k=4, distance=3, restarts=1)
+        """The exact GF(3) distance should match the target on success."""
+        instance = self.search_core.make_instance(n=6, k=3, distance=3, restarts=1)
         attempt = self.search_core.best_restart_for_instance(
             instance,
             self.initial_program.get_priority_function(),
@@ -400,8 +433,8 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         )
 
     def test_generator_matrix_is_orthogonal_to_parity_check_matrix(self):
-        """Generated G = [I_k | P] should satisfy G H^T = 0 over F_2."""
-        instance = self.search_core.make_instance(n=7, k=4, distance=3, restarts=1)
+        """Generated G = [I_k | -P] should satisfy G H^T = 0 over GF(3)."""
+        instance = self.search_core.make_instance(n=6, k=3, distance=3, restarts=1)
         attempt = self.search_core.best_restart_for_instance(
             instance,
             self.initial_program.get_priority_function(),
@@ -411,9 +444,9 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         for g_row in g_rows:
             for h_row in h_rows:
                 overlap = sum(
-                    (int(g_bit) & int(h_bit))
-                    for g_bit, h_bit in zip(g_row, h_row)
-                ) % 2
+                    int(g_digit) * int(h_digit)
+                    for g_digit, h_digit in zip(g_row, h_row)
+                ) % 3
                 self.assertEqual(overlap, 0)
 
     def test_evaluator_is_deterministic(self):
@@ -469,10 +502,11 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         self.assertIn("- d = 7", resolved)
         self.assertIn("- r = n - k = 11", resolved)
         self.assertNotIn("- n = 33", resolved)
+        self.assertIn("GF(3)", resolved)
 
     def test_parse_verification_output_distinguishes_complete_and_partial(self):
         """Verification parsing should classify complete and partial constructions."""
-        complete = self.run_batch.parse_verification_output("d_actual: 7\nH shape: 11 x 18\n")
+        complete = self.run_batch.parse_verification_output("d_actual: 7\nH shape: 11 x 18 over GF(3)\n")
         partial = self.run_batch.parse_verification_output("d_partial: 9\nwarning: construction is incomplete\n")
         self.assertEqual(complete["verification_status"], "complete")
         self.assertEqual(complete["distance"], 7)
@@ -493,9 +527,9 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
             program_path,
             "--no-progress",
             "--N",
-            "7",
+            "6",
             "--K",
-            "4",
+            "3",
             "--D",
             "3",
         ]
@@ -503,9 +537,11 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
             with redirect_stdout(stdout):
                 self.verify_distance.main()
         output = stdout.getvalue()
-        self.assertIn('"n": 7', output)
-        self.assertIn('"k": 4', output)
+        self.assertIn('"n": 6', output)
+        self.assertIn('"k": 3', output)
         self.assertIn('"d_target": 3', output)
+        self.assertIn("over GF(3)", output)
+        self.assertIn("selected_free_columns", output)
 
 
 if __name__ == "__main__":

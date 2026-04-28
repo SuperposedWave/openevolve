@@ -1,6 +1,6 @@
-# Configuration for binary linear-code feasibility search
+# Configuration for ternary linear-code feasibility search over GF(3)
 # Override the target with environment variables before running:
-#   LINEAR_CODE_N=8 LINEAR_CODE_K=4 LINEAR_CODE_D=4 openevolve-run ...
+#   LINEAR_CODE_N=7 LINEAR_CODE_K=3 LINEAR_CODE_D=4 openevolve-run ...
 # Optional:
 #   LINEAR_CODE_RESTARTS=3
 max_iterations: 200
@@ -26,29 +26,31 @@ llm:
 prompt:
   system_message: |
     Current target:
-    - n = 50
-    - k = 20
-    - d = 13
-    - r = n - k = 30
+    - n = 16
+    - k = 7
+    - d = 6
+    - r = n - k = 9
 
-    You are improving a static scoring function for a binary matrix construction problem.
+    You are improving a static scoring function for a ternary GF(3) matrix construction problem.
 
-    We build a binary matrix in systematic form:
+    We build a ternary parity-check matrix in systematic form:
 
       H = [P^T | I_r]
 
     Here:
-    - `H` is a binary matrix of shape `r x n`
+    - `H` is a GF(3) matrix of shape `r x n`
     - `P^T` is the free part and has shape `r x k`
     - `I_r` is fixed
     - the search only chooses the `k` free columns in `P^T`
+    - each free column is passed to the priority function as a base-3 encoded integer
+    - scalar multiples are normalized projectively, so the first non-zero coordinate is 1
 
     Goal:
-    choose free columns so that any `d - 1` columns of `H` are linearly independent.
+    choose free columns so that any `d - 1` columns of `H` are linearly independent over GF(3).
 
     You must improve this function only:
 
-      priority(column_mask: int, n: int, k: int, d: int) -> float
+      priority(column_code: int, n: int, k: int, d: int) -> float
 
     This is a FunSearch-style setup:
     - your function scores each candidate column once
@@ -67,9 +69,10 @@ prompt:
     - do not try to construct the whole matrix directly
 
     Useful heuristic ideas:
-    - avoid columns that are too sparse or too dense
+    - avoid GF(3) columns that are too sparse or too dense
     - prefer balanced support across the `r` row positions
-    - reward bit patterns that look structurally useful but not overly repetitive
+    - reward ternary digit patterns that look structurally useful but not overly repetitive
+    - consider the balance between symbols 1 and 2
     - prefer columns that are likely to remain compatible with many other columns later
 
     Write simple, deterministic heuristic logic that ranks promising columns above weaker ones.

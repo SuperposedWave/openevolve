@@ -1,22 +1,23 @@
-# Binary Linear Code Feasibility Search
+# Ternary Linear Code Feasibility Search
 
-This example uses OpenEvolve to optimize a FunSearch-style static scoring function `priority(column_mask, n, k, d)` for constructing one binary matrix instance at a time.
+This example uses OpenEvolve to optimize a FunSearch-style static scoring function `priority(column_code, n, k, d)` for constructing one ternary `GF(3)` matrix instance at a time.
 
 ## Problem Setup
 
-For a binary `[n,k,d]` code with redundancy `r = n-k`, the evaluator works with a systematic parity-check matrix
+For a ternary `[n,k,d]_3` code with redundancy `r = n-k`, the evaluator works with a systematic parity-check matrix
 
 `H = [P^T | I_r]`
 
-and asks for `k` free columns in `F_2^r` such that every set of `d-1` columns in `H` is linearly independent.
+and asks for `k` free columns in `GF(3)^r` such that every set of `d-1` columns in `H` is linearly independent over `GF(3)`.
 
 The fixed search skeleton:
 
-- enumerates free columns as integer bitmasks,
-- filters out columns with weight `< d-1`,
+- encodes free columns as little-endian base-3 integers,
+- normalizes scalar multiples projectively so the first non-zero coordinate is `1`,
+- filters out columns with support weight `< d-1`,
 - scores every candidate column exactly once,
 - sorts the full candidate list by that static score,
-- maintains exact forbidden xor layers for subsets of size up to `d-2`,
+- maintains exact forbidden `GF(3)` combination layers for subsets of size up to `d-2`,
 - greedily scans the sorted list and keeps every legal column it can add.
 
 Only the static `priority()` function inside `initial_program.py` is evolved.
@@ -33,14 +34,14 @@ The evaluator reads the target instance from environment variables:
 - optional: `LINEAR_CODE_RESTART_WORKERS`
 - optional: `LINEAR_CODE_CANDIDATE_MAP_CHUNKSIZE`
 
-If you do not set them, the default target is `[8,4,4]_2`.
+If you do not set them, the default target is `[7,3,4]_3`.
 
 The greedy fill itself stays sequential because each accepted column updates the exact forbidden-state. The worker settings only parallelize:
 
 - candidate scoring inside one restart,
 - and evaluation across independent restart indices.
 
-The streaming path now auto-tunes its parallelism by default:
+The streaming path auto-tunes its parallelism by default:
 
 - it derives a shared CPU budget from `os.cpu_count()`,
 - prefers candidate scoring over restart parallelism on smaller machines,
@@ -51,11 +52,11 @@ Most runs should not need manual tuning. `LINEAR_CODE_CANDIDATE_MAP_CHUNKSIZE` i
 
 ## Files
 
-- `initial_program.py`: baseline priority heuristic, with a single EVOLVE-BLOCK.
-- `search_core.py`: fixed legality checks, single-instance loader, greedy skeleton, and exact validation helpers.
+- `initial_program.py`: baseline ternary priority heuristic, with a single EVOLVE-BLOCK.
+- `search_core.py`: fixed `GF(3)` legality checks, single-instance loader, greedy skeleton, and exact validation helpers.
 - `evaluator.py`: thin OpenEvolve adapter.
 - `config.yaml`: evolution config tuned for deterministic heuristic search.
-- `verify_distance.py`: prints the constructed `H`, the derived `G`, and the achieved `d`.
+- `verify_distance.py`: prints the constructed `H`, the derived `G = [I_k | -P]`, and the achieved `d`.
 - `run_batch.py`: sweeps many `(n,k,d)` instances from `Misc/ECCRecord.json` into separate output directories.
 
 ## Method
@@ -70,14 +71,14 @@ This is intentionally closer to the FunSearch cap set pattern than to an interac
 
 ```bash
 cd examples/linear_code_binary_search
-LINEAR_CODE_N=8 LINEAR_CODE_K=4 LINEAR_CODE_D=4 \
+LINEAR_CODE_N=7 LINEAR_CODE_K=3 LINEAR_CODE_D=4 \
 python ../../openevolve-run.py initial_program.py evaluator.py --config config.yaml --iterations 40
 ```
 
 To inspect the baseline without running evolution:
 
 ```bash
-LINEAR_CODE_N=7 LINEAR_CODE_K=4 LINEAR_CODE_D=3 python initial_program.py
+LINEAR_CODE_N=6 LINEAR_CODE_K=3 LINEAR_CODE_D=3 python initial_program.py
 ```
 
 To batch-run all valid `(n,k)` entries with `10 < n <= 40`, using `d = lower` from `Misc/ECCRecord.json`:

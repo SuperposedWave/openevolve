@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batch-run OpenEvolve for binary linear-code instances from ECCRecord.json."""
+"""Batch-run OpenEvolve for ternary linear-code instances from ECCRecord.json."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ class SweepTask:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Batch-run OpenEvolve for all binary matrix instances with n <= n_max."
+        description="Batch-run OpenEvolve for all GF(3) matrix instances with n <= n_max."
     )
     parser.add_argument(
         "--record",
