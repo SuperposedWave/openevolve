@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-from contextlib import ExitStack
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-import heapq
 import importlib.util
 import json
 import logging
 import math
 import multiprocessing
 import os
-import struct
 import sys
-import tempfile
 import time
 import uuid
 from collections import Counter
@@ -21,7 +17,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from itertools import combinations
 from pathlib import Path
-from typing import BinaryIO, Callable, Iterable, Iterator, List, Sequence, Tuple
+from typing import Callable, Iterable, List, Sequence, Tuple
 
 try:
     from openevolve.evaluation_result import EvaluationResult
@@ -42,7 +38,6 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 PriorityFn = Callable[[int, int, int, int], float]
-_SCORED_RECORD_STRUCT = struct.Struct(">dQQ")
 _PROCESS_PRIORITY_FN: PriorityFn | None = None
 
 
@@ -63,6 +58,17 @@ class BenchmarkInstance:
 
 
 @dataclass
+class AcceptedVectorRecord:
+    """Analysis details for one free column accepted by the greedy scan."""
+
+    fill_index: int
+    rank: int
+    column: str
+    weight: int
+    score: float
+
+
+@dataclass
 class SearchAttemptResult:
     """Result of one deterministic sorted-greedy run."""
 
@@ -76,14 +82,7 @@ class SearchAttemptResult:
     blocked_candidate_count: int
     illegal_weight_histogram: Tuple[Tuple[int, int], ...]
     chosen_weights: Tuple[int, ...]
-
-
-@dataclass(frozen=True)
-class ScoredChunkRun:
-    """One sorted on-disk run used by the streaming candidate path."""
-
-    path: str
-    record_count: int
+    accepted_vectors: Tuple[AcceptedVectorRecord, ...]
 
 
 class IncrementalForbiddenState:
@@ -145,18 +144,6 @@ def _resolve_worker_count(task_count: int, env_name: str, minimum_parallel_tasks
     return min(cpu_count, task_count)
 
 
-def _env_positive_int(name: str) -> int | None:
-    """Parse an optional strictly positive integer environment variable."""
-    raw_value = os.environ.get(name)
-    if raw_value is None:
-        return None
-    try:
-        parsed = int(raw_value)
-    except ValueError:
-        return None
-    return parsed if parsed > 0 else None
-
-
 def _env_flag_enabled(name: str) -> bool:
     """Parse a conventional boolean environment flag."""
     raw_value = os.environ.get(name)
@@ -178,32 +165,6 @@ def _log_profile(stage: str, **fields: object) -> None:
     logger.info(f"linear_code_profile stage={stage} {payload}".strip())
 
 
-def _candidate_chunk_size() -> int:
-    """Return the numeric mask-range chunk size for streaming candidate generation."""
-    return _env_positive_int("LINEAR_CODE_CANDIDATE_CHUNK_SIZE") or (1 << 20)
-
-
-def _streaming_mask_threshold() -> int:
-    """Return the mask-space threshold above which candidate streaming is enabled by default."""
-    return _env_positive_int("LINEAR_CODE_STREAMING_THRESHOLD_MASKS") or (1 << 22)
-
-
-def _should_stream_candidates(r: int) -> bool:
-    """Choose the candidate-processing strategy for the current redundancy."""
-    if _env_flag_enabled("LINEAR_CODE_FORCE_STREAMING"):
-        return True
-    return (1 << r) > _streaming_mask_threshold()
-
-
-def _candidate_executor_mode() -> str:
-    """Return the requested candidate-scoring executor mode."""
-    raw_value = os.environ.get("LINEAR_CODE_CANDIDATE_EXECUTOR", "thread")
-    normalized = raw_value.strip().lower()
-    if normalized in {"process", "thread"}:
-        return normalized
-    return "thread"
-
-
 @lru_cache(maxsize=None)
 def basis_columns(r: int) -> Tuple[int, ...]:
     """Systematic identity columns."""
@@ -215,24 +176,6 @@ def candidate_masks(r: int, distance: int) -> Tuple[int, ...]:
     """All non-zero free columns that pass the initial weight filter."""
     min_weight = max(distance - 1, 1)
     return tuple(mask for mask in range(1, 1 << r) if popcount(mask) >= min_weight)
-
-
-def candidate_mask_chunks(
-    r: int,
-    distance: int,
-    chunk_size: int | None = None,
-) -> Iterator[Tuple[int, ...]]:
-    """Yield candidate masks in numeric-range chunks instead of one giant tuple."""
-    min_weight = max(distance - 1, 1)
-    resolved_chunk_size = chunk_size or _candidate_chunk_size()
-    upper_bound = 1 << r
-    for chunk_start in range(1, upper_bound, resolved_chunk_size):
-        chunk_end = min(chunk_start + resolved_chunk_size, upper_bound)
-        chunk = tuple(
-            mask for mask in range(chunk_start, chunk_end) if popcount(mask) >= min_weight
-        )
-        if chunk:
-            yield chunk
 
 
 def _initialize_reachable_layers(r: int, distance: int) -> List[set[int]]:
@@ -376,6 +319,23 @@ def format_mask(mask: int, r: int) -> str:
     return format(mask, f"0{r}b")
 
 
+def _accepted_vector_record(
+    candidate_mask: int,
+    score: float,
+    rank: int,
+    fill_index: int,
+    r: int,
+) -> AcceptedVectorRecord:
+    """Create the shared accepted-vector analysis record for both scan paths."""
+    return AcceptedVectorRecord(
+        fill_index=fill_index,
+        rank=rank,
+        column=format_mask(candidate_mask, r),
+        weight=popcount(candidate_mask),
+        score=float(score),
+    )
+
+
 def parity_check_matrix_rows(r: int, free_columns: Sequence[int]) -> Tuple[str, ...]:
     """Return the parity-check matrix as row strings over F_2."""
     columns = all_columns(r, free_columns)
@@ -417,14 +377,13 @@ def _safe_priority(priority_fn: PriorityFn, candidate_mask: int, n: int, k: int,
     return value
 
 
-def _score_candidate_job(
-    job: Tuple[PriorityFn, int, int, int, int, int]
-) -> Tuple[float, int, int]:
-    """Score one candidate column and attach the restart-specific tie-break."""
-    priority_fn, candidate_mask, n, k, d, restart_index = job
+def _score_static_candidate_job(
+    job: Tuple[PriorityFn, int, int, int, int]
+) -> Tuple[int, float]:
+    """Score one candidate column without restart-specific tie-break."""
+    priority_fn, candidate_mask, n, k, d = job
     score = _safe_priority(priority_fn, candidate_mask, n, k, d)
-    tie_break = _deterministic_tiebreak(candidate_mask, restart_index)
-    return score, tie_break, candidate_mask
+    return candidate_mask, score
 
 
 def _initialize_process_priority_fn(program_path: str) -> None:
@@ -433,16 +392,15 @@ def _initialize_process_priority_fn(program_path: str) -> None:
     _PROCESS_PRIORITY_FN = load_priority_function(program_path)
 
 
-def _score_candidate_job_in_process(
-    job: Tuple[int, int, int, int, int]
-) -> Tuple[float, int, int]:
-    """Score one candidate column using the process-local priority function."""
-    candidate_mask, n, k, d, restart_index = job
+def _score_static_candidate_job_in_process(
+    job: Tuple[int, int, int, int]
+) -> Tuple[int, float]:
+    """Score one candidate column with the process-local priority function."""
+    candidate_mask, n, k, d = job
     if _PROCESS_PRIORITY_FN is None:
         raise RuntimeError("Process scoring requested before initializing priority function")
     score = _safe_priority(_PROCESS_PRIORITY_FN, candidate_mask, n, k, d)
-    tie_break = _deterministic_tiebreak(candidate_mask, restart_index)
-    return score, tie_break, candidate_mask
+    return candidate_mask, score
 
 
 def _priority_program_path(priority_fn: PriorityFn) -> str | None:
@@ -454,11 +412,20 @@ def _priority_program_path(priority_fn: PriorityFn) -> str | None:
     return None
 
 
+def _candidate_executor_mode() -> str:
+    """Return the requested candidate-scoring executor mode."""
+    raw_value = os.environ.get("LINEAR_CODE_CANDIDATE_EXECUTOR", "thread")
+    normalized = raw_value.strip().lower()
+    if normalized in {"process", "thread"}:
+        return normalized
+    return "thread"
+
+
 def _create_process_candidate_pool(
     priority_fn: PriorityFn,
     worker_count: int,
 ) -> ProcessPoolExecutor | None:
-    """Create a process pool for chunk scoring when the priority source path is available."""
+    """Create a process pool for static scoring when the priority source path is available."""
     if worker_count <= 1:
         return None
     program_path = _priority_program_path(priority_fn)
@@ -484,149 +451,18 @@ def _create_process_candidate_pool(
     )
 
 
-def _score_candidate_chunk(
-    chunk_candidates: Sequence[int],
-    instance: BenchmarkInstance,
-    priority_fn: PriorityFn,
-    restart_index: int,
-    worker_count: int,
-    executor_mode: str = "thread",
-    process_pool: ProcessPoolExecutor | None = None,
-) -> List[Tuple[float, int, int]]:
-    """Score one candidate chunk, optionally using a worker pool."""
-    if worker_count <= 1:
-        return [
-            _score_candidate_job(
-                (
-                    priority_fn,
-                    candidate_mask,
-                    instance.n,
-                    instance.k,
-                    instance.target_distance,
-                    restart_index,
-                )
-            )
-            for candidate_mask in chunk_candidates
-        ]
-
-    if executor_mode == "process" and process_pool is not None:
-        job_iter = (
-            (
-                candidate_mask,
-                instance.n,
-                instance.k,
-                instance.target_distance,
-                restart_index,
-            )
-            for candidate_mask in chunk_candidates
-        )
-        return list(process_pool.map(_score_candidate_job_in_process, job_iter))
-
-    job_iter = (
-        (
-            priority_fn,
-            candidate_mask,
-            instance.n,
-            instance.k,
-            instance.target_distance,
-            restart_index,
-        )
-        for candidate_mask in chunk_candidates
-    )
-    with ThreadPoolExecutor(
-        max_workers=worker_count,
-        thread_name_prefix="linear-code-score",
-    ) as executor:
-        return list(executor.map(_score_candidate_job, job_iter))
-
-
-def _write_scored_chunk_run(records: Sequence[Tuple[float, int, int]]) -> ScoredChunkRun:
-    """Persist one scored candidate chunk as a sorted binary run on disk."""
-    fd, path = tempfile.mkstemp(prefix="linear-code-run-", suffix=".bin")
-    record_count = 0
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            for score, tie_break, candidate_mask in records:
-                handle.write(_SCORED_RECORD_STRUCT.pack(score, tie_break, candidate_mask))
-                record_count += 1
-    except Exception:
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
-        raise
-    return ScoredChunkRun(path=path, record_count=record_count)
-
-
-def _read_scored_record(handle: BinaryIO) -> Tuple[float, int, int] | None:
-    """Read one scored candidate triple from a chunk-run file."""
-    raw_record = handle.read(_SCORED_RECORD_STRUCT.size)
-    if not raw_record:
-        return None
-    score, tie_break, candidate_mask = _SCORED_RECORD_STRUCT.unpack(raw_record)
-    return score, int(tie_break), int(candidate_mask)
-
-
-def _merge_scored_chunk_runs(
-    runs: Sequence[ScoredChunkRun],
-) -> Iterator[Tuple[float, int, int]]:
-    """Merge sorted chunk runs into one exact global descending order."""
-    with ExitStack() as stack:
-        handles: List[BinaryIO] = []
-        heap: List[Tuple[float, int, int, int, float, int, int]] = []
-        for run_index, run in enumerate(runs):
-            handle = stack.enter_context(open(run.path, "rb"))
-            handles.append(handle)
-            first_record = _read_scored_record(handle)
-            if first_record is None:
-                continue
-            score, tie_break, candidate_mask = first_record
-            heapq.heappush(
-                heap,
-                (-score, -tie_break, -candidate_mask, run_index, score, tie_break, candidate_mask),
-            )
-
-        while heap:
-            _, _, _, run_index, score, tie_break, candidate_mask = heapq.heappop(heap)
-            yield score, tie_break, candidate_mask
-            next_record = _read_scored_record(handles[run_index])
-            if next_record is None:
-                continue
-            next_score, next_tie_break, next_candidate_mask = next_record
-            heapq.heappush(
-                heap,
-                (
-                    -next_score,
-                    -next_tie_break,
-                    -next_candidate_mask,
-                    run_index,
-                    next_score,
-                    next_tie_break,
-                    next_candidate_mask,
-                ),
-            )
-
-
-def _cleanup_scored_chunk_runs(runs: Sequence[ScoredChunkRun]) -> None:
-    """Delete temporary chunk-run files after a streaming search completes."""
-    for run in runs:
-        try:
-            os.unlink(run.path)
-        except FileNotFoundError:
-            continue
-
-
-def _run_restart_job(
-    job: Tuple[BenchmarkInstance, PriorityFn, int]
+def _run_scored_restart_job(
+    job: Tuple[BenchmarkInstance, Tuple[Tuple[int, float], ...], int]
 ) -> SearchAttemptResult:
-    """Run one restart in isolation, keeping inner candidate scoring serial."""
-    instance, priority_fn, restart_index = job
+    """Run one restart from shared static candidate scores."""
+    instance, static_scores, restart_index = job
     return greedy_construct(
         instance,
-        priority_fn,
-        restart_index,
+        priority_fn=None,
+        restart_index=restart_index,
         show_progress=False,
         candidate_workers=1,
+        static_scores=static_scores,
     )
 
 
@@ -657,15 +493,13 @@ def _iterate_with_progress(
     return tqdm(items, desc=description, leave=False, total=total)
 
 
-def ranked_candidates(
+def score_static_candidates(
     instance: BenchmarkInstance,
     priority_fn: PriorityFn,
-    restart_index: int,
     show_progress: bool = False,
     candidate_workers: int | None = None,
-) -> Tuple[Tuple[int, ...], Tuple[Tuple[int, float], ...]]:
-    """Compute a single static ordering of all candidate columns."""
-    scored_candidates = []
+) -> Tuple[Tuple[int, float], ...]:
+    """Compute restart-independent priority scores once for all candidate columns."""
     started_at = time.perf_counter()
     candidates = candidate_masks(instance.r, instance.target_distance)
     _log_profile(
@@ -674,7 +508,7 @@ def ranked_candidates(
         k=instance.k,
         d=instance.target_distance,
         r=instance.r,
-        restart=restart_index,
+        restart="shared",
         candidate_count=len(candidates),
         elapsed_seconds=f"{time.perf_counter() - started_at:.6f}",
     )
@@ -686,62 +520,107 @@ def ranked_candidates(
             minimum_parallel_tasks=64,
         )
 
+    executor_mode = "thread"
+    process_pool = None
+    if _candidate_executor_mode() == "process":
+        process_pool = _create_process_candidate_pool(priority_fn, worker_count)
+        if process_pool is not None:
+            executor_mode = "process"
+
     scoring_started_at = time.perf_counter()
-    if worker_count <= 1:
-        for candidate_mask in _iterate_with_progress(
-            candidates,
-            f"ranking restart {restart_index}",
-            show_progress,
-            total=len(candidates),
-        ):
-            scored_candidates.append(
-                _score_candidate_job(
+    try:
+        if worker_count <= 1:
+            scored_candidates = tuple(
+                _score_static_candidate_job(
                     (
                         priority_fn,
                         candidate_mask,
                         instance.n,
                         instance.k,
                         instance.target_distance,
-                        restart_index,
                     )
                 )
+                for candidate_mask in _iterate_with_progress(
+                    candidates,
+                    "shared candidate scoring",
+                    show_progress,
+                    total=len(candidates),
+                )
             )
-    else:
-        jobs = [
-            (
-                priority_fn,
-                candidate_mask,
-                instance.n,
-                instance.k,
-                instance.target_distance,
-                restart_index,
+        elif executor_mode == "process" and process_pool is not None:
+            jobs = [
+                (
+                    candidate_mask,
+                    instance.n,
+                    instance.k,
+                    instance.target_distance,
+                )
+                for candidate_mask in candidates
+            ]
+            scored_candidates = tuple(
+                _iterate_with_progress(
+                    process_pool.map(_score_static_candidate_job_in_process, jobs),
+                    "shared candidate scoring",
+                    show_progress,
+                    total=len(candidates),
+                )
             )
-            for candidate_mask in candidates
-        ]
-        with ThreadPoolExecutor(
-            max_workers=worker_count,
-            thread_name_prefix="linear-code-score",
-        ) as executor:
-            scored_iterator = executor.map(_score_candidate_job, jobs)
-            for scored_candidate in _iterate_with_progress(
-                scored_iterator,
-                f"ranking restart {restart_index}",
-                show_progress,
-                total=len(candidates),
-            ):
-                scored_candidates.append(scored_candidate)
+        else:
+            jobs = [
+                (
+                    priority_fn,
+                    candidate_mask,
+                    instance.n,
+                    instance.k,
+                    instance.target_distance,
+                )
+                for candidate_mask in candidates
+            ]
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="linear-code-score",
+            ) as executor:
+                scored_candidates = tuple(
+                    _iterate_with_progress(
+                        executor.map(_score_static_candidate_job, jobs),
+                        "shared candidate scoring",
+                        show_progress,
+                        total=len(candidates),
+                    )
+                )
+    finally:
+        if process_pool is not None:
+            process_pool.shutdown()
     _log_profile(
         "candidate_scoring",
         n=instance.n,
         k=instance.k,
         d=instance.target_distance,
         r=instance.r,
-        restart=restart_index,
+        restart="shared",
         candidate_count=len(candidates),
         worker_count=worker_count,
+        executor_mode=executor_mode,
         elapsed_seconds=f"{time.perf_counter() - scoring_started_at:.6f}",
     )
+    return scored_candidates
+
+
+def ranked_candidates_from_scores(
+    instance: BenchmarkInstance,
+    static_scores: Sequence[Tuple[int, float]],
+    restart_index: int,
+) -> Tuple[Tuple[int, ...], Tuple[Tuple[int, float], ...]]:
+    """Apply restart-specific tie-breaks to cached static candidate scores."""
     sort_started_at = time.perf_counter()
+    scored_candidates = [
+        (
+            score,
+            _deterministic_tiebreak(candidate_mask, restart_index),
+            candidate_mask,
+        )
+        for candidate_mask, score in static_scores
+    ]
     scored_candidates.sort(reverse=True)
     _log_profile(
         "candidate_sort",
@@ -758,130 +637,75 @@ def ranked_candidates(
     return ordered_candidates, ordered_scores
 
 
-def _ranked_candidate_runs(
-    instance: BenchmarkInstance,
-    priority_fn: PriorityFn,
-    restart_index: int,
-    candidate_workers: int | None = None,
-) -> Tuple[List[ScoredChunkRun], int]:
-    """Build sorted chunk runs for the exact streaming candidate path."""
-    worker_count = candidate_workers
-    runs: List[ScoredChunkRun] = []
-    candidate_count = 0
-    if worker_count is None:
-        worker_count = _resolve_worker_count(
-            _candidate_chunk_size(),
-            env_name="LINEAR_CODE_CANDIDATE_WORKERS",
-            minimum_parallel_tasks=64,
-        )
-
-    executor_mode = "thread"
-    process_pool = None
-    if _candidate_executor_mode() == "process":
-        process_pool = _create_process_candidate_pool(priority_fn, worker_count)
-        if process_pool is not None:
-            executor_mode = "process"
-
-    try:
-        for chunk_index, chunk_candidates in enumerate(
-            candidate_mask_chunks(instance.r, instance.target_distance, _candidate_chunk_size())
-        ):
-            generation_elapsed_seconds = 0.0
-            _log_profile(
-                "candidate_generation",
-                n=instance.n,
-                k=instance.k,
-                d=instance.target_distance,
-                r=instance.r,
-                restart=restart_index,
-                chunk_index=chunk_index,
-                chunk_candidate_count=len(chunk_candidates),
-                elapsed_seconds=f"{generation_elapsed_seconds:.6f}",
-            )
-            candidate_count += len(chunk_candidates)
-
-            scoring_started_at = time.perf_counter()
-            scored_chunk = _score_candidate_chunk(
-                chunk_candidates,
-                instance,
-                priority_fn,
-                restart_index,
-                worker_count,
-                executor_mode=executor_mode,
-                process_pool=process_pool,
-            )
-            _log_profile(
-                "candidate_scoring",
-                n=instance.n,
-                k=instance.k,
-                d=instance.target_distance,
-                r=instance.r,
-                restart=restart_index,
-                chunk_index=chunk_index,
-                chunk_candidate_count=len(chunk_candidates),
-                worker_count=worker_count,
-                executor_mode=executor_mode,
-                elapsed_seconds=f"{time.perf_counter() - scoring_started_at:.6f}",
-            )
-
-            sort_started_at = time.perf_counter()
-            scored_chunk.sort(reverse=True)
-            _log_profile(
-                "candidate_sort",
-                n=instance.n,
-                k=instance.k,
-                d=instance.target_distance,
-                r=instance.r,
-                restart=restart_index,
-                chunk_index=chunk_index,
-                chunk_candidate_count=len(scored_chunk),
-                elapsed_seconds=f"{time.perf_counter() - sort_started_at:.6f}",
-            )
-            runs.append(_write_scored_chunk_run(scored_chunk))
-    finally:
-        if process_pool is not None:
-            process_pool.shutdown()
-
-    return runs, candidate_count
-
-
-def greedy_construct(
+def ranked_candidates(
     instance: BenchmarkInstance,
     priority_fn: PriorityFn,
     restart_index: int,
     show_progress: bool = False,
     candidate_workers: int | None = None,
-) -> SearchAttemptResult:
-    """Run one fixed sorted-greedy pass for a single benchmark instance."""
-    if _should_stream_candidates(instance.r):
-        return _greedy_construct_streaming(
-            instance,
-            priority_fn,
-            restart_index,
-            candidate_workers=candidate_workers,
-        )
-
-    search_state = IncrementalForbiddenState(instance.r, instance.target_distance)
-    ordered_candidates, ordered_scores = ranked_candidates(
+) -> Tuple[Tuple[int, ...], Tuple[Tuple[int, float], ...]]:
+    """Compute a single restart-specific ordering of all candidate columns."""
+    static_scores = score_static_candidates(
         instance,
         priority_fn,
-        restart_index,
         show_progress=show_progress,
         candidate_workers=candidate_workers,
     )
+    return ranked_candidates_from_scores(instance, static_scores, restart_index)
+
+
+def greedy_construct(
+    instance: BenchmarkInstance,
+    priority_fn: PriorityFn | None,
+    restart_index: int,
+    show_progress: bool = False,
+    candidate_workers: int | None = None,
+    static_scores: Sequence[Tuple[int, float]] | None = None,
+) -> SearchAttemptResult:
+    """Run one fixed sorted-greedy pass for a single benchmark instance."""
+    search_state = IncrementalForbiddenState(instance.r, instance.target_distance)
+    if static_scores is None:
+        if priority_fn is None:
+            raise ValueError("priority_fn is required when static_scores are not provided")
+        ordered_candidates, ordered_scores = ranked_candidates(
+            instance,
+            priority_fn,
+            restart_index,
+            show_progress=show_progress,
+            candidate_workers=candidate_workers,
+        )
+    else:
+        ordered_candidates, ordered_scores = ranked_candidates_from_scores(
+            instance,
+            static_scores,
+            restart_index,
+        )
     blocked_candidate_count = 0
     illegal_weight_histogram: Counter[int] = Counter()
+    accepted_vectors: List[AcceptedVectorRecord] = []
 
     greedy_started_at = time.perf_counter()
-    for candidate_mask in _iterate_with_progress(
-        ordered_candidates,
-        f"greedy restart {restart_index}",
-        show_progress,
+    for rank, (candidate_mask, score) in enumerate(
+        _iterate_with_progress(
+            ordered_scores,
+            f"greedy restart {restart_index}",
+            show_progress,
+        ),
+        start=1,
     ):
         if len(search_state.selected_free_columns) >= instance.k:
             break
         if search_state.can_add(candidate_mask):
             search_state.add(candidate_mask)
+            accepted_vectors.append(
+                _accepted_vector_record(
+                    candidate_mask,
+                    score,
+                    rank,
+                    len(search_state.selected_free_columns),
+                    instance.r,
+                )
+            )
         else:
             blocked_candidate_count += 1
             illegal_weight_histogram[popcount(candidate_mask)] += 1
@@ -915,73 +739,8 @@ def greedy_construct(
         blocked_candidate_count=blocked_candidate_count,
         illegal_weight_histogram=tuple(sorted(illegal_weight_histogram.items())),
         chosen_weights=tuple(popcount(mask) for mask in selected),
+        accepted_vectors=tuple(accepted_vectors),
     )
-
-
-def _greedy_construct_streaming(
-    instance: BenchmarkInstance,
-    priority_fn: PriorityFn,
-    restart_index: int,
-    candidate_workers: int | None = None,
-) -> SearchAttemptResult:
-    """Run the exact greedy search while streaming sorted candidate runs from disk."""
-    search_state = IncrementalForbiddenState(instance.r, instance.target_distance)
-    runs, candidate_count = _ranked_candidate_runs(
-        instance,
-        priority_fn,
-        restart_index,
-        candidate_workers=candidate_workers,
-    )
-    blocked_candidate_count = 0
-    illegal_weight_histogram: Counter[int] = Counter()
-    top_ranked_scores: List[Tuple[int, float]] = []
-
-    greedy_started_at = time.perf_counter()
-    try:
-        for score, _, candidate_mask in _merge_scored_chunk_runs(runs):
-            if len(top_ranked_scores) < 10:
-                top_ranked_scores.append((candidate_mask, score))
-            if len(search_state.selected_free_columns) >= instance.k:
-                break
-            if search_state.can_add(candidate_mask):
-                search_state.add(candidate_mask)
-            else:
-                blocked_candidate_count += 1
-                illegal_weight_histogram[popcount(candidate_mask)] += 1
-    finally:
-        _cleanup_scored_chunk_runs(runs)
-
-    selected = tuple(search_state.selected_free_columns)
-    _log_profile(
-        "greedy_scan",
-        n=instance.n,
-        k=instance.k,
-        d=instance.target_distance,
-        r=instance.r,
-        restart=restart_index,
-        candidate_count=candidate_count,
-        selected_count=len(selected),
-        blocked_count=blocked_candidate_count,
-        elapsed_seconds=f"{time.perf_counter() - greedy_started_at:.6f}",
-    )
-    success = len(selected) == instance.k and validate_free_columns(
-        instance.r,
-        selected,
-        instance.target_distance,
-    )
-    return SearchAttemptResult(
-        success=success,
-        selected_free_columns=selected,
-        added_free_columns=len(selected),
-        candidate_count=candidate_count,
-        restart_index=restart_index,
-        sorted_candidates=tuple(mask for mask, _ in top_ranked_scores),
-        sorted_scores=tuple(top_ranked_scores),
-        blocked_candidate_count=blocked_candidate_count,
-        illegal_weight_histogram=tuple(sorted(illegal_weight_histogram.items())),
-        chosen_weights=tuple(popcount(mask) for mask in selected),
-    )
-
 
 def best_restart_for_instance(
     instance: BenchmarkInstance,
@@ -994,26 +753,32 @@ def best_restart_for_instance(
         env_name="LINEAR_CODE_RESTART_WORKERS",
         minimum_parallel_tasks=2,
     )
+    static_scores = score_static_candidates(
+        instance,
+        priority_fn,
+        show_progress=show_progress,
+    )
     if show_progress or restart_worker_count <= 1:
         attempts = [
             greedy_construct(
                 instance,
-                priority_fn,
-                restart_index,
+                priority_fn=None,
+                restart_index=restart_index,
                 show_progress=show_progress,
+                static_scores=static_scores,
             )
             for restart_index in range(instance.restarts)
         ]
     else:
         restart_jobs = [
-            (instance, priority_fn, restart_index)
+            (instance, static_scores, restart_index)
             for restart_index in range(instance.restarts)
         ]
         with ThreadPoolExecutor(
             max_workers=restart_worker_count,
             thread_name_prefix="linear-code-restart",
         ) as executor:
-            attempts = list(executor.map(_run_restart_job, restart_jobs))
+            attempts = list(executor.map(_run_scored_restart_job, restart_jobs))
     return max(
         attempts,
         key=lambda attempt: (
@@ -1058,6 +823,38 @@ def load_priority_function(program_path: str) -> PriorityFn:
     return module.priority
 
 
+def _accepted_vector_to_dict(record: AcceptedVectorRecord) -> dict[str, int | float | str]:
+    """Convert an accepted-vector record to artifact JSON shape."""
+    return {
+        "fill_index": record.fill_index,
+        "rank": record.rank,
+        "column": record.column,
+        "weight": record.weight,
+        "score": record.score,
+    }
+
+
+def _successful_code_summary(
+    active_instance: BenchmarkInstance,
+    attempt: SearchAttemptResult,
+) -> dict[str, int | float | dict[int, int]]:
+    """Summarize accepted-vector rank and weight statistics for a successful code."""
+    ranks = [record.rank for record in attempt.accepted_vectors]
+    weight_counter = Counter(record.weight for record in attempt.accepted_vectors)
+    return {
+        "n": active_instance.n,
+        "k": active_instance.k,
+        "d": active_instance.target_distance,
+        "r": active_instance.r,
+        "restart": attempt.restart_index,
+        "vector_count": len(attempt.accepted_vectors),
+        "rank_min": min(ranks),
+        "rank_max": max(ranks),
+        "rank_avg": sum(ranks) / len(ranks),
+        "weight_histogram": dict(sorted(weight_counter.items())),
+    }
+
+
 def evaluate_priority_function(
     priority_fn: PriorityFn, instance: BenchmarkInstance | None = None
 ) -> EvaluationResult:
@@ -1100,6 +897,46 @@ def evaluate_priority_function(
         for mask, score in attempt.sorted_scores[: min(10, len(attempt.sorted_scores))]
     ]
 
+    artifacts = {
+        "instance": json.dumps(
+            {
+                "name": active_instance.name,
+                "n": active_instance.n,
+                "k": active_instance.k,
+                "d": active_instance.target_distance,
+                "restarts": active_instance.restarts,
+            },
+            sort_keys=True,
+        ),
+        "search_result": json.dumps(
+            {
+                "success": attempt.success,
+                "restart": attempt.restart_index,
+                "added_free_columns": attempt.added_free_columns,
+                "candidate_count": attempt.candidate_count,
+                "blocked_candidates": attempt.blocked_candidate_count,
+                "target_free_columns": active_instance.k,
+                "selected_free_columns": [
+                    format_mask(mask, active_instance.r)
+                    for mask in attempt.selected_free_columns
+                ],
+                "chosen_weights": list(attempt.chosen_weights),
+            },
+            sort_keys=True,
+        ),
+        "top_ranked_columns": json.dumps(top_ranked_columns, sort_keys=True),
+        "blocked_weight_histogram": json.dumps(dict(sorted(blocked_counter.items()))),
+    }
+    if attempt.success:
+        artifacts["successful_code_vectors"] = json.dumps(
+            [_accepted_vector_to_dict(record) for record in attempt.accepted_vectors],
+            sort_keys=True,
+        )
+        artifacts["successful_code_summary"] = json.dumps(
+            _successful_code_summary(active_instance, attempt),
+            sort_keys=True,
+        )
+
     return EvaluationResult(
         metrics={
             "combined_score": combined_score,
@@ -1112,36 +949,7 @@ def evaluate_priority_function(
             "k": active_instance.k,
             "evaluation_time_seconds": elapsed_seconds,
         },
-        artifacts={
-            "instance": json.dumps(
-                {
-                    "name": active_instance.name,
-                    "n": active_instance.n,
-                    "k": active_instance.k,
-                    "d": active_instance.target_distance,
-                    "restarts": active_instance.restarts,
-                },
-                sort_keys=True,
-            ),
-            "search_result": json.dumps(
-                {
-                    "success": attempt.success,
-                    "restart": attempt.restart_index,
-                    "added_free_columns": attempt.added_free_columns,
-                    "candidate_count": attempt.candidate_count,
-                    "blocked_candidates": attempt.blocked_candidate_count,
-                    "target_free_columns": active_instance.k,
-                    "selected_free_columns": [
-                        format_mask(mask, active_instance.r)
-                        for mask in attempt.selected_free_columns
-                    ],
-                    "chosen_weights": list(attempt.chosen_weights),
-                },
-                sort_keys=True,
-            ),
-            "top_ranked_columns": json.dumps(top_ranked_columns, sort_keys=True),
-            "blocked_weight_histogram": json.dumps(dict(sorted(blocked_counter.items()))),
-        },
+        artifacts=artifacts,
     )
 
 

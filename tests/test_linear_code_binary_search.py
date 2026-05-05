@@ -122,48 +122,72 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         self.assertEqual(first_order, second_order)
         self.assertEqual(first_scores, second_scores)
 
-    def test_streaming_candidate_path_matches_materialized_search_on_small_instance(self):
-        """Forced chunked processing should preserve exact greedy results on small instances."""
-        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=1)
-        priority_fn = self.initial_program.get_priority_function()
+    def test_restart_search_scores_candidates_once_across_restarts(self):
+        """Restart tie-breaks should reuse static priority scores for each candidate."""
+        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=3)
+        candidate_count = len(
+            self.search_core.candidate_masks(instance.r, instance.target_distance)
+        )
+        calls = []
 
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("LINEAR_CODE_FORCE_STREAMING", None)
-            baseline = self.search_core.best_restart_for_instance(instance, priority_fn)
+        def counted_priority(column_mask, n, k, d):
+            calls.append(column_mask)
+            return self.initial_program.get_priority_function()(column_mask, n, k, d)
+
+        with mock.patch.dict(os.environ, {"LINEAR_CODE_RESTART_WORKERS": "3"}, clear=False):
+            attempt = self.search_core.best_restart_for_instance(instance, counted_priority)
+
+        self.assertTrue(attempt.success)
+        self.assertEqual(len(calls), candidate_count)
+        self.assertEqual(sorted(calls), sorted(set(calls)))
+
+    def test_streaming_configuration_is_ignored_after_removal(self):
+        """Former streaming flags should not change the materialized search path."""
+        instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=3)
+        candidate_count = len(
+            self.search_core.candidate_masks(instance.r, instance.target_distance)
+        )
+        calls = []
+
+        def counted_priority(column_mask, n, k, d):
+            calls.append(column_mask)
+            return self.initial_program.get_priority_function()(column_mask, n, k, d)
 
         with mock.patch.dict(
             os.environ,
             {
                 "LINEAR_CODE_FORCE_STREAMING": "1",
                 "LINEAR_CODE_CANDIDATE_CHUNK_SIZE": "3",
+                "LINEAR_CODE_RESTART_WORKERS": "3",
+                "LINEAR_CODE_PROFILE": "1",
             },
             clear=False,
         ):
-            streamed = self.search_core.best_restart_for_instance(instance, priority_fn)
+            with mock.patch.object(self.search_core.logger, "info") as mock_info:
+                attempt = self.search_core.best_restart_for_instance(instance, counted_priority)
 
-        self.assertEqual(streamed.success, baseline.success)
-        self.assertEqual(streamed.selected_free_columns, baseline.selected_free_columns)
-        self.assertEqual(streamed.added_free_columns, baseline.added_free_columns)
-        self.assertEqual(streamed.blocked_candidate_count, baseline.blocked_candidate_count)
-        self.assertEqual(streamed.chosen_weights, baseline.chosen_weights)
-        self.assertEqual(streamed.candidate_count, baseline.candidate_count)
-        self.assertEqual(streamed.sorted_scores[:10], baseline.sorted_scores[:10])
+        self.assertTrue(attempt.success)
+        self.assertEqual(len(calls), candidate_count)
+        self.assertEqual(sorted(calls), sorted(set(calls)))
+        profile_messages = [
+            call.args[0]
+            for call in mock_info.call_args_list
+            if call.args and "linear_code_profile" in call.args[0]
+        ]
+        self.assertFalse(any("chunk_index=" in message for message in profile_messages))
 
-    def test_process_scored_streaming_matches_baseline_on_small_instance(self):
-        """Optional process-based chunk scoring should preserve exact greedy results."""
+    def test_process_candidate_scoring_matches_thread_scoring(self):
+        """Static candidate scoring should support process workers when requested."""
         instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=1)
         priority_fn = self.initial_program.get_priority_function()
 
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("LINEAR_CODE_FORCE_STREAMING", None)
             os.environ.pop("LINEAR_CODE_CANDIDATE_EXECUTOR", None)
-            baseline = self.search_core.best_restart_for_instance(instance, priority_fn)
+            thread_scores = self.search_core.score_static_candidates(priority_fn=priority_fn, instance=instance)
 
         with mock.patch.dict(
             os.environ,
             {
-                "LINEAR_CODE_FORCE_STREAMING": "1",
-                "LINEAR_CODE_CANDIDATE_CHUNK_SIZE": "3",
                 "LINEAR_CODE_CANDIDATE_EXECUTOR": "process",
                 "LINEAR_CODE_CANDIDATE_WORKERS": "2",
                 "LINEAR_CODE_PROFILE": "1",
@@ -171,15 +195,12 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
             clear=False,
         ):
             with mock.patch.object(self.search_core.logger, "info") as mock_info:
-                processed = self.search_core.best_restart_for_instance(instance, priority_fn)
+                process_scores = self.search_core.score_static_candidates(
+                    priority_fn=priority_fn,
+                    instance=instance,
+                )
 
-        self.assertEqual(processed.success, baseline.success)
-        self.assertEqual(processed.selected_free_columns, baseline.selected_free_columns)
-        self.assertEqual(processed.added_free_columns, baseline.added_free_columns)
-        self.assertEqual(processed.blocked_candidate_count, baseline.blocked_candidate_count)
-        self.assertEqual(processed.chosen_weights, baseline.chosen_weights)
-        self.assertEqual(processed.candidate_count, baseline.candidate_count)
-        self.assertEqual(processed.sorted_scores[:10], baseline.sorted_scores[:10])
+        self.assertEqual(process_scores, thread_scores)
         profile_messages = [
             call.args[0]
             for call in mock_info.call_args_list
@@ -249,6 +270,58 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         self.assertIn("evaluation_time_seconds", result.metrics)
         self.assertGreaterEqual(result.metrics["evaluation_time_seconds"], 0.0)
         self.assertIn("top_ranked_columns", result.artifacts)
+
+    def test_successful_code_vector_artifacts_describe_accepted_columns(self):
+        """Successful constructions should expose rank, score, and weight for each fill."""
+        instance = self.search_core.make_instance(n=7, k=4, distance=3, restarts=1)
+        result = self.search_core.evaluate_priority_function(
+            self.initial_program.get_priority_function(),
+            instance,
+        )
+
+        self.assertEqual(result.metrics["success_rate"], 1.0)
+        self.assertIn("successful_code_vectors", result.artifacts)
+        self.assertIn("successful_code_summary", result.artifacts)
+
+        vectors = json.loads(result.artifacts["successful_code_vectors"])
+        summary = json.loads(result.artifacts["successful_code_summary"])
+
+        self.assertEqual(len(vectors), instance.k)
+        self.assertEqual([entry["fill_index"] for entry in vectors], [1, 2, 3, 4])
+        self.assertTrue(all(entry["rank"] >= 1 for entry in vectors))
+        self.assertTrue(all(isinstance(entry["score"], float) for entry in vectors))
+        for entry in vectors:
+            self.assertEqual(entry["weight"], entry["column"].count("1"))
+
+        ranks = [entry["rank"] for entry in vectors]
+        weight_histogram = {}
+        for entry in vectors:
+            weight = str(entry["weight"])
+            weight_histogram[weight] = weight_histogram.get(weight, 0) + 1
+
+        self.assertEqual(summary["n"], instance.n)
+        self.assertEqual(summary["k"], instance.k)
+        self.assertEqual(summary["d"], instance.target_distance)
+        self.assertEqual(summary["r"], instance.r)
+        self.assertEqual(summary["restart"], 0)
+        self.assertEqual(summary["vector_count"], instance.k)
+        self.assertEqual(summary["rank_min"], min(ranks))
+        self.assertEqual(summary["rank_max"], max(ranks))
+        self.assertAlmostEqual(summary["rank_avg"], sum(ranks) / len(ranks))
+        self.assertEqual(summary["weight_histogram"], weight_histogram)
+
+    def test_successful_code_vector_artifacts_are_success_only(self):
+        """Partial constructions should keep existing artifacts without success-only analysis."""
+        instance = self.search_core.make_instance(n=16, k=15, distance=2, restarts=1)
+        result = self.search_core.evaluate_priority_function(
+            self.initial_program.get_priority_function(),
+            instance,
+        )
+
+        self.assertEqual(result.metrics["success_rate"], 0.0)
+        self.assertIn("search_result", result.artifacts)
+        self.assertNotIn("successful_code_vectors", result.artifacts)
+        self.assertNotIn("successful_code_summary", result.artifacts)
 
     def test_actual_minimum_distance_matches_target_for_valid_construction(self):
         """The exact d computed from constructed columns should match the target on success."""
