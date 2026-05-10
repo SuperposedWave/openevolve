@@ -29,12 +29,37 @@ The evaluator reads the target instance from environment variables:
 - `LINEAR_CODE_K`
 - `LINEAR_CODE_D`
 - optional: `LINEAR_CODE_RESTARTS`
+- optional: `LINEAR_CODE_SEARCH_MODE` (`full` by default, `sampled_refill`, or `sampled_beam`)
+- optional: `LINEAR_CODE_PROGRESS` (`1` enables restart progress and sampled-step output)
 - optional: `LINEAR_CODE_CANDIDATE_WORKERS`
 - optional: `LINEAR_CODE_RESTART_WORKERS`
 
 If you do not set them, the default target is `[8,4,4]_2`.
 
-The greedy fill itself stays sequential because each accepted column updates the exact forbidden-state. The new worker settings only parallelize:
+The default `full` mode scores every candidate and sorts the complete candidate
+list. `sampled_refill` mode avoids full enumeration: each restart samples
+candidate pools from Hamming-weight layers proportional to `C(r, w)`, filters
+them through the current exact forbidden state, scores only legal sampled
+candidates, and greedily accepts from that small pool before refilling.
+`sampled_beam` keeps several partial constructions per restart and expands them
+with the same sampled legality checks.
+
+Useful sampled-search controls:
+
+- `LINEAR_CODE_RANDOM_SEED`: base seed for reproducible randomized restarts.
+- `LINEAR_CODE_SAMPLE_POOL_SIZE`: target legal sampled candidates per refill.
+- `LINEAR_CODE_SAMPLE_ATTEMPTS_PER_REFILL`: random draws allowed for one refill.
+- `LINEAR_CODE_SAMPLE_MAX_REFILLS`: maximum refills per restart.
+- `LINEAR_CODE_SAMPLE_MAX_STALE_REFILLS`: no-progress refills before abandoning a restart.
+- `LINEAR_CODE_BACKTRACK_DEPTH`: recent columns removed when sampled refill stalls.
+- `LINEAR_CODE_BACKTRACK_MAX_EVENTS`: maximum sampled-refill backtracking events per restart.
+- `LINEAR_CODE_BEAM_WIDTH`: number of partial constructions kept in sampled beam mode.
+- `LINEAR_CODE_BEAM_BRANCHES_PER_STATE`: legal branches kept from each beam state.
+- `LINEAR_CODE_BEAM_ATTEMPTS_PER_STATE`: random draws used to expand each beam state.
+- `LINEAR_CODE_BEAM_FORBIDDEN_PENALTY`: penalty for growing the exact forbidden set.
+- `LINEAR_CODE_PROGRESS`: show a restart progress bar plus per-refill sampled-search steps.
+
+The greedy fill itself stays sequential because each accepted column updates the exact forbidden-state. The worker settings only parallelize:
 
 - candidate scoring inside one restart,
 - and evaluation across independent restart indices.

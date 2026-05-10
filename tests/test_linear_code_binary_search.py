@@ -213,6 +213,240 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
             )
         )
 
+    def test_sampled_refill_search_solves_without_full_candidate_scoring(self):
+        """Sampled refill mode should find a valid code while scoring only sampled candidates."""
+        instance = self.search_core.make_instance(n=12, k=4, distance=4, restarts=3)
+        candidate_count = self.search_core.candidate_count(
+            instance.r,
+            instance.target_distance,
+        )
+        calls = []
+
+        def counted_priority(column_mask, n, k, d):
+            calls.append(column_mask)
+            return self.initial_program.get_priority_function()(column_mask, n, k, d)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LINEAR_CODE_SEARCH_MODE": "sampled_refill",
+                "LINEAR_CODE_RANDOM_SEED": "1",
+                "LINEAR_CODE_SAMPLE_POOL_SIZE": "64",
+                "LINEAR_CODE_SAMPLE_ATTEMPTS_PER_REFILL": "1024",
+                "LINEAR_CODE_SAMPLE_MAX_REFILLS": "16",
+                "LINEAR_CODE_RESTART_WORKERS": "1",
+            },
+            clear=False,
+        ):
+            result = self.search_core.evaluate_priority_function(counted_priority, instance)
+
+        self.assertEqual(result.metrics["success_rate"], 1.0)
+        self.assertLess(len(calls), candidate_count * instance.restarts)
+        search_result = json.loads(result.artifacts["search_result"])
+        self.assertEqual(search_result["search_mode"], "sampled_refill")
+        self.assertLess(search_result["scored_candidates"], candidate_count)
+        selected = tuple(int(bits, 2) for bits in search_result["selected_free_columns"])
+        self.assertTrue(
+            self.search_core.validate_free_columns(
+                instance.r,
+                selected,
+                instance.target_distance,
+            )
+        )
+
+    def test_sample_weight_layers_use_candidate_layer_counts(self):
+        """Sampled weight priors should match exact binomial layer sizes."""
+        layers = self.search_core.candidate_weight_layer_counts(r=6, distance=4)
+        self.assertEqual(layers, ((3, 20), (4, 15), (5, 6), (6, 1)))
+        rng = self.search_core.random.Random(123)
+        sampled_weights = {
+            self.search_core._sample_weight(6, 4, rng)
+            for _ in range(200)
+        }
+        self.assertTrue(sampled_weights)
+        self.assertTrue(all(weight >= 3 for weight in sampled_weights))
+        self.assertTrue(all(weight <= 6 for weight in sampled_weights))
+
+    def test_sampled_refill_artifacts_use_sampled_rank_scope(self):
+        """Sampled vector ranks should be labeled as pool-local rather than global ranks."""
+        instance = self.search_core.make_instance(n=12, k=4, distance=4, restarts=1)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LINEAR_CODE_SEARCH_MODE": "sampled_refill",
+                "LINEAR_CODE_RANDOM_SEED": "1",
+                "LINEAR_CODE_SAMPLE_POOL_SIZE": "64",
+                "LINEAR_CODE_SAMPLE_ATTEMPTS_PER_REFILL": "1024",
+            },
+            clear=False,
+        ):
+            result = self.search_core.evaluate_priority_function(
+                self.initial_program.get_priority_function(),
+                instance,
+            )
+
+        self.assertEqual(result.metrics["success_rate"], 1.0)
+        vectors = json.loads(result.artifacts["successful_code_vectors"])
+        summary = json.loads(result.artifacts["successful_code_summary"])
+        self.assertEqual(summary["search_mode"], "sampled_refill")
+        self.assertTrue(all(entry["rank_scope"] == "sampled_pool" for entry in vectors))
+        self.assertEqual([entry["fill_index"] for entry in vectors], [1, 2, 3, 4])
+
+    def test_sampled_refill_backtracking_keeps_final_vectors_consistent(self):
+        """Backtracking should remove stale path columns from the final success artifacts."""
+        instance = self.search_core.make_instance(n=10, k=4, distance=4, restarts=1)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LINEAR_CODE_SEARCH_MODE": "sampled_refill",
+                "LINEAR_CODE_RANDOM_SEED": "5",
+                "LINEAR_CODE_SAMPLE_POOL_SIZE": "1",
+                "LINEAR_CODE_SAMPLE_ATTEMPTS_PER_REFILL": "1",
+                "LINEAR_CODE_SAMPLE_MAX_REFILLS": "80",
+                "LINEAR_CODE_SAMPLE_MAX_STALE_REFILLS": "1",
+                "LINEAR_CODE_BACKTRACK_DEPTH": "1",
+                "LINEAR_CODE_BACKTRACK_MAX_EVENTS": "10",
+            },
+            clear=False,
+        ):
+            result = self.search_core.evaluate_priority_function(
+                self.initial_program.get_priority_function(),
+                instance,
+            )
+
+        self.assertEqual(result.metrics["success_rate"], 1.0)
+        search_result = json.loads(result.artifacts["search_result"])
+        self.assertEqual(search_result["backtrack_events"], 1)
+        self.assertEqual(search_result["backtracked_columns"], 1)
+        selected = search_result["selected_free_columns"]
+        vectors = json.loads(result.artifacts["successful_code_vectors"])
+        self.assertEqual([entry["fill_index"] for entry in vectors], [1, 2, 3, 4])
+        self.assertEqual([entry["column"] for entry in vectors], selected)
+        self.assertTrue(
+            self.search_core.validate_free_columns(
+                instance.r,
+                tuple(int(bits, 2) for bits in selected),
+                instance.target_distance,
+            )
+        )
+
+    def test_sampled_refill_search_is_reproducible_for_fixed_seed(self):
+        """Randomized search should be reproducible when the seed and budgets are fixed."""
+        instance = self.search_core.make_instance(n=12, k=4, distance=4, restarts=2)
+        env = {
+            "LINEAR_CODE_SEARCH_MODE": "sampled_refill",
+            "LINEAR_CODE_RANDOM_SEED": "7",
+            "LINEAR_CODE_SAMPLE_POOL_SIZE": "64",
+            "LINEAR_CODE_SAMPLE_ATTEMPTS_PER_REFILL": "1024",
+            "LINEAR_CODE_RESTART_WORKERS": "1",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            first = self.search_core.evaluate_priority_function(
+                self.initial_program.get_priority_function(),
+                instance,
+            )
+        with mock.patch.dict(os.environ, env, clear=False):
+            second = self.search_core.evaluate_priority_function(
+                self.initial_program.get_priority_function(),
+                instance,
+            )
+
+        comparable_first = {
+            key: value
+            for key, value in first.metrics.items()
+            if key != "evaluation_time_seconds"
+        }
+        comparable_second = {
+            key: value
+            for key, value in second.metrics.items()
+            if key != "evaluation_time_seconds"
+        }
+        self.assertEqual(comparable_first, comparable_second)
+        self.assertEqual(first.artifacts, second.artifacts)
+
+    def test_sampled_beam_search_solves_and_uses_beam_rank_scope(self):
+        """Sampled beam mode should solve a small instance without full enumeration."""
+        instance = self.search_core.make_instance(n=12, k=4, distance=4, restarts=1)
+        candidate_count = self.search_core.candidate_count(
+            instance.r,
+            instance.target_distance,
+        )
+        env = {
+            "LINEAR_CODE_SEARCH_MODE": "sampled_beam",
+            "LINEAR_CODE_RANDOM_SEED": "1",
+            "LINEAR_CODE_BEAM_WIDTH": "4",
+            "LINEAR_CODE_BEAM_BRANCHES_PER_STATE": "16",
+            "LINEAR_CODE_BEAM_ATTEMPTS_PER_STATE": "256",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            first = self.search_core.evaluate_priority_function(
+                self.initial_program.get_priority_function(),
+                instance,
+            )
+        with mock.patch.dict(os.environ, env, clear=False):
+            second = self.search_core.evaluate_priority_function(
+                self.initial_program.get_priority_function(),
+                instance,
+            )
+
+        self.assertEqual(first.metrics["success_rate"], 1.0)
+        search_result = json.loads(first.artifacts["search_result"])
+        self.assertEqual(search_result["search_mode"], "sampled_beam")
+        self.assertEqual(search_result["beam_width"], 4)
+        self.assertGreater(search_result["beam_expanded_states"], 0)
+        self.assertLess(search_result["scored_candidates"], candidate_count * instance.restarts)
+        vectors = json.loads(first.artifacts["successful_code_vectors"])
+        self.assertTrue(all(entry["rank_scope"] == "sampled_beam_pool" for entry in vectors))
+
+        comparable_first = {
+            key: value
+            for key, value in first.metrics.items()
+            if key != "evaluation_time_seconds"
+        }
+        comparable_second = {
+            key: value
+            for key, value in second.metrics.items()
+            if key != "evaluation_time_seconds"
+        }
+        self.assertEqual(comparable_first, comparable_second)
+        self.assertEqual(first.artifacts, second.artifacts)
+
+    def test_progress_flag_emits_sampled_restart_steps(self):
+        """Progress mode should report sampled restart and refill phases."""
+        instance = self.search_core.make_instance(n=12, k=4, distance=4, restarts=1)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LINEAR_CODE_SEARCH_MODE": "sampled_refill",
+                "LINEAR_CODE_PROGRESS": "1",
+                "LINEAR_CODE_RANDOM_SEED": "1",
+                "LINEAR_CODE_SAMPLE_POOL_SIZE": "64",
+                "LINEAR_CODE_SAMPLE_ATTEMPTS_PER_REFILL": "1024",
+            },
+            clear=False,
+        ):
+            with mock.patch.object(self.search_core, "_progress_message") as mock_progress:
+                with mock.patch.object(
+                    self.search_core,
+                    "_iterate_with_progress",
+                    side_effect=lambda items, description, show_progress, total=None: items,
+                ):
+                    result = self.search_core.evaluate_priority_function(
+                        self.initial_program.get_priority_function(),
+                        instance,
+                    )
+
+        self.assertEqual(result.metrics["success_rate"], 1.0)
+        messages = [
+            call.args[1]
+            for call in mock_progress.call_args_list
+            if len(call.args) >= 2 and call.args[0]
+        ]
+        self.assertTrue(any("restart 0: start sampled_refill" in message for message in messages))
+        self.assertTrue(any("refill 1/" in message and "sample" in message for message in messages))
+        self.assertTrue(any("sort_and_greedy" in message for message in messages))
+        self.assertTrue(any("restart 0: finish" in message for message in messages))
+
     def test_stage_profile_logging_is_disabled_by_default(self):
         """Profiling logs should stay silent unless explicitly enabled."""
         instance = self.search_core.make_instance(n=8, k=4, distance=4, restarts=1)
