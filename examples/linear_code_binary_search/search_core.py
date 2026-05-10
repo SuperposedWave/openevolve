@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from itertools import combinations
 from pathlib import Path
+import random
 from typing import Callable, Iterable, List, Sequence, Tuple
 
 try:
@@ -66,6 +67,7 @@ class AcceptedVectorRecord:
     column: str
     weight: int
     score: float
+    rank_scope: str = "global"
 
 
 @dataclass
@@ -83,6 +85,25 @@ class SearchAttemptResult:
     illegal_weight_histogram: Tuple[Tuple[int, int], ...]
     chosen_weights: Tuple[int, ...]
     accepted_vectors: Tuple[AcceptedVectorRecord, ...]
+    search_mode: str = "full"
+    sample_attempt_count: int = 0
+    sampled_candidate_count: int = 0
+    scored_candidate_count: int = 0
+    backtrack_events: int = 0
+    backtracked_columns: int = 0
+    beam_width: int = 0
+    beam_expanded_states: int = 0
+
+
+@dataclass
+class BeamSearchState:
+    """One partial solution maintained by sampled beam search."""
+
+    search_state: "IncrementalForbiddenState"
+    accepted_vectors: Tuple[AcceptedVectorRecord, ...]
+    adjusted_score: float
+    priority_score: float
+    tie_break: float
 
 
 class IncrementalForbiddenState:
@@ -133,6 +154,28 @@ def _env_worker_override(name: str) -> int | None:
         return None
 
 
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    """Parse an integer environment override with a lower bound."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        return max(int(raw_value), minimum)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    """Parse a float environment override with a lower bound."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        return max(float(raw_value), minimum)
+    except ValueError:
+        return default
+
+
 def _resolve_worker_count(task_count: int, env_name: str, minimum_parallel_tasks: int) -> int:
     """Choose a bounded thread count for a pool-backed parallel section."""
     override = _env_worker_override(env_name)
@@ -157,12 +200,40 @@ def _profiling_enabled() -> bool:
     return _env_flag_enabled("LINEAR_CODE_PROFILE")
 
 
+def _progress_enabled() -> bool:
+    """Return whether user-facing progress bars should be shown."""
+    return _env_flag_enabled("LINEAR_CODE_PROGRESS")
+
+
+def _search_mode() -> str:
+    """Return the requested inner search mode."""
+    raw_value = os.environ.get("LINEAR_CODE_SEARCH_MODE", "full")
+    normalized = raw_value.strip().lower().replace("-", "_")
+    if normalized in {"sampled", "sampled_refill", "refill"}:
+        return "sampled_refill"
+    if normalized in {"sampled_beam", "beam"}:
+        return "sampled_beam"
+    return "full"
+
+
 def _log_profile(stage: str, **fields: object) -> None:
     """Emit one structured stage log line when profiling is enabled."""
     if not _profiling_enabled():
         return
     payload = " ".join(f"{key}={value}" for key, value in fields.items())
     logger.info(f"linear_code_profile stage={stage} {payload}".strip())
+
+
+def _progress_message(show_progress: bool, message: str) -> None:
+    """Emit a short user-facing progress message without breaking tqdm bars."""
+    if not show_progress:
+        return
+    try:
+        from tqdm import tqdm
+    except Exception:
+        print(message)
+        return
+    tqdm.write(message)
 
 
 @lru_cache(maxsize=None)
@@ -176,6 +247,20 @@ def candidate_masks(r: int, distance: int) -> Tuple[int, ...]:
     """All non-zero free columns that pass the initial weight filter."""
     min_weight = max(distance - 1, 1)
     return tuple(mask for mask in range(1, 1 << r) if popcount(mask) >= min_weight)
+
+
+@lru_cache(maxsize=None)
+def candidate_count(r: int, distance: int) -> int:
+    """Count initially weight-eligible free columns without materializing them."""
+    min_weight = max(distance - 1, 1)
+    return sum(math.comb(r, weight) for weight in range(min_weight, r + 1))
+
+
+@lru_cache(maxsize=None)
+def candidate_weight_layer_counts(r: int, distance: int) -> Tuple[Tuple[int, int], ...]:
+    """Return exact candidate counts for each initially eligible Hamming weight."""
+    min_weight = max(distance - 1, 1)
+    return tuple((weight, math.comb(r, weight)) for weight in range(min_weight, r + 1))
 
 
 def _initialize_reachable_layers(r: int, distance: int) -> List[set[int]]:
@@ -325,6 +410,7 @@ def _accepted_vector_record(
     rank: int,
     fill_index: int,
     r: int,
+    rank_scope: str = "global",
 ) -> AcceptedVectorRecord:
     """Create the shared accepted-vector analysis record for both scan paths."""
     return AcceptedVectorRecord(
@@ -333,6 +419,7 @@ def _accepted_vector_record(
         column=format_mask(candidate_mask, r),
         weight=popcount(candidate_mask),
         score=float(score),
+        rank_scope=rank_scope,
     )
 
 
@@ -473,6 +560,100 @@ def _deterministic_tiebreak(candidate_mask: int, restart_index: int) -> int:
         + restart_index * 2654435761
         + 12345
     ) & 0xFFFFFFFF
+
+
+def _sampled_seed(restart_index: int) -> int:
+    """Return the deterministic seed for one sampled restart."""
+    base_seed = _env_int("LINEAR_CODE_RANDOM_SEED", 0, minimum=0)
+    return (base_seed + restart_index * 1000003) & 0xFFFFFFFF
+
+
+def _sample_weight(r: int, distance: int, rng: random.Random) -> int:
+    """Draw a Hamming weight layer proportional to the layer's candidate count."""
+    layer_counts = candidate_weight_layer_counts(r, distance)
+    weights = [weight for weight, _ in layer_counts]
+    counts = [count for _, count in layer_counts]
+    return rng.choices(weights, weights=counts, k=1)[0]
+
+
+def _random_mask_with_weight(r: int, weight: int, rng: random.Random) -> int:
+    """Generate a uniformly random binary mask with exactly `weight` ones."""
+    mask = 0
+    for bit_index in rng.sample(range(r), weight):
+        mask |= 1 << bit_index
+    return mask
+
+
+def _sampled_refill_pool_size(instance: BenchmarkInstance) -> int:
+    """Return the target legal-candidate pool size for sampled refills."""
+    default_size = max(256, min(8192, instance.k * 256))
+    return _env_int("LINEAR_CODE_SAMPLE_POOL_SIZE", default_size)
+
+
+def _sampled_refill_attempt_budget(pool_size: int) -> int:
+    """Return the maximum random draws used to refill one sampled pool."""
+    return _env_int("LINEAR_CODE_SAMPLE_ATTEMPTS_PER_REFILL", pool_size * 20)
+
+
+def _sampled_max_refills(instance: BenchmarkInstance) -> int:
+    """Return the maximum number of sampled pool refills per restart."""
+    return _env_int("LINEAR_CODE_SAMPLE_MAX_REFILLS", max(16, instance.k * 8))
+
+
+def _sampled_max_stale_refills() -> int:
+    """Return how many no-progress refills are allowed before abandoning a restart."""
+    return _env_int("LINEAR_CODE_SAMPLE_MAX_STALE_REFILLS", 4)
+
+
+def _backtrack_depth() -> int:
+    """Return how many recent accepted columns to remove on sampled-refill backtracking."""
+    return _env_int("LINEAR_CODE_BACKTRACK_DEPTH", 2, minimum=0)
+
+
+def _backtrack_max_events() -> int:
+    """Return the maximum number of sampled-refill backtracking events per restart."""
+    return _env_int("LINEAR_CODE_BACKTRACK_MAX_EVENTS", 4, minimum=0)
+
+
+def _beam_width() -> int:
+    """Return the sampled beam width."""
+    return _env_int("LINEAR_CODE_BEAM_WIDTH", 8)
+
+
+def _beam_branches_per_state() -> int:
+    """Return the maximum number of branch candidates kept from each beam state."""
+    return _env_int("LINEAR_CODE_BEAM_BRANCHES_PER_STATE", 128)
+
+
+def _beam_attempts_per_state() -> int:
+    """Return the maximum random draws used to expand one beam state."""
+    return _env_int("LINEAR_CODE_BEAM_ATTEMPTS_PER_STATE", 2560)
+
+
+def _beam_forbidden_penalty() -> float:
+    """Return the forbidden-growth penalty used by sampled beam scoring."""
+    return _env_float("LINEAR_CODE_BEAM_FORBIDDEN_PENALTY", 1.0)
+
+
+def _clone_search_state(search_state: IncrementalForbiddenState) -> IncrementalForbiddenState:
+    """Deep-copy an incremental forbidden state."""
+    cloned = IncrementalForbiddenState(search_state.r, search_state.distance)
+    cloned.reachable = [set(layer) for layer in search_state.reachable]
+    cloned.forbidden = set(search_state.forbidden)
+    cloned.selected_free_columns = list(search_state.selected_free_columns)
+    return cloned
+
+
+def _rebuild_search_state(
+    r: int,
+    distance: int,
+    selected_free_columns: Sequence[int],
+) -> IncrementalForbiddenState:
+    """Rebuild an incremental forbidden state from selected free columns."""
+    rebuilt = IncrementalForbiddenState(r, distance)
+    for column_mask in selected_free_columns:
+        rebuilt.add(column_mask)
+    return rebuilt
 
 
 def _iterate_with_progress(
@@ -740,7 +921,532 @@ def greedy_construct(
         illegal_weight_histogram=tuple(sorted(illegal_weight_histogram.items())),
         chosen_weights=tuple(popcount(mask) for mask in selected),
         accepted_vectors=tuple(accepted_vectors),
+        search_mode="full",
+        sample_attempt_count=0,
+        sampled_candidate_count=0,
+        scored_candidate_count=len(ordered_scores),
+        backtrack_events=0,
+        backtracked_columns=0,
+        beam_width=0,
+        beam_expanded_states=0,
     )
+
+
+def sampled_refill_greedy_construct(
+    instance: BenchmarkInstance,
+    priority_fn: PriorityFn,
+    restart_index: int,
+    show_progress: bool = False,
+) -> SearchAttemptResult:
+    """Run priority-guided randomized greedy search without enumerating all candidates."""
+    search_state = IncrementalForbiddenState(instance.r, instance.target_distance)
+    rng = random.Random(_sampled_seed(restart_index))
+    pool_size = _sampled_refill_pool_size(instance)
+    attempt_budget = _sampled_refill_attempt_budget(pool_size)
+    max_refills = _sampled_max_refills(instance)
+    max_stale_refills = _sampled_max_stale_refills()
+    total_candidate_count = candidate_count(instance.r, instance.target_distance)
+
+    seen: set[int] = set()
+    blocked_candidate_count = 0
+    sample_attempt_count = 0
+    illegal_weight_histogram: Counter[int] = Counter()
+    accepted_vectors: List[AcceptedVectorRecord] = []
+    scored_candidates_seen: List[Tuple[int, float]] = []
+    tabu_columns: set[int] = set()
+    stale_refills = 0
+    backtrack_events = 0
+    backtracked_columns = 0
+    backtrack_depth = _backtrack_depth()
+    max_backtrack_events = _backtrack_max_events()
+
+    greedy_started_at = time.perf_counter()
+    _progress_message(
+        show_progress,
+        (
+            f"restart {restart_index}: start sampled_refill "
+            f"pool_size={pool_size} attempts_per_refill={attempt_budget} "
+            f"max_refills={max_refills}"
+        ),
+    )
+    for refill_index in range(1, max_refills + 1):
+        if len(search_state.selected_free_columns) >= instance.k:
+            break
+        if len(seen) >= total_candidate_count:
+            break
+
+        _progress_message(
+            show_progress,
+            (
+                f"restart {restart_index}: refill {refill_index}/{max_refills} "
+                f"sample selected={len(search_state.selected_free_columns)}/{instance.k} "
+                f"seen={len(seen)}/{total_candidate_count}"
+            ),
+        )
+        pool: List[Tuple[float, float, int]] = []
+        refill_attempts = 0
+        while (
+            len(pool) < pool_size
+            and refill_attempts < attempt_budget
+            and len(seen) < total_candidate_count
+        ):
+            refill_attempts += 1
+            sample_attempt_count += 1
+            weight = _sample_weight(instance.r, instance.target_distance, rng)
+            candidate_mask = _random_mask_with_weight(instance.r, weight, rng)
+            if candidate_mask in tabu_columns:
+                continue
+            if candidate_mask in seen:
+                continue
+            seen.add(candidate_mask)
+            if not search_state.can_add(candidate_mask):
+                blocked_candidate_count += 1
+                illegal_weight_histogram[popcount(candidate_mask)] += 1
+                continue
+            score = _safe_priority(
+                priority_fn,
+                candidate_mask,
+                instance.n,
+                instance.k,
+                instance.target_distance,
+            )
+            scored_candidates_seen.append((candidate_mask, score))
+            pool.append((score, rng.random(), candidate_mask))
+
+        _progress_message(
+            show_progress,
+            (
+                f"restart {restart_index}: refill {refill_index}/{max_refills} "
+                f"sampled pool={len(pool)} attempts={refill_attempts} "
+                f"seen={len(seen)} blocked={blocked_candidate_count}"
+            ),
+        )
+        if not pool:
+            stale_refills += 1
+            if stale_refills >= max_stale_refills:
+                if (
+                    backtrack_depth > 0
+                    and backtrack_events < max_backtrack_events
+                    and search_state.selected_free_columns
+                ):
+                    remove_count = min(
+                        backtrack_depth,
+                        len(search_state.selected_free_columns),
+                        len(accepted_vectors),
+                    )
+                    removed = tuple(search_state.selected_free_columns[-remove_count:])
+                    tabu_columns.update(removed)
+                    remaining = tuple(search_state.selected_free_columns[:-remove_count])
+                    search_state = _rebuild_search_state(
+                        instance.r,
+                        instance.target_distance,
+                        remaining,
+                    )
+                    del accepted_vectors[-remove_count:]
+                    backtrack_events += 1
+                    backtracked_columns += remove_count
+                    stale_refills = 0
+                    _progress_message(
+                        show_progress,
+                        (
+                            f"restart {restart_index}: backtrack removed={remove_count} "
+                            f"selected={len(search_state.selected_free_columns)}/{instance.k} "
+                            f"events={backtrack_events}/{max_backtrack_events}"
+                        ),
+                    )
+                    continue
+                break
+            continue
+
+        _progress_message(
+            show_progress,
+            f"restart {restart_index}: refill {refill_index}/{max_refills} sort_and_greedy pool={len(pool)}",
+        )
+        pool.sort(reverse=True)
+        accepted_this_refill = 0
+        for pool_rank, (score, _, candidate_mask) in enumerate(pool, start=1):
+            if len(search_state.selected_free_columns) >= instance.k:
+                break
+            if search_state.can_add(candidate_mask):
+                search_state.add(candidate_mask)
+                accepted_this_refill += 1
+                accepted_vectors.append(
+                    _accepted_vector_record(
+                        candidate_mask,
+                        score,
+                        pool_rank,
+                        len(search_state.selected_free_columns),
+                        instance.r,
+                        rank_scope="sampled_pool",
+                    )
+                )
+            else:
+                blocked_candidate_count += 1
+                illegal_weight_histogram[popcount(candidate_mask)] += 1
+
+        _progress_message(
+            show_progress,
+            (
+                f"restart {restart_index}: refill {refill_index}/{max_refills} "
+                f"accepted={accepted_this_refill} "
+                f"selected={len(search_state.selected_free_columns)}/{instance.k} "
+                f"stale={stale_refills if accepted_this_refill == 0 else 0}"
+            ),
+        )
+        if accepted_this_refill:
+            stale_refills = 0
+        else:
+            stale_refills += 1
+            if stale_refills >= max_stale_refills:
+                if (
+                    backtrack_depth > 0
+                    and backtrack_events < max_backtrack_events
+                    and search_state.selected_free_columns
+                ):
+                    remove_count = min(
+                        backtrack_depth,
+                        len(search_state.selected_free_columns),
+                        len(accepted_vectors),
+                    )
+                    removed = tuple(search_state.selected_free_columns[-remove_count:])
+                    tabu_columns.update(removed)
+                    remaining = tuple(search_state.selected_free_columns[:-remove_count])
+                    search_state = _rebuild_search_state(
+                        instance.r,
+                        instance.target_distance,
+                        remaining,
+                    )
+                    del accepted_vectors[-remove_count:]
+                    backtrack_events += 1
+                    backtracked_columns += remove_count
+                    stale_refills = 0
+                    _progress_message(
+                        show_progress,
+                        (
+                            f"restart {restart_index}: backtrack removed={remove_count} "
+                            f"selected={len(search_state.selected_free_columns)}/{instance.k} "
+                            f"events={backtrack_events}/{max_backtrack_events}"
+                        ),
+                    )
+                    continue
+                break
+
+    selected = tuple(search_state.selected_free_columns)
+    top_sampled_scores = sorted(
+        scored_candidates_seen,
+        key=lambda item: (
+            item[1],
+            _deterministic_tiebreak(item[0], restart_index),
+            item[0],
+        ),
+        reverse=True,
+    )
+    success = len(selected) == instance.k and validate_free_columns(
+        instance.r,
+        selected,
+        instance.target_distance,
+    )
+    _log_profile(
+        "sampled_refill_greedy_scan",
+        n=instance.n,
+        k=instance.k,
+        d=instance.target_distance,
+        r=instance.r,
+        restart=restart_index,
+        candidate_count=total_candidate_count,
+        sampled_candidates=len(seen),
+        scored_candidates=len(scored_candidates_seen),
+        sample_attempts=sample_attempt_count,
+        selected_count=len(selected),
+        blocked_count=blocked_candidate_count,
+        backtrack_events=backtrack_events,
+        backtracked_columns=backtracked_columns,
+        elapsed_seconds=f"{time.perf_counter() - greedy_started_at:.6f}",
+    )
+    _progress_message(
+        show_progress,
+        (
+            f"restart {restart_index}: finish success={int(success)} "
+            f"selected={len(selected)}/{instance.k} sampled={len(seen)} "
+            f"scored={len(scored_candidates_seen)} attempts={sample_attempt_count} "
+            f"backtracks={backtrack_events}"
+        ),
+    )
+    return SearchAttemptResult(
+        success=success,
+        selected_free_columns=selected,
+        added_free_columns=len(selected),
+        candidate_count=total_candidate_count,
+        restart_index=restart_index,
+        sorted_candidates=tuple(mask for mask, _ in top_sampled_scores),
+        sorted_scores=tuple(top_sampled_scores),
+        blocked_candidate_count=blocked_candidate_count,
+        illegal_weight_histogram=tuple(sorted(illegal_weight_histogram.items())),
+        chosen_weights=tuple(popcount(mask) for mask in selected),
+        accepted_vectors=tuple(accepted_vectors),
+        search_mode="sampled_refill",
+        sample_attempt_count=sample_attempt_count,
+        sampled_candidate_count=len(seen),
+        scored_candidate_count=len(scored_candidates_seen),
+        backtrack_events=backtrack_events,
+        backtracked_columns=backtracked_columns,
+        beam_width=0,
+        beam_expanded_states=0,
+    )
+
+
+def _run_sampled_restart_job(
+    job: Tuple[BenchmarkInstance, PriorityFn, int]
+) -> SearchAttemptResult:
+    """Run one sampled restart."""
+    instance, priority_fn, restart_index = job
+    return sampled_refill_greedy_construct(
+        instance,
+        priority_fn,
+        restart_index=restart_index,
+        show_progress=False,
+    )
+
+
+def _beam_state_key(state: BeamSearchState) -> Tuple[int, float, float, float]:
+    """Sort key for keeping the most promising beam states."""
+    return (
+        len(state.search_state.selected_free_columns),
+        state.adjusted_score,
+        state.priority_score,
+        state.tie_break,
+    )
+
+
+def sampled_beam_construct(
+    instance: BenchmarkInstance,
+    priority_fn: PriorityFn,
+    restart_index: int,
+    show_progress: bool = False,
+) -> SearchAttemptResult:
+    """Run priority-guided sampled beam search without enumerating all candidates."""
+    rng = random.Random(_sampled_seed(restart_index))
+    width = _beam_width()
+    branches_per_state = _beam_branches_per_state()
+    attempts_per_state = _beam_attempts_per_state()
+    forbidden_penalty = _beam_forbidden_penalty()
+    total_candidate_count = candidate_count(instance.r, instance.target_distance)
+    forbidden_normalizer = float(max(1, 1 << instance.r))
+
+    beam_states = [
+        BeamSearchState(
+            search_state=IncrementalForbiddenState(
+                instance.r,
+                instance.target_distance,
+            ),
+            accepted_vectors=tuple(),
+            adjusted_score=0.0,
+            priority_score=0.0,
+            tie_break=rng.random(),
+        )
+    ]
+    seen_masks: set[int] = set()
+    scored_candidates_seen: List[Tuple[int, float]] = []
+    illegal_weight_histogram: Counter[int] = Counter()
+    blocked_candidate_count = 0
+    sample_attempt_count = 0
+    expanded_states = 0
+    started_at = time.perf_counter()
+
+    _progress_message(
+        show_progress,
+        (
+            f"restart {restart_index}: start sampled_beam width={width} "
+            f"branches_per_state={branches_per_state} attempts_per_state={attempts_per_state}"
+        ),
+    )
+    for depth in range(1, instance.k + 1):
+        if any(len(state.search_state.selected_free_columns) >= instance.k for state in beam_states):
+            break
+        next_states: List[BeamSearchState] = []
+        _progress_message(
+            show_progress,
+            (
+                f"restart {restart_index}: beam depth {depth}/{instance.k} "
+                f"states={len(beam_states)} seen={len(seen_masks)}/{total_candidate_count}"
+            ),
+        )
+        for state_index, state in enumerate(beam_states):
+            if len(state.search_state.selected_free_columns) >= instance.k:
+                next_states.append(state)
+                continue
+
+            pool: List[Tuple[float, float, float, int, IncrementalForbiddenState, int]] = []
+            local_seen: set[int] = set()
+            attempts = 0
+            while len(pool) < branches_per_state and attempts < attempts_per_state:
+                attempts += 1
+                sample_attempt_count += 1
+                weight = _sample_weight(instance.r, instance.target_distance, rng)
+                candidate_mask = _random_mask_with_weight(instance.r, weight, rng)
+                if candidate_mask in local_seen:
+                    continue
+                local_seen.add(candidate_mask)
+                seen_masks.add(candidate_mask)
+                if not state.search_state.can_add(candidate_mask):
+                    blocked_candidate_count += 1
+                    illegal_weight_histogram[popcount(candidate_mask)] += 1
+                    continue
+
+                priority_score = _safe_priority(
+                    priority_fn,
+                    candidate_mask,
+                    instance.n,
+                    instance.k,
+                    instance.target_distance,
+                )
+                scored_candidates_seen.append((candidate_mask, priority_score))
+                next_search_state = _clone_search_state(state.search_state)
+                before_forbidden = len(next_search_state.forbidden)
+                next_search_state.add(candidate_mask)
+                forbidden_growth = len(next_search_state.forbidden) - before_forbidden
+                extension_score = (
+                    priority_score
+                    - forbidden_penalty * (forbidden_growth / forbidden_normalizer)
+                )
+                pool.append(
+                    (
+                        extension_score,
+                        priority_score,
+                        rng.random(),
+                        candidate_mask,
+                        next_search_state,
+                        forbidden_growth,
+                    )
+                )
+
+            pool.sort(reverse=True)
+            _progress_message(
+                show_progress,
+                (
+                    f"restart {restart_index}: beam depth {depth}/{instance.k} "
+                    f"state={state_index + 1}/{len(beam_states)} "
+                    f"pool={len(pool)} attempts={attempts}"
+                ),
+            )
+            for pool_rank, (
+                extension_score,
+                priority_score,
+                tie_break,
+                candidate_mask,
+                next_search_state,
+                _,
+            ) in enumerate(pool, start=1):
+                accepted_vectors = state.accepted_vectors + (
+                    _accepted_vector_record(
+                        candidate_mask,
+                        priority_score,
+                        pool_rank,
+                        len(next_search_state.selected_free_columns),
+                        instance.r,
+                        rank_scope="sampled_beam_pool",
+                    ),
+                )
+                next_states.append(
+                    BeamSearchState(
+                        search_state=next_search_state,
+                        accepted_vectors=accepted_vectors,
+                        adjusted_score=state.adjusted_score + extension_score,
+                        priority_score=state.priority_score + priority_score,
+                        tie_break=tie_break,
+                    )
+                )
+                expanded_states += 1
+
+        if not next_states:
+            break
+        next_states.sort(key=_beam_state_key, reverse=True)
+        beam_states = next_states[:width]
+        _progress_message(
+            show_progress,
+            (
+                f"restart {restart_index}: beam depth {depth}/{instance.k} "
+                f"kept={len(beam_states)} best_selected="
+                f"{len(beam_states[0].search_state.selected_free_columns)}/{instance.k}"
+            ),
+        )
+
+    best_state = max(beam_states, key=_beam_state_key)
+    selected = tuple(best_state.search_state.selected_free_columns)
+    success = len(selected) == instance.k and validate_free_columns(
+        instance.r,
+        selected,
+        instance.target_distance,
+    )
+    top_sampled_scores = sorted(
+        scored_candidates_seen,
+        key=lambda item: (
+            item[1],
+            _deterministic_tiebreak(item[0], restart_index),
+            item[0],
+        ),
+        reverse=True,
+    )
+    _log_profile(
+        "sampled_beam_scan",
+        n=instance.n,
+        k=instance.k,
+        d=instance.target_distance,
+        r=instance.r,
+        restart=restart_index,
+        candidate_count=total_candidate_count,
+        sampled_candidates=len(seen_masks),
+        scored_candidates=len(scored_candidates_seen),
+        sample_attempts=sample_attempt_count,
+        selected_count=len(selected),
+        blocked_count=blocked_candidate_count,
+        beam_width=width,
+        beam_expanded_states=expanded_states,
+        elapsed_seconds=f"{time.perf_counter() - started_at:.6f}",
+    )
+    _progress_message(
+        show_progress,
+        (
+            f"restart {restart_index}: finish sampled_beam success={int(success)} "
+            f"selected={len(selected)}/{instance.k} sampled={len(seen_masks)} "
+            f"scored={len(scored_candidates_seen)} expanded={expanded_states}"
+        ),
+    )
+    return SearchAttemptResult(
+        success=success,
+        selected_free_columns=selected,
+        added_free_columns=len(selected),
+        candidate_count=total_candidate_count,
+        restart_index=restart_index,
+        sorted_candidates=tuple(mask for mask, _ in top_sampled_scores),
+        sorted_scores=tuple(top_sampled_scores),
+        blocked_candidate_count=blocked_candidate_count,
+        illegal_weight_histogram=tuple(sorted(illegal_weight_histogram.items())),
+        chosen_weights=tuple(popcount(mask) for mask in selected),
+        accepted_vectors=best_state.accepted_vectors,
+        search_mode="sampled_beam",
+        sample_attempt_count=sample_attempt_count,
+        sampled_candidate_count=len(seen_masks),
+        scored_candidate_count=len(scored_candidates_seen),
+        backtrack_events=0,
+        backtracked_columns=0,
+        beam_width=width,
+        beam_expanded_states=expanded_states,
+    )
+
+
+def _run_beam_restart_job(
+    job: Tuple[BenchmarkInstance, PriorityFn, int]
+) -> SearchAttemptResult:
+    """Run one sampled beam restart."""
+    instance, priority_fn, restart_index = job
+    return sampled_beam_construct(
+        instance,
+        priority_fn,
+        restart_index=restart_index,
+        show_progress=False,
+    )
+
 
 def best_restart_for_instance(
     instance: BenchmarkInstance,
@@ -748,6 +1454,90 @@ def best_restart_for_instance(
     show_progress: bool = False,
 ) -> SearchAttemptResult:
     """Evaluate all fixed restarts and keep the best deterministic attempt."""
+    search_mode = _search_mode()
+    if search_mode == "sampled_beam":
+        restart_worker_count = _resolve_worker_count(
+            instance.restarts,
+            env_name="LINEAR_CODE_RESTART_WORKERS",
+            minimum_parallel_tasks=2,
+        )
+        if show_progress or restart_worker_count <= 1:
+            attempts = [
+                sampled_beam_construct(
+                    instance,
+                    priority_fn,
+                    restart_index=restart_index,
+                    show_progress=show_progress,
+                )
+                for restart_index in _iterate_with_progress(
+                    range(instance.restarts),
+                    "sampled beam restarts",
+                    show_progress,
+                    total=instance.restarts,
+                )
+            ]
+        else:
+            restart_jobs = [
+                (instance, priority_fn, restart_index)
+                for restart_index in range(instance.restarts)
+            ]
+            with ThreadPoolExecutor(
+                max_workers=restart_worker_count,
+                thread_name_prefix="linear-code-beam-restart",
+            ) as executor:
+                attempts = list(executor.map(_run_beam_restart_job, restart_jobs))
+        return max(
+            attempts,
+            key=lambda attempt: (
+                int(attempt.success),
+                attempt.added_free_columns,
+                attempt.beam_expanded_states,
+                -attempt.sample_attempt_count,
+                -attempt.restart_index,
+            ),
+        )
+
+    if search_mode == "sampled_refill":
+        restart_worker_count = _resolve_worker_count(
+            instance.restarts,
+            env_name="LINEAR_CODE_RESTART_WORKERS",
+            minimum_parallel_tasks=2,
+        )
+        if show_progress or restart_worker_count <= 1:
+            attempts = [
+                sampled_refill_greedy_construct(
+                    instance,
+                    priority_fn,
+                    restart_index=restart_index,
+                    show_progress=show_progress,
+                )
+                for restart_index in _iterate_with_progress(
+                    range(instance.restarts),
+                    "sampled restarts",
+                    show_progress,
+                    total=instance.restarts,
+                )
+            ]
+        else:
+            restart_jobs = [
+                (instance, priority_fn, restart_index)
+                for restart_index in range(instance.restarts)
+            ]
+            with ThreadPoolExecutor(
+                max_workers=restart_worker_count,
+                thread_name_prefix="linear-code-sampled-restart",
+            ) as executor:
+                attempts = list(executor.map(_run_sampled_restart_job, restart_jobs))
+        return max(
+            attempts,
+            key=lambda attempt: (
+                int(attempt.success),
+                attempt.added_free_columns,
+                -attempt.sample_attempt_count,
+                -attempt.restart_index,
+            ),
+        )
+
     restart_worker_count = _resolve_worker_count(
         instance.restarts,
         env_name="LINEAR_CODE_RESTART_WORKERS",
@@ -767,7 +1557,12 @@ def best_restart_for_instance(
                 show_progress=show_progress,
                 static_scores=static_scores,
             )
-            for restart_index in range(instance.restarts)
+            for restart_index in _iterate_with_progress(
+                range(instance.restarts),
+                "full restarts",
+                show_progress,
+                total=instance.restarts,
+            )
         ]
     else:
         restart_jobs = [
@@ -828,6 +1623,7 @@ def _accepted_vector_to_dict(record: AcceptedVectorRecord) -> dict[str, int | fl
     return {
         "fill_index": record.fill_index,
         "rank": record.rank,
+        "rank_scope": record.rank_scope,
         "column": record.column,
         "weight": record.weight,
         "score": record.score,
@@ -837,7 +1633,7 @@ def _accepted_vector_to_dict(record: AcceptedVectorRecord) -> dict[str, int | fl
 def _successful_code_summary(
     active_instance: BenchmarkInstance,
     attempt: SearchAttemptResult,
-) -> dict[str, int | float | dict[int, int]]:
+) -> dict[str, int | float | str | dict[int, int]]:
     """Summarize accepted-vector rank and weight statistics for a successful code."""
     ranks = [record.rank for record in attempt.accepted_vectors]
     weight_counter = Counter(record.weight for record in attempt.accepted_vectors)
@@ -847,6 +1643,7 @@ def _successful_code_summary(
         "d": active_instance.target_distance,
         "r": active_instance.r,
         "restart": attempt.restart_index,
+        "search_mode": attempt.search_mode,
         "vector_count": len(attempt.accepted_vectors),
         "rank_min": min(ranks),
         "rank_max": max(ranks),
@@ -856,10 +1653,13 @@ def _successful_code_summary(
 
 
 def evaluate_priority_function(
-    priority_fn: PriorityFn, instance: BenchmarkInstance | None = None
+    priority_fn: PriorityFn,
+    instance: BenchmarkInstance | None = None,
+    show_progress: bool | None = None,
 ) -> EvaluationResult:
     """Run the fixed greedy search on one configurable instance."""
     active_instance = instance or DEFAULT_INSTANCE
+    active_show_progress = _progress_enabled() if show_progress is None else show_progress
     _log_profile(
         "evaluation_start",
         n=active_instance.n,
@@ -869,7 +1669,11 @@ def evaluate_priority_function(
         restarts=active_instance.restarts,
     )
     started_at = time.perf_counter()
-    attempt = best_restart_for_instance(active_instance, priority_fn)
+    attempt = best_restart_for_instance(
+        active_instance,
+        priority_fn,
+        show_progress=active_show_progress,
+    )
     elapsed_seconds = time.perf_counter() - started_at
     progress = attempt.added_free_columns / active_instance.k
     combined_score = 1.0 if attempt.success else progress
@@ -911,9 +1715,17 @@ def evaluate_priority_function(
         "search_result": json.dumps(
             {
                 "success": attempt.success,
+                "search_mode": attempt.search_mode,
                 "restart": attempt.restart_index,
                 "added_free_columns": attempt.added_free_columns,
                 "candidate_count": attempt.candidate_count,
+                "sample_attempts": attempt.sample_attempt_count,
+                "sampled_candidates": attempt.sampled_candidate_count,
+                "scored_candidates": attempt.scored_candidate_count,
+                "backtrack_events": attempt.backtrack_events,
+                "backtracked_columns": attempt.backtracked_columns,
+                "beam_width": attempt.beam_width,
+                "beam_expanded_states": attempt.beam_expanded_states,
                 "blocked_candidates": attempt.blocked_candidate_count,
                 "target_free_columns": active_instance.k,
                 "selected_free_columns": [
@@ -943,6 +1755,13 @@ def evaluate_priority_function(
             "success_rate": float(attempt.success),
             "avg_progress": progress,
             "constructed_columns": attempt.added_free_columns,
+            "sample_attempts": attempt.sample_attempt_count,
+            "sampled_candidates": attempt.sampled_candidate_count,
+            "scored_candidates": attempt.scored_candidate_count,
+            "backtrack_events": attempt.backtrack_events,
+            "backtracked_columns": attempt.backtracked_columns,
+            "beam_width": attempt.beam_width,
+            "beam_expanded_states": attempt.beam_expanded_states,
             "target_columns": active_instance.k,
             "target_distance": active_instance.target_distance,
             "n": active_instance.n,
