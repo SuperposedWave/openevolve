@@ -60,3 +60,4 @@ problems
 # linear code binary search
 examples/linear_code_binary_search/batch_runs/
 examples/linear_code_binary_search/batch_runs_n40/
+examples/linear_code_binary_search/batch_runs*/
