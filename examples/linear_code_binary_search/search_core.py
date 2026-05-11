@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import importlib.machinery
 import importlib.util
 import json
 import logging
@@ -40,6 +41,7 @@ except Exception:
 logger = logging.getLogger(__name__)
 PriorityFn = Callable[[int, int, int, int], float]
 _PROCESS_PRIORITY_FN: PriorityFn | None = None
+_NATIVE_MODULE = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,9 @@ class SearchAttemptResult:
     backtracked_columns: int = 0
     beam_width: int = 0
     beam_expanded_states: int = 0
+    legality_engine: str = "python"
+    native_r_limit: int | None = None
+    final_forbidden_count: int | None = None
 
 
 @dataclass
@@ -120,12 +125,57 @@ class IncrementalForbiddenState:
     def can_add(self, column_mask: int) -> bool:
         return column_mask not in self.forbidden
 
-    def add(self, column_mask: int) -> None:
+    def add(self, column_mask: int) -> int:
         if not self.can_add(column_mask):
             raise ValueError(f"Illegal free column {column_mask}")
+        before_count = len(self.forbidden)
         _add_column_to_reachable(self.reachable, column_mask, self.max_subset_size)
         self.forbidden = set().union(*self.reachable)
         self.selected_free_columns.append(column_mask)
+        return len(self.forbidden) - before_count
+
+
+class NativeForbiddenStateAdapter:
+    """Python adapter around the optional C exact legality engine."""
+
+    engine_name = "native"
+
+    def __init__(self, r: int, distance: int, native_state=None):
+        self.r = r
+        self.distance = distance
+        self.max_subset_size = max(distance - 2, 0)
+        self._native = native_state
+        if self._native is None:
+            native_module = _load_native_module()
+            self._native = native_module.NativeForbiddenState(r, distance)
+        self.selected_free_columns: List[int] = list(self._native.selected_columns())
+
+    def can_add(self, column_mask: int) -> bool:
+        return bool(self._native.can_add(column_mask))
+
+    def add(self, column_mask: int) -> int:
+        growth = int(self._native.add(column_mask))
+        self.selected_free_columns.append(column_mask)
+        return growth
+
+    def undo(self, count: int) -> None:
+        if count <= 0:
+            return
+        self._native.undo(count)
+        del self.selected_free_columns[-count:]
+
+    def clone(self) -> "NativeForbiddenStateAdapter":
+        return NativeForbiddenStateAdapter(
+            self.r,
+            self.distance,
+            native_state=self._native.clone(),
+        )
+
+    def forbidden_count(self) -> int:
+        return int(self._native.forbidden_count())
+
+    def layer_counts(self) -> Tuple[int, ...]:
+        return tuple(int(value) for value in self._native.layer_counts())
 
 
 DEFAULT_INSTANCE = BenchmarkInstance(
@@ -214,6 +264,48 @@ def _search_mode() -> str:
     if normalized in {"sampled_beam", "beam"}:
         return "sampled_beam"
     return "full"
+
+
+def _legality_engine_mode() -> str:
+    """Return the requested exact legality engine."""
+    raw_value = os.environ.get("LINEAR_CODE_LEGALITY_ENGINE", "python")
+    normalized = raw_value.strip().lower().replace("-", "_")
+    if normalized == "native":
+        return "native"
+    return "python"
+
+
+def _load_native_module():
+    """Load the optional CPython native legality module."""
+    global _NATIVE_MODULE
+    if _NATIVE_MODULE is not None:
+        return _NATIVE_MODULE
+    try:
+        import _linear_code_native as native_module
+
+        _NATIVE_MODULE = native_module
+        return native_module
+    except ImportError:
+        pass
+
+    search_roots = [Path(__file__).resolve().parents[2], Path(__file__).resolve().parent]
+    for root in search_roots:
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+            candidate = root / f"_linear_code_native{suffix}"
+            if not candidate.exists():
+                continue
+            spec = importlib.util.spec_from_file_location("_linear_code_native", candidate)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["_linear_code_native"] = module
+            spec.loader.exec_module(module)
+            _NATIVE_MODULE = module
+            return module
+    raise ImportError(
+        "LINEAR_CODE_LEGALITY_ENGINE=native requested, but _linear_code_native is not built. "
+        "Run `python setup.py build_ext --inplace` first."
+    )
 
 
 def _log_profile(stage: str, **fields: object) -> None:
@@ -635,8 +727,46 @@ def _beam_forbidden_penalty() -> float:
     return _env_float("LINEAR_CODE_BEAM_FORBIDDEN_PENALTY", 1.0)
 
 
-def _clone_search_state(search_state: IncrementalForbiddenState) -> IncrementalForbiddenState:
+def _native_r_limit() -> int | None:
+    """Return the native engine r limit when available and requested."""
+    if _legality_engine_mode() != "native":
+        return None
+    native_module = _load_native_module()
+    return int(native_module.NATIVE_R_LIMIT)
+
+
+def create_forbidden_state(r: int, distance: int):
+    """Create the configured exact forbidden-state engine."""
+    if _legality_engine_mode() == "native":
+        return NativeForbiddenStateAdapter(r, distance)
+    return IncrementalForbiddenState(r, distance)
+
+
+def _state_engine_name(search_state) -> str:
+    """Return the implementation name for a forbidden state."""
+    return getattr(search_state, "engine_name", "python")
+
+
+def _state_forbidden_count(search_state) -> int | None:
+    """Return forbidden count from either Python or native state."""
+    if hasattr(search_state, "forbidden_count"):
+        return int(search_state.forbidden_count())
+    forbidden = getattr(search_state, "forbidden", None)
+    if forbidden is not None:
+        return len(forbidden)
+    return None
+
+
+def _state_add(search_state, column_mask: int) -> int:
+    """Add a column and return the exact forbidden-set growth."""
+    result = search_state.add(column_mask)
+    return int(result) if result is not None else 0
+
+
+def _clone_search_state(search_state):
     """Deep-copy an incremental forbidden state."""
+    if hasattr(search_state, "clone"):
+        return search_state.clone()
     cloned = IncrementalForbiddenState(search_state.r, search_state.distance)
     cloned.reachable = [set(layer) for layer in search_state.reachable]
     cloned.forbidden = set(search_state.forbidden)
@@ -648,12 +778,24 @@ def _rebuild_search_state(
     r: int,
     distance: int,
     selected_free_columns: Sequence[int],
-) -> IncrementalForbiddenState:
+):
     """Rebuild an incremental forbidden state from selected free columns."""
-    rebuilt = IncrementalForbiddenState(r, distance)
+    rebuilt = create_forbidden_state(r, distance)
     for column_mask in selected_free_columns:
-        rebuilt.add(column_mask)
+        _state_add(rebuilt, column_mask)
     return rebuilt
+
+
+def _validate_selected_free_columns(
+    r: int,
+    free_columns: Sequence[int],
+    distance: int,
+) -> bool:
+    """Validate free columns using the configured exact engine."""
+    if _legality_engine_mode() == "native":
+        native_module = _load_native_module()
+        return bool(native_module.validate_columns(r, distance, tuple(free_columns)))
+    return validate_free_columns(r, free_columns, distance)
 
 
 def _iterate_with_progress(
@@ -844,7 +986,7 @@ def greedy_construct(
     static_scores: Sequence[Tuple[int, float]] | None = None,
 ) -> SearchAttemptResult:
     """Run one fixed sorted-greedy pass for a single benchmark instance."""
-    search_state = IncrementalForbiddenState(instance.r, instance.target_distance)
+    search_state = create_forbidden_state(instance.r, instance.target_distance)
     if static_scores is None:
         if priority_fn is None:
             raise ValueError("priority_fn is required when static_scores are not provided")
@@ -877,7 +1019,7 @@ def greedy_construct(
         if len(search_state.selected_free_columns) >= instance.k:
             break
         if search_state.can_add(candidate_mask):
-            search_state.add(candidate_mask)
+            _state_add(search_state, candidate_mask)
             accepted_vectors.append(
                 _accepted_vector_record(
                     candidate_mask,
@@ -904,7 +1046,7 @@ def greedy_construct(
         blocked_count=blocked_candidate_count,
         elapsed_seconds=f"{time.perf_counter() - greedy_started_at:.6f}",
     )
-    success = len(selected) == instance.k and validate_free_columns(
+    success = len(selected) == instance.k and _validate_selected_free_columns(
         instance.r,
         selected,
         instance.target_distance,
@@ -929,6 +1071,9 @@ def greedy_construct(
         backtracked_columns=0,
         beam_width=0,
         beam_expanded_states=0,
+        legality_engine=_state_engine_name(search_state),
+        native_r_limit=_native_r_limit(),
+        final_forbidden_count=_state_forbidden_count(search_state),
     )
 
 
@@ -939,7 +1084,7 @@ def sampled_refill_greedy_construct(
     show_progress: bool = False,
 ) -> SearchAttemptResult:
     """Run priority-guided randomized greedy search without enumerating all candidates."""
-    search_state = IncrementalForbiddenState(instance.r, instance.target_distance)
+    search_state = create_forbidden_state(instance.r, instance.target_distance)
     rng = random.Random(_sampled_seed(restart_index))
     pool_size = _sampled_refill_pool_size(instance)
     attempt_budget = _sampled_refill_attempt_budget(pool_size)
@@ -1036,12 +1181,15 @@ def sampled_refill_greedy_construct(
                     )
                     removed = tuple(search_state.selected_free_columns[-remove_count:])
                     tabu_columns.update(removed)
-                    remaining = tuple(search_state.selected_free_columns[:-remove_count])
-                    search_state = _rebuild_search_state(
-                        instance.r,
-                        instance.target_distance,
-                        remaining,
-                    )
+                    if hasattr(search_state, "undo"):
+                        search_state.undo(remove_count)
+                    else:
+                        remaining = tuple(search_state.selected_free_columns[:-remove_count])
+                        search_state = _rebuild_search_state(
+                            instance.r,
+                            instance.target_distance,
+                            remaining,
+                        )
                     del accepted_vectors[-remove_count:]
                     backtrack_events += 1
                     backtracked_columns += remove_count
@@ -1068,7 +1216,7 @@ def sampled_refill_greedy_construct(
             if len(search_state.selected_free_columns) >= instance.k:
                 break
             if search_state.can_add(candidate_mask):
-                search_state.add(candidate_mask)
+                _state_add(search_state, candidate_mask)
                 accepted_this_refill += 1
                 accepted_vectors.append(
                     _accepted_vector_record(
@@ -1110,12 +1258,15 @@ def sampled_refill_greedy_construct(
                     )
                     removed = tuple(search_state.selected_free_columns[-remove_count:])
                     tabu_columns.update(removed)
-                    remaining = tuple(search_state.selected_free_columns[:-remove_count])
-                    search_state = _rebuild_search_state(
-                        instance.r,
-                        instance.target_distance,
-                        remaining,
-                    )
+                    if hasattr(search_state, "undo"):
+                        search_state.undo(remove_count)
+                    else:
+                        remaining = tuple(search_state.selected_free_columns[:-remove_count])
+                        search_state = _rebuild_search_state(
+                            instance.r,
+                            instance.target_distance,
+                            remaining,
+                        )
                     del accepted_vectors[-remove_count:]
                     backtrack_events += 1
                     backtracked_columns += remove_count
@@ -1141,7 +1292,7 @@ def sampled_refill_greedy_construct(
         ),
         reverse=True,
     )
-    success = len(selected) == instance.k and validate_free_columns(
+    success = len(selected) == instance.k and _validate_selected_free_columns(
         instance.r,
         selected,
         instance.target_distance,
@@ -1192,6 +1343,9 @@ def sampled_refill_greedy_construct(
         backtracked_columns=backtracked_columns,
         beam_width=0,
         beam_expanded_states=0,
+        legality_engine=_state_engine_name(search_state),
+        native_r_limit=_native_r_limit(),
+        final_forbidden_count=_state_forbidden_count(search_state),
     )
 
 
@@ -1235,10 +1389,7 @@ def sampled_beam_construct(
 
     beam_states = [
         BeamSearchState(
-            search_state=IncrementalForbiddenState(
-                instance.r,
-                instance.target_distance,
-            ),
+            search_state=create_forbidden_state(instance.r, instance.target_distance),
             accepted_vectors=tuple(),
             adjusted_score=0.0,
             priority_score=0.0,
@@ -1302,9 +1453,14 @@ def sampled_beam_construct(
                 )
                 scored_candidates_seen.append((candidate_mask, priority_score))
                 next_search_state = _clone_search_state(state.search_state)
-                before_forbidden = len(next_search_state.forbidden)
-                next_search_state.add(candidate_mask)
-                forbidden_growth = len(next_search_state.forbidden) - before_forbidden
+                before_forbidden = _state_forbidden_count(next_search_state) or 0
+                add_growth = _state_add(next_search_state, candidate_mask)
+                after_forbidden = _state_forbidden_count(next_search_state)
+                forbidden_growth = (
+                    add_growth
+                    if after_forbidden is None
+                    else after_forbidden - before_forbidden
+                )
                 extension_score = (
                     priority_score
                     - forbidden_penalty * (forbidden_growth / forbidden_normalizer)
@@ -1373,7 +1529,7 @@ def sampled_beam_construct(
 
     best_state = max(beam_states, key=_beam_state_key)
     selected = tuple(best_state.search_state.selected_free_columns)
-    success = len(selected) == instance.k and validate_free_columns(
+    success = len(selected) == instance.k and _validate_selected_free_columns(
         instance.r,
         selected,
         instance.target_distance,
@@ -1432,6 +1588,9 @@ def sampled_beam_construct(
         backtracked_columns=0,
         beam_width=width,
         beam_expanded_states=expanded_states,
+        legality_engine=_state_engine_name(best_state.search_state),
+        native_r_limit=_native_r_limit(),
+        final_forbidden_count=_state_forbidden_count(best_state.search_state),
     )
 
 
@@ -1716,6 +1875,9 @@ def evaluate_priority_function(
             {
                 "success": attempt.success,
                 "search_mode": attempt.search_mode,
+                "legality_engine": attempt.legality_engine,
+                "native_r_limit": attempt.native_r_limit,
+                "forbidden_count": attempt.final_forbidden_count,
                 "restart": attempt.restart_index,
                 "added_free_columns": attempt.added_free_columns,
                 "candidate_count": attempt.candidate_count,
@@ -1762,6 +1924,8 @@ def evaluate_priority_function(
             "backtracked_columns": attempt.backtracked_columns,
             "beam_width": attempt.beam_width,
             "beam_expanded_states": attempt.beam_expanded_states,
+            "native_r_limit": attempt.native_r_limit or 0,
+            "forbidden_count": attempt.final_forbidden_count or 0,
             "target_columns": active_instance.k,
             "target_distance": active_instance.target_distance,
             "n": active_instance.n,

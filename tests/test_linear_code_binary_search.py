@@ -13,6 +13,8 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_DIR = REPO_ROOT / "examples" / "linear_code_binary_search"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(EXAMPLE_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLE_DIR))
 
@@ -45,6 +47,12 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
             "linear_code_verify_distance",
             EXAMPLE_DIR / "verify_distance.py",
         )
+
+    def _skip_if_native_missing(self):
+        try:
+            __import__("_linear_code_native")
+        except ImportError:
+            self.skipTest("native extension is not built")
 
     def test_initial_forbidden_matches_weight_threshold(self):
         """Systematic initialization should match the exact low-weight forbidden set."""
@@ -410,6 +418,95 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         }
         self.assertEqual(comparable_first, comparable_second)
         self.assertEqual(first.artifacts, second.artifacts)
+
+    def test_native_engine_integrates_with_full_refill_and_beam(self):
+        """Opt-in native legality should solve small instances across search modes."""
+        self._skip_if_native_missing()
+        cases = [
+            (
+                "full",
+                self.search_core.make_instance(n=7, k=4, distance=3, restarts=1),
+                {},
+            ),
+            (
+                "sampled_refill",
+                self.search_core.make_instance(n=12, k=4, distance=4, restarts=1),
+                {
+                    "LINEAR_CODE_RANDOM_SEED": "1",
+                    "LINEAR_CODE_SAMPLE_POOL_SIZE": "64",
+                    "LINEAR_CODE_SAMPLE_ATTEMPTS_PER_REFILL": "1024",
+                },
+            ),
+            (
+                "sampled_beam",
+                self.search_core.make_instance(n=12, k=4, distance=4, restarts=1),
+                {
+                    "LINEAR_CODE_RANDOM_SEED": "1",
+                    "LINEAR_CODE_BEAM_WIDTH": "4",
+                    "LINEAR_CODE_BEAM_BRANCHES_PER_STATE": "16",
+                    "LINEAR_CODE_BEAM_ATTEMPTS_PER_STATE": "256",
+                },
+            ),
+        ]
+
+        for mode, instance, extra_env in cases:
+            with self.subTest(mode=mode):
+                env = {
+                    "LINEAR_CODE_LEGALITY_ENGINE": "native",
+                    "LINEAR_CODE_SEARCH_MODE": mode,
+                    "LINEAR_CODE_RESTART_WORKERS": "1",
+                    **extra_env,
+                }
+                with mock.patch.dict(os.environ, env, clear=False):
+                    result = self.search_core.evaluate_priority_function(
+                        self.initial_program.get_priority_function(),
+                        instance,
+                    )
+
+                self.assertEqual(result.metrics["success_rate"], 1.0)
+                self.assertNotIn("legality_engine", result.metrics)
+                search_result = json.loads(result.artifacts["search_result"])
+                self.assertEqual(search_result["legality_engine"], "native")
+                self.assertEqual(search_result["native_r_limit"], 30)
+                self.assertGreater(search_result["forbidden_count"], 0)
+                if mode == "sampled_beam":
+                    vectors = json.loads(result.artifacts["successful_code_vectors"])
+                    self.assertTrue(
+                        all(entry["rank_scope"] == "sampled_beam_pool" for entry in vectors)
+                    )
+
+    def test_native_refill_backtracking_uses_final_vector_path(self):
+        """Native undo should support sampled-refill backtracking without stale vectors."""
+        self._skip_if_native_missing()
+        instance = self.search_core.make_instance(n=10, k=4, distance=4, restarts=1)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LINEAR_CODE_LEGALITY_ENGINE": "native",
+                "LINEAR_CODE_SEARCH_MODE": "sampled_refill",
+                "LINEAR_CODE_RANDOM_SEED": "5",
+                "LINEAR_CODE_SAMPLE_POOL_SIZE": "1",
+                "LINEAR_CODE_SAMPLE_ATTEMPTS_PER_REFILL": "1",
+                "LINEAR_CODE_SAMPLE_MAX_REFILLS": "80",
+                "LINEAR_CODE_SAMPLE_MAX_STALE_REFILLS": "1",
+                "LINEAR_CODE_BACKTRACK_DEPTH": "1",
+                "LINEAR_CODE_BACKTRACK_MAX_EVENTS": "10",
+            },
+            clear=False,
+        ):
+            result = self.search_core.evaluate_priority_function(
+                self.initial_program.get_priority_function(),
+                instance,
+            )
+
+        self.assertEqual(result.metrics["success_rate"], 1.0)
+        search_result = json.loads(result.artifacts["search_result"])
+        self.assertEqual(search_result["legality_engine"], "native")
+        self.assertEqual(search_result["backtrack_events"], 1)
+        selected = search_result["selected_free_columns"]
+        vectors = json.loads(result.artifacts["successful_code_vectors"])
+        self.assertEqual([entry["fill_index"] for entry in vectors], [1, 2, 3, 4])
+        self.assertEqual([entry["column"] for entry in vectors], selected)
 
     def test_progress_flag_emits_sampled_restart_steps(self):
         """Progress mode should report sampled restart and refill phases."""

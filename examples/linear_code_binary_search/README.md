@@ -31,6 +31,7 @@ The evaluator reads the target instance from environment variables:
 - optional: `LINEAR_CODE_RESTARTS`
 - optional: `LINEAR_CODE_SEARCH_MODE` (`full` by default, `sampled_refill`, or `sampled_beam`)
 - optional: `LINEAR_CODE_PROGRESS` (`1` enables restart progress and sampled-step output)
+- optional: `LINEAR_CODE_LEGALITY_ENGINE` (`python` by default, or `native`)
 - optional: `LINEAR_CODE_CANDIDATE_WORKERS`
 - optional: `LINEAR_CODE_RESTART_WORKERS`
 
@@ -43,6 +44,19 @@ them through the current exact forbidden state, scores only legal sampled
 candidates, and greedily accepts from that small pool before refilling.
 `sampled_beam` keeps several partial constructions per restart and expands them
 with the same sampled legality checks.
+
+For larger exact-search runs, `LINEAR_CODE_LEGALITY_ENGINE=native` switches the
+forbidden-state engine to the optional CPython C extension. Build it first:
+
+```bash
+python setup.py build_ext --inplace
+```
+
+The native engine is explicit opt-in, supports `r <= 30`, and fails loudly if it
+is requested without a built extension. It stores exact reachable/forbidden
+membership in bitsets and accelerates `can_add`, `add`, `undo`, and beam-state
+`clone` operations while leaving sampling, priority scoring, and beam ranking in
+Python.
 
 Useful sampled-search controls:
 
@@ -57,6 +71,7 @@ Useful sampled-search controls:
 - `LINEAR_CODE_BEAM_BRANCHES_PER_STATE`: legal branches kept from each beam state.
 - `LINEAR_CODE_BEAM_ATTEMPTS_PER_STATE`: random draws used to expand each beam state.
 - `LINEAR_CODE_BEAM_FORBIDDEN_PENALTY`: penalty for growing the exact forbidden set.
+- `LINEAR_CODE_LEGALITY_ENGINE`: use `native` to enable the C exact-legality engine.
 - `LINEAR_CODE_PROGRESS`: show a restart progress bar plus per-refill sampled-search steps.
 
 The greedy fill itself stays sequential because each accepted column updates the exact forbidden-state. The worker settings only parallelize:
