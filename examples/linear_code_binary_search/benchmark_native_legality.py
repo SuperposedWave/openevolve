@@ -1,7 +1,8 @@
 """Manual smoke benchmark for the optional native legality engine.
 
-This script is intentionally not part of the default pytest suite.  The large
-target case, for example ``--r 30 --d 13``, can allocate substantial memory.
+This script is intentionally not part of the default pytest suite.  Large
+targets, for example ``--r 60 --d 8`` or ``--r 30 --d 13``, can allocate
+substantial memory.
 """
 
 from __future__ import annotations

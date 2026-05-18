@@ -52,11 +52,13 @@ forbidden-state engine to the optional CPython C extension. Build it first:
 python setup.py build_ext --inplace
 ```
 
-The native engine is explicit opt-in, supports `r <= 30`, and fails loudly if it
+The native engine is explicit opt-in, supports `r <= 60`, and fails loudly if it
 is requested without a built extension. It stores exact reachable/forbidden
-membership in bitsets and accelerates `can_add`, `add`, `undo`, and beam-state
-`clone` operations while leaving sampling, priority scoring, and beam ranking in
-Python.
+membership in sparse C hash sets and accelerates `can_add`, `add`, `undo`, and
+beam-state `clone` operations while leaving sampling, priority scoring, and beam
+ranking in Python. It still exactly materializes the low-weight reachable layers;
+for large `r,d`, initialization can be intrinsically too large. The safety guard
+`LINEAR_CODE_NATIVE_MAX_INITIAL_VALUES` defaults to `200000000`.
 
 Useful sampled-search controls:
 
@@ -72,6 +74,7 @@ Useful sampled-search controls:
 - `LINEAR_CODE_BEAM_ATTEMPTS_PER_STATE`: random draws used to expand each beam state.
 - `LINEAR_CODE_BEAM_FORBIDDEN_PENALTY`: penalty for growing the exact forbidden set.
 - `LINEAR_CODE_LEGALITY_ENGINE`: use `native` to enable the C exact-legality engine.
+- `LINEAR_CODE_NATIVE_MAX_INITIAL_VALUES`: safety cap for exact native initialization.
 - `LINEAR_CODE_PROGRESS`: show a restart progress bar plus per-refill sampled-search steps.
 
 The greedy fill itself stays sequential because each accepted column updates the exact forbidden-state. The worker settings only parallelize:
@@ -109,6 +112,12 @@ To inspect the baseline without running evolution:
 ```bash
 LINEAR_CODE_N=7 LINEAR_CODE_K=4 LINEAR_CODE_D=3 python initial_program.py
 ```
+
+Single-run inspection writes the constructed parity-check and generator matrices
+to `matrix_verification.txt` by default. Override the path with
+`LINEAR_CODE_MATRIX_OUTPUT`; exhaustive distance reporting is skipped when the
+filled dimension exceeds `LINEAR_CODE_MATRIX_MAX_EXHAUSTIVE_K` whose default is
+`24`.
 
 To batch-run all valid `(n,k)` entries with `10 < n <= 40`, using `d = lower` from `Misc/ECCRecord.json`:
 

@@ -4,31 +4,25 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define NATIVE_R_LIMIT 30
-#define PAGE_BITS 4096u
-#define PAGE_WORDS (PAGE_BITS / 64u)
-#define PAGE_SHIFT 12u
-#define PAGE_MASK (PAGE_BITS - 1u)
+#define NATIVE_R_LIMIT 60
+#define DEFAULT_MAX_INITIAL_VALUES 200000000ULL
 
 typedef struct {
-    size_t refcount;
-    uint64_t words[PAGE_WORDS];
-} BitPage;
+    uint64_t *keys;
+    unsigned char *states;
+    Py_ssize_t capacity;
+    Py_ssize_t count;
+    Py_ssize_t used;
+} SparseSet;
 
 typedef struct {
-    uint32_t page_count;
-    BitPage **pages;
-    uint64_t count;
-} Bitset;
-
-typedef struct {
-    uint32_t *items;
+    uint64_t *items;
     Py_ssize_t size;
     Py_ssize_t cap;
 } UIntVec;
 
 typedef struct {
-    uint32_t *items;
+    uint64_t *items;
     Py_ssize_t size;
     Py_ssize_t cap;
 } DeltaVec;
@@ -36,11 +30,11 @@ typedef struct {
 typedef struct {
     DeltaVec *layer_deltas;
     DeltaVec forbidden_delta;
-    uint32_t selected_column;
+    uint64_t selected_column;
 } HistoryEntry;
 
 typedef struct {
-    Bitset *bits;
+    SparseSet *set;
     UIntVec values;
 } Layer;
 
@@ -49,19 +43,179 @@ typedef struct {
     int r;
     int distance;
     int max_subset_size;
-    uint32_t mask_limit;
+    uint64_t mask_limit;
     Layer *layers;
-    Bitset *forbidden;
+    SparseSet *forbidden;
     UIntVec selected;
     HistoryEntry *history;
     Py_ssize_t history_size;
     Py_ssize_t history_cap;
 } NativeState;
 
-static int vec_push(UIntVec *vec, uint32_t value) {
+static uint64_t hash_u64(uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
+static Py_ssize_t next_power_of_two(Py_ssize_t value) {
+    Py_ssize_t capacity = 16;
+    while (capacity < value) {
+        capacity <<= 1;
+    }
+    return capacity;
+}
+
+static SparseSet *sparse_set_new(Py_ssize_t min_capacity) {
+    SparseSet *set = PyMem_Calloc(1, sizeof(SparseSet));
+    if (!set) {
+        PyErr_NoMemory();
+        return NULL;
+    }
+    set->capacity = next_power_of_two(min_capacity);
+    set->keys = PyMem_Calloc((size_t)set->capacity, sizeof(uint64_t));
+    set->states = PyMem_Calloc((size_t)set->capacity, sizeof(unsigned char));
+    if (!set->keys || !set->states) {
+        PyMem_Free(set->keys);
+        PyMem_Free(set->states);
+        PyMem_Free(set);
+        PyErr_NoMemory();
+        return NULL;
+    }
+    return set;
+}
+
+static void sparse_set_free(SparseSet *set) {
+    if (!set) {
+        return;
+    }
+    PyMem_Free(set->keys);
+    PyMem_Free(set->states);
+    PyMem_Free(set);
+}
+
+static int sparse_set_contains(SparseSet *set, uint64_t key) {
+    Py_ssize_t mask = set->capacity - 1;
+    Py_ssize_t index = (Py_ssize_t)(hash_u64(key) & (uint64_t)mask);
+    for (;;) {
+        unsigned char state = set->states[index];
+        if (state == 0) {
+            return 0;
+        }
+        if (state == 1 && set->keys[index] == key) {
+            return 1;
+        }
+        index = (index + 1) & mask;
+    }
+}
+
+static int sparse_set_rehash(SparseSet *set, Py_ssize_t min_capacity) {
+    SparseSet replacement;
+    memset(&replacement, 0, sizeof(replacement));
+    replacement.capacity = next_power_of_two(min_capacity);
+    replacement.keys = PyMem_Calloc((size_t)replacement.capacity, sizeof(uint64_t));
+    replacement.states = PyMem_Calloc((size_t)replacement.capacity, sizeof(unsigned char));
+    if (!replacement.keys || !replacement.states) {
+        PyMem_Free(replacement.keys);
+        PyMem_Free(replacement.states);
+        PyErr_NoMemory();
+        return -1;
+    }
+
+    for (Py_ssize_t i = 0; i < set->capacity; i++) {
+        if (set->states[i] != 1) {
+            continue;
+        }
+        uint64_t key = set->keys[i];
+        Py_ssize_t mask = replacement.capacity - 1;
+        Py_ssize_t index = (Py_ssize_t)(hash_u64(key) & (uint64_t)mask);
+        while (replacement.states[index] == 1) {
+            index = (index + 1) & mask;
+        }
+        replacement.keys[index] = key;
+        replacement.states[index] = 1;
+        replacement.count++;
+        replacement.used++;
+    }
+
+    PyMem_Free(set->keys);
+    PyMem_Free(set->states);
+    set->keys = replacement.keys;
+    set->states = replacement.states;
+    set->capacity = replacement.capacity;
+    set->count = replacement.count;
+    set->used = replacement.used;
+    return 0;
+}
+
+static int sparse_set_add(SparseSet *set, uint64_t key) {
+    if ((set->used + 1) * 10 >= set->capacity * 7) {
+        if (sparse_set_rehash(set, set->capacity * 2) < 0) {
+            return -1;
+        }
+    }
+
+    Py_ssize_t mask = set->capacity - 1;
+    Py_ssize_t index = (Py_ssize_t)(hash_u64(key) & (uint64_t)mask);
+    Py_ssize_t first_deleted = -1;
+    for (;;) {
+        unsigned char state = set->states[index];
+        if (state == 0) {
+            Py_ssize_t insert_at = first_deleted >= 0 ? first_deleted : index;
+            set->keys[insert_at] = key;
+            if (set->states[insert_at] == 0) {
+                set->used++;
+            }
+            set->states[insert_at] = 1;
+            set->count++;
+            return 1;
+        }
+        if (state == 2) {
+            if (first_deleted < 0) {
+                first_deleted = index;
+            }
+        } else if (set->keys[index] == key) {
+            return 0;
+        }
+        index = (index + 1) & mask;
+    }
+}
+
+static int sparse_set_remove(SparseSet *set, uint64_t key) {
+    Py_ssize_t mask = set->capacity - 1;
+    Py_ssize_t index = (Py_ssize_t)(hash_u64(key) & (uint64_t)mask);
+    for (;;) {
+        unsigned char state = set->states[index];
+        if (state == 0) {
+            return 0;
+        }
+        if (state == 1 && set->keys[index] == key) {
+            set->states[index] = 2;
+            set->count--;
+            return 1;
+        }
+        index = (index + 1) & mask;
+    }
+}
+
+static SparseSet *sparse_set_clone(SparseSet *src) {
+    SparseSet *dst = sparse_set_new(src->capacity);
+    if (!dst) {
+        return NULL;
+    }
+    memcpy(dst->keys, src->keys, (size_t)src->capacity * sizeof(uint64_t));
+    memcpy(dst->states, src->states, (size_t)src->capacity * sizeof(unsigned char));
+    dst->capacity = src->capacity;
+    dst->count = src->count;
+    dst->used = src->used;
+    return dst;
+}
+
+static int vec_push(UIntVec *vec, uint64_t value) {
     if (vec->size == vec->cap) {
         Py_ssize_t new_cap = vec->cap ? vec->cap * 2 : 16;
-        uint32_t *items = PyMem_Realloc(vec->items, (size_t)new_cap * sizeof(uint32_t));
+        uint64_t *items = PyMem_Realloc(vec->items, (size_t)new_cap * sizeof(uint64_t));
         if (!items) {
             PyErr_NoMemory();
             return -1;
@@ -73,10 +227,10 @@ static int vec_push(UIntVec *vec, uint32_t value) {
     return 0;
 }
 
-static int delta_push(DeltaVec *vec, uint32_t value) {
+static int delta_push(DeltaVec *vec, uint64_t value) {
     if (vec->size == vec->cap) {
         Py_ssize_t new_cap = vec->cap ? vec->cap * 2 : 16;
-        uint32_t *items = PyMem_Realloc(vec->items, (size_t)new_cap * sizeof(uint32_t));
+        uint64_t *items = PyMem_Realloc(vec->items, (size_t)new_cap * sizeof(uint64_t));
         if (!items) {
             PyErr_NoMemory();
             return -1;
@@ -102,143 +256,8 @@ static void delta_free(DeltaVec *vec) {
     vec->cap = 0;
 }
 
-static BitPage *page_new(void) {
-    BitPage *page = PyMem_Calloc(1, sizeof(BitPage));
-    if (!page) {
-        PyErr_NoMemory();
-        return NULL;
-    }
-    page->refcount = 1;
-    return page;
-}
-
-static void page_decref(BitPage *page) {
-    if (!page) {
-        return;
-    }
-    if (--page->refcount == 0) {
-        PyMem_Free(page);
-    }
-}
-
-static Bitset *bitset_new(int r) {
-    uint64_t bit_count = 1ULL << r;
-    uint32_t page_count = (uint32_t)((bit_count + PAGE_BITS - 1u) >> PAGE_SHIFT);
-    Bitset *bitset = PyMem_Calloc(1, sizeof(Bitset));
-    if (!bitset) {
-        PyErr_NoMemory();
-        return NULL;
-    }
-    bitset->pages = PyMem_Calloc(page_count, sizeof(BitPage *));
-    if (!bitset->pages) {
-        PyMem_Free(bitset);
-        PyErr_NoMemory();
-        return NULL;
-    }
-    bitset->page_count = page_count;
-    bitset->count = 0;
-    return bitset;
-}
-
-static Bitset *bitset_clone(Bitset *src) {
-    Bitset *dst = PyMem_Calloc(1, sizeof(Bitset));
-    if (!dst) {
-        PyErr_NoMemory();
-        return NULL;
-    }
-    dst->pages = PyMem_Malloc((size_t)src->page_count * sizeof(BitPage *));
-    if (!dst->pages) {
-        PyMem_Free(dst);
-        PyErr_NoMemory();
-        return NULL;
-    }
-    memcpy(dst->pages, src->pages, (size_t)src->page_count * sizeof(BitPage *));
-    dst->page_count = src->page_count;
-    dst->count = src->count;
-    for (uint32_t i = 0; i < src->page_count; i++) {
-        if (dst->pages[i]) {
-            dst->pages[i]->refcount++;
-        }
-    }
-    return dst;
-}
-
-static void bitset_free(Bitset *bitset) {
-    if (!bitset) {
-        return;
-    }
-    for (uint32_t i = 0; i < bitset->page_count; i++) {
-        page_decref(bitset->pages[i]);
-    }
-    PyMem_Free(bitset->pages);
-    PyMem_Free(bitset);
-}
-
-static int bitset_ensure_unique_page(Bitset *bitset, uint32_t page_index) {
-    BitPage *page = bitset->pages[page_index];
-    if (!page) {
-        page = page_new();
-        if (!page) {
-            return -1;
-        }
-        bitset->pages[page_index] = page;
-        return 0;
-    }
-    if (page->refcount == 1) {
-        return 0;
-    }
-    BitPage *copy = PyMem_Malloc(sizeof(BitPage));
-    if (!copy) {
-        PyErr_NoMemory();
-        return -1;
-    }
-    memcpy(copy, page, sizeof(BitPage));
-    copy->refcount = 1;
-    page->refcount--;
-    bitset->pages[page_index] = copy;
-    return 0;
-}
-
-static int bitset_get(Bitset *bitset, uint32_t value) {
-    uint32_t page_index = value >> PAGE_SHIFT;
-    BitPage *page = bitset->pages[page_index];
-    if (!page) {
-        return 0;
-    }
-    uint32_t bit = value & PAGE_MASK;
-    return (page->words[bit >> 6] >> (bit & 63u)) & 1u;
-}
-
-static int bitset_set(Bitset *bitset, uint32_t value) {
-    uint32_t page_index = value >> PAGE_SHIFT;
-    uint32_t bit = value & PAGE_MASK;
-    if (bitset_get(bitset, value)) {
-        return 0;
-    }
-    if (bitset_ensure_unique_page(bitset, page_index) < 0) {
-        return -1;
-    }
-    bitset->pages[page_index]->words[bit >> 6] |= 1ULL << (bit & 63u);
-    bitset->count++;
-    return 1;
-}
-
-static int bitset_clear(Bitset *bitset, uint32_t value) {
-    uint32_t page_index = value >> PAGE_SHIFT;
-    uint32_t bit = value & PAGE_MASK;
-    if (!bitset_get(bitset, value)) {
-        return 0;
-    }
-    if (bitset_ensure_unique_page(bitset, page_index) < 0) {
-        return -1;
-    }
-    bitset->pages[page_index]->words[bit >> 6] &= ~(1ULL << (bit & 63u));
-    bitset->count--;
-    return 1;
-}
-
-static int layer_add(Layer *layer, uint32_t value) {
-    int changed = bitset_set(layer->bits, value);
+static int layer_add(Layer *layer, uint64_t value) {
+    int changed = sparse_set_add(layer->set, value);
     if (changed < 0) {
         return -1;
     }
@@ -276,15 +295,46 @@ static void history_entry_free(HistoryEntry *entry, int layer_count) {
     entry->layer_deltas = NULL;
 }
 
-static int state_update_layers(NativeState *self, uint32_t column, HistoryEntry *history) {
+static uint64_t initial_limit_from_env(void) {
+    const char *raw = getenv("LINEAR_CODE_NATIVE_MAX_INITIAL_VALUES");
+    if (!raw || !*raw) {
+        return DEFAULT_MAX_INITIAL_VALUES;
+    }
+    char *end = NULL;
+    unsigned long long parsed = strtoull(raw, &end, 10);
+    if (end == raw || parsed == 0) {
+        return DEFAULT_MAX_INITIAL_VALUES;
+    }
+    return (uint64_t)parsed;
+}
+
+static int initial_layer_value_count_exceeds(int r, int max_subset_size, uint64_t limit) {
+    long double total = 0.0L;
+    long double comb = 1.0L;
+    int capped_subset_size = max_subset_size < r ? max_subset_size : r;
+    for (int w = 0; w <= capped_subset_size; w++) {
+        if (w == 0) {
+            comb = 1.0L;
+        } else {
+            comb *= (long double)(r - w + 1) / (long double)w;
+        }
+        total += comb;
+        if (total > (long double)limit) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int state_update_layers(NativeState *self, uint64_t column, HistoryEntry *history) {
     int max_s = self->max_subset_size;
     for (int s = max_s; s >= 1; s--) {
         Py_ssize_t prev_size = self->layers[s - 1].values.size;
-        uint32_t *prev_items = self->layers[s - 1].values.items;
+        uint64_t *prev_items = self->layers[s - 1].values.items;
         for (Py_ssize_t i = 0; i < prev_size; i++) {
-            uint32_t value = prev_items[i] ^ column;
-            if (!bitset_get(self->layers[s].bits, value)) {
-                int was_forbidden = bitset_get(self->forbidden, value);
+            uint64_t value = prev_items[i] ^ column;
+            if (!sparse_set_contains(self->layers[s].set, value)) {
+                int was_forbidden = sparse_set_contains(self->forbidden, value);
                 if (layer_add(&self->layers[s], value) < 0) {
                     return -1;
                 }
@@ -292,7 +342,7 @@ static int state_update_layers(NativeState *self, uint32_t column, HistoryEntry 
                     return -1;
                 }
                 if (!was_forbidden) {
-                    int changed = bitset_set(self->forbidden, value);
+                    int changed = sparse_set_add(self->forbidden, value);
                     if (changed < 0) {
                         return -1;
                     }
@@ -318,27 +368,42 @@ static int state_init_storage(NativeState *self, int r, int distance) {
     self->r = r;
     self->distance = distance;
     self->max_subset_size = distance - 2 > 0 ? distance - 2 : 0;
-    self->mask_limit = r == 32 ? 0xFFFFFFFFu : (uint32_t)(1ULL << r);
+    self->mask_limit = 1ULL << r;
+
+    uint64_t initial_limit = initial_limit_from_env();
+    if (initial_layer_value_count_exceeds(r, self->max_subset_size, initial_limit)) {
+        PyErr_Format(
+            PyExc_MemoryError,
+            "Native exact initialization for r=%d, d=%d exceeds "
+            "LINEAR_CODE_NATIVE_MAX_INITIAL_VALUES=%llu; exact low-weight forbidden "
+            "layers are too large for this run",
+            r,
+            distance,
+            (unsigned long long)initial_limit
+        );
+        return -1;
+    }
+
     self->layers = PyMem_Calloc((size_t)self->max_subset_size + 1, sizeof(Layer));
     if (!self->layers) {
         PyErr_NoMemory();
         return -1;
     }
     for (int i = 0; i <= self->max_subset_size; i++) {
-        self->layers[i].bits = bitset_new(r);
-        if (!self->layers[i].bits) {
+        self->layers[i].set = sparse_set_new(16);
+        if (!self->layers[i].set) {
             return -1;
         }
     }
-    self->forbidden = bitset_new(r);
+    self->forbidden = sparse_set_new(16);
     if (!self->forbidden) {
         return -1;
     }
-    if (layer_add(&self->layers[0], 0) < 0 || bitset_set(self->forbidden, 0) < 0) {
+    if (layer_add(&self->layers[0], 0) < 0 || sparse_set_add(self->forbidden, 0) < 0) {
         return -1;
     }
     for (int bit = 0; bit < r; bit++) {
-        if (state_update_layers(self, (uint32_t)(1u << bit), NULL) < 0) {
+        if (state_update_layers(self, 1ULL << bit, NULL) < 0) {
             return -1;
         }
     }
@@ -348,12 +413,12 @@ static int state_init_storage(NativeState *self, int r, int distance) {
 static void NativeState_dealloc(NativeState *self) {
     if (self->layers) {
         for (int i = 0; i <= self->max_subset_size; i++) {
-            bitset_free(self->layers[i].bits);
+            sparse_set_free(self->layers[i].set);
             vec_free(&self->layers[i].values);
         }
         PyMem_Free(self->layers);
     }
-    bitset_free(self->forbidden);
+    sparse_set_free(self->forbidden);
     vec_free(&self->selected);
     if (self->history) {
         for (Py_ssize_t i = 0; i < self->history_size; i++) {
@@ -374,38 +439,39 @@ static int NativeState_init(NativeState *self, PyObject *args, PyObject *kwds) {
 }
 
 static PyObject *NativeState_can_add(NativeState *self, PyObject *args) {
-    uint32_t mask;
-    if (!PyArg_ParseTuple(args, "I", &mask)) {
+    unsigned long long mask;
+    if (!PyArg_ParseTuple(args, "K", &mask)) {
         return NULL;
     }
-    if (mask >= self->mask_limit) {
+    if ((uint64_t)mask >= self->mask_limit) {
         Py_RETURN_FALSE;
     }
-    if (bitset_get(self->forbidden, mask)) {
+    if (sparse_set_contains(self->forbidden, (uint64_t)mask)) {
         Py_RETURN_FALSE;
     }
     Py_RETURN_TRUE;
 }
 
 static PyObject *NativeState_add(NativeState *self, PyObject *args) {
-    uint32_t mask;
-    if (!PyArg_ParseTuple(args, "I", &mask)) {
+    unsigned long long mask;
+    if (!PyArg_ParseTuple(args, "K", &mask)) {
         return NULL;
     }
-    if (mask >= self->mask_limit || bitset_get(self->forbidden, mask)) {
+    uint64_t column = (uint64_t)mask;
+    if (column >= self->mask_limit || sparse_set_contains(self->forbidden, column)) {
         PyErr_SetString(PyExc_ValueError, "Illegal free column");
         return NULL;
     }
     HistoryEntry entry;
     memset(&entry, 0, sizeof(entry));
-    entry.selected_column = mask;
+    entry.selected_column = column;
     entry.layer_deltas = PyMem_Calloc((size_t)self->max_subset_size + 1, sizeof(DeltaVec));
     if (!entry.layer_deltas) {
         PyErr_NoMemory();
         return NULL;
     }
-    uint64_t before = self->forbidden->count;
-    if (state_update_layers(self, mask, &entry) < 0 || vec_push(&self->selected, mask) < 0) {
+    uint64_t before = (uint64_t)self->forbidden->count;
+    if (state_update_layers(self, column, &entry) < 0 || vec_push(&self->selected, column) < 0) {
         history_entry_free(&entry, self->max_subset_size + 1);
         return NULL;
     }
@@ -413,7 +479,7 @@ static PyObject *NativeState_add(NativeState *self, PyObject *args) {
         history_entry_free(&entry, self->max_subset_size + 1);
         return NULL;
     }
-    return PyLong_FromUnsignedLongLong(self->forbidden->count - before);
+    return PyLong_FromUnsignedLongLong((uint64_t)self->forbidden->count - before);
 }
 
 static PyObject *NativeState_undo(NativeState *self, PyObject *args) {
@@ -430,16 +496,12 @@ static PyObject *NativeState_undo(NativeState *self, PyObject *args) {
         for (int s = self->max_subset_size; s >= 0; s--) {
             DeltaVec *delta = &entry->layer_deltas[s];
             for (Py_ssize_t i = delta->size - 1; i >= 0; i--) {
-                if (bitset_clear(self->layers[s].bits, delta->items[i]) < 0) {
-                    return NULL;
-                }
+                sparse_set_remove(self->layers[s].set, delta->items[i]);
             }
             self->layers[s].values.size -= delta->size;
         }
         for (Py_ssize_t i = entry->forbidden_delta.size - 1; i >= 0; i--) {
-            if (bitset_clear(self->forbidden, entry->forbidden_delta.items[i]) < 0) {
-                return NULL;
-            }
+            sparse_set_remove(self->forbidden, entry->forbidden_delta.items[i]);
         }
         if (self->selected.size > 0) {
             self->selected.size--;
@@ -467,8 +529,8 @@ static PyObject *NativeState_clone(NativeState *self, PyObject *Py_UNUSED(ignore
         return NULL;
     }
     for (int i = 0; i <= self->max_subset_size; i++) {
-        clone->layers[i].bits = bitset_clone(self->layers[i].bits);
-        if (!clone->layers[i].bits) {
+        clone->layers[i].set = sparse_set_clone(self->layers[i].set);
+        if (!clone->layers[i].set) {
             Py_DECREF(clone);
             return NULL;
         }
@@ -476,7 +538,7 @@ static PyObject *NativeState_clone(NativeState *self, PyObject *Py_UNUSED(ignore
         clone->layers[i].values.size = self->layers[i].values.size;
         if (clone->layers[i].values.size) {
             clone->layers[i].values.items = PyMem_Malloc(
-                (size_t)clone->layers[i].values.size * sizeof(uint32_t)
+                (size_t)clone->layers[i].values.size * sizeof(uint64_t)
             );
             if (!clone->layers[i].values.items) {
                 Py_DECREF(clone);
@@ -486,11 +548,11 @@ static PyObject *NativeState_clone(NativeState *self, PyObject *Py_UNUSED(ignore
             memcpy(
                 clone->layers[i].values.items,
                 self->layers[i].values.items,
-                (size_t)clone->layers[i].values.size * sizeof(uint32_t)
+                (size_t)clone->layers[i].values.size * sizeof(uint64_t)
             );
         }
     }
-    clone->forbidden = bitset_clone(self->forbidden);
+    clone->forbidden = sparse_set_clone(self->forbidden);
     if (!clone->forbidden) {
         Py_DECREF(clone);
         return NULL;
@@ -498,7 +560,7 @@ static PyObject *NativeState_clone(NativeState *self, PyObject *Py_UNUSED(ignore
     clone->selected.cap = self->selected.size;
     clone->selected.size = self->selected.size;
     if (clone->selected.size) {
-        clone->selected.items = PyMem_Malloc((size_t)clone->selected.size * sizeof(uint32_t));
+        clone->selected.items = PyMem_Malloc((size_t)clone->selected.size * sizeof(uint64_t));
         if (!clone->selected.items) {
             Py_DECREF(clone);
             PyErr_NoMemory();
@@ -507,7 +569,7 @@ static PyObject *NativeState_clone(NativeState *self, PyObject *Py_UNUSED(ignore
         memcpy(
             clone->selected.items,
             self->selected.items,
-            (size_t)clone->selected.size * sizeof(uint32_t)
+            (size_t)clone->selected.size * sizeof(uint64_t)
         );
     }
     return (PyObject *)clone;
@@ -519,13 +581,13 @@ static PyObject *NativeState_selected_columns(NativeState *self, PyObject *Py_UN
         return NULL;
     }
     for (Py_ssize_t i = 0; i < self->selected.size; i++) {
-        PyTuple_SET_ITEM(tuple, i, PyLong_FromUnsignedLong(self->selected.items[i]));
+        PyTuple_SET_ITEM(tuple, i, PyLong_FromUnsignedLongLong(self->selected.items[i]));
     }
     return tuple;
 }
 
 static PyObject *NativeState_forbidden_count(NativeState *self, PyObject *Py_UNUSED(ignored)) {
-    return PyLong_FromUnsignedLongLong(self->forbidden->count);
+    return PyLong_FromSsize_t(self->forbidden->count);
 }
 
 static PyObject *NativeState_layer_counts(NativeState *self, PyObject *Py_UNUSED(ignored)) {
@@ -556,7 +618,7 @@ static PyTypeObject NativeStateType = {
     .tp_basicsize = sizeof(NativeState),
     .tp_dealloc = (destructor)NativeState_dealloc,
     .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_doc = "Native exact forbidden-state engine.",
+    .tp_doc = "Native exact sparse forbidden-state engine.",
     .tp_methods = NativeState_methods,
     .tp_init = (initproc)NativeState_init,
     .tp_new = PyType_GenericNew,
@@ -585,18 +647,18 @@ static PyObject *native_validate_columns(PyObject *self, PyObject *args) {
     Py_ssize_t size = PySequence_Fast_GET_SIZE(seq);
     PyObject **items = PySequence_Fast_ITEMS(seq);
     for (Py_ssize_t i = 0; i < size; i++) {
-        uint32_t mask = (uint32_t)PyLong_AsUnsignedLong(items[i]);
+        uint64_t mask = PyLong_AsUnsignedLongLong(items[i]);
         if (PyErr_Occurred()) {
             Py_DECREF(seq);
             Py_DECREF(state);
             return NULL;
         }
-        if (mask >= state->mask_limit || bitset_get(state->forbidden, mask)) {
+        if (mask >= state->mask_limit || sparse_set_contains(state->forbidden, mask)) {
             Py_DECREF(seq);
             Py_DECREF(state);
             Py_RETURN_FALSE;
         }
-        PyObject *add_args = Py_BuildValue("(I)", mask);
+        PyObject *add_args = Py_BuildValue("(K)", (unsigned long long)mask);
         if (!add_args) {
             Py_DECREF(seq);
             Py_DECREF(state);

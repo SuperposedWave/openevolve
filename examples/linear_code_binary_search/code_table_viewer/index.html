@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Binary Code Search Matrix</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Binary Code Search Matrix</h1>
+        <p id="summary" class="summary">Loading local search data...</p>
+      </div>
+      <div class="legend" aria-label="Cell color legend">
+        <span><i class="swatch swatch-found"></i>Found</span>
+        <span><i class="swatch swatch-failed"></i>Searched, not found</span>
+        <span><i class="swatch swatch-unsearched"></i>Unsearched</span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="matrix-pane" aria-label="Code table matrix">
+        <form class="controls" id="controls">
+          <label>
+            n min
+            <input id="minN" type="number" min="1" max="256" value="1">
+          </label>
+          <label>
+            n max
+            <input id="maxN" type="number" min="1" max="256" value="256">
+          </label>
+          <label>
+            k min
+            <input id="minK" type="number" min="1" max="256" value="1">
+          </label>
+          <label>
+            k max
+            <input id="maxK" type="number" min="1" max="256" value="256">
+          </label>
+          <label>
+            status
+            <select id="statusFilter">
+              <option value="all">All</option>
+              <option value="found">Found</option>
+              <option value="failed">Searched, not found</option>
+              <option value="upper_failed_after_found">Upper failed after found</option>
+              <option value="unsearched">Unsearched</option>
+            </select>
+          </label>
+          <button type="button" id="resetFilters">Reset</button>
+        </form>
+        <div id="tableStatus" class="table-status" aria-live="polite"></div>
+        <div class="table-wrap" id="tableWrap">
+          <table id="matrixTable" class="matrix-table" aria-describedby="tableStatus"></table>
+        </div>
+      </section>
+
+      <aside class="detail-pane" aria-label="Selected code details">
+        <div id="emptyDetail" class="empty-detail">
+          <h2>Select a searched cell</h2>
+          <p>Green and yellow cells contain local run details. Black cells have no saved search attempt.</p>
+        </div>
+        <article id="detail" class="detail" hidden>
+          <div class="detail-head">
+            <div>
+              <h2 id="detailTitle"></h2>
+              <p id="detailSubtitle"></p>
+            </div>
+            <button type="button" id="closeDetail" aria-label="Close detail">x</button>
+          </div>
+
+          <dl class="metrics" id="detailMetrics"></dl>
+
+          <section>
+            <h3>Attempts</h3>
+            <div id="attemptList" class="attempt-list"></div>
+          </section>
+
+          <section id="matrixSection">
+            <h3>Parity-check matrix H</h3>
+            <pre id="hRows" class="matrix-output"></pre>
+          </section>
+
+          <section id="generatorSection">
+            <h3>Generator matrix G</h3>
+            <pre id="gRows" class="matrix-output"></pre>
+          </section>
+
+          <section id="prioritySection">
+            <h3>Priority function</h3>
+            <pre id="prioritySource" class="code-output"></pre>
+          </section>
+
+          <section>
+            <h3>Source</h3>
+            <pre id="sourcePaths" class="path-output"></pre>
+          </section>
+        </article>
+      </aside>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

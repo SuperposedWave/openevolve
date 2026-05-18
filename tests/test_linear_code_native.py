@@ -129,9 +129,21 @@ class TestLinearCodeNative(unittest.TestCase):
             search_core.validate_free_columns(r, tuple(columns), distance),
         )
 
+    def test_r_60_uses_64_bit_masks(self):
+        state = native.NativeForbiddenState(60, 3)
+        column = (1 << 59) | (1 << 40) | (1 << 17)
+        self.assertTrue(state.can_add(column))
+        state.add(column)
+        self.assertEqual(state.selected_columns(), (column,))
+        self.assertTrue(native.validate_columns(60, 3, (column,)))
+
     def test_r_limit_is_loud(self):
-        with self.assertRaisesRegex(ValueError, "r <= 30"):
-            native.NativeForbiddenState(31, 4)
+        with self.assertRaisesRegex(ValueError, "r <= 60"):
+            native.NativeForbiddenState(61, 4)
+
+    def test_large_initial_forbidden_layers_fail_loudly(self):
+        with self.assertRaisesRegex(MemoryError, "LINEAR_CODE_NATIVE_MAX_INITIAL_VALUES"):
+            native.NativeForbiddenState(60, 13)
 
 
 if __name__ == "__main__":
