@@ -684,6 +684,39 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
                 ) % 2
                 self.assertEqual(overlap, 0)
 
+    def test_evaluation_artifacts_include_constructed_matrices(self):
+        """Evaluation artifacts should expose the constructed H and G matrices."""
+        instance = self.search_core.make_instance(n=7, k=4, distance=3, restarts=1)
+        result = self.search_core.evaluate_priority_function(
+            self.initial_program.get_priority_function(),
+            instance,
+        )
+
+        self.assertIn("parity_check_matrix", result.artifacts)
+        self.assertIn("generator_matrix", result.artifacts)
+        self.assertIn("matrix_summary", result.artifacts)
+
+        h_rows = json.loads(result.artifacts["parity_check_matrix"])
+        g_rows = json.loads(result.artifacts["generator_matrix"])
+        summary = json.loads(result.artifacts["matrix_summary"])
+
+        self.assertEqual(len(h_rows), instance.r)
+        self.assertTrue(all(len(row) == instance.n for row in h_rows))
+        self.assertEqual(len(g_rows), instance.k)
+        self.assertTrue(all(len(row) == instance.n for row in g_rows))
+        self.assertEqual(summary["h_shape"], [instance.r, instance.n])
+        self.assertEqual(summary["g_shape"], [instance.k, instance.n])
+        self.assertTrue(summary["complete"])
+        self.assertEqual(summary["filled_free_columns"], instance.k)
+
+        for g_row in g_rows:
+            for h_row in h_rows:
+                overlap = sum(
+                    (int(g_bit) & int(h_bit))
+                    for g_bit, h_bit in zip(g_row, h_row)
+                ) % 2
+                self.assertEqual(overlap, 0)
+
     def test_evaluator_is_deterministic(self):
         """The evaluator should produce stable metrics for the same program."""
         program_path = str(EXAMPLE_DIR / "initial_program.py")

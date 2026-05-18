@@ -1859,6 +1859,33 @@ def evaluate_priority_function(
         }
         for mask, score in attempt.sorted_scores[: min(10, len(attempt.sorted_scores))]
     ]
+    parity_rows = parity_check_matrix_rows(
+        active_instance.r,
+        attempt.selected_free_columns,
+    )
+    generator_rows = generator_matrix_rows(
+        active_instance.r,
+        attempt.selected_free_columns,
+    )
+    matrix_summary = {
+        "form": "H=[P^T|I_r], G=[I_k|P]",
+        "complete": attempt.added_free_columns == active_instance.k,
+        "n": active_instance.n,
+        "k": active_instance.k,
+        "d": active_instance.target_distance,
+        "r": active_instance.r,
+        "filled_free_columns": attempt.added_free_columns,
+        "target_free_columns": active_instance.k,
+        "h_shape": [active_instance.r, attempt.added_free_columns + active_instance.r],
+        "g_shape": [
+            attempt.added_free_columns,
+            attempt.added_free_columns + active_instance.r,
+        ],
+        "selected_free_columns": [
+            format_mask(mask, active_instance.r)
+            for mask in attempt.selected_free_columns
+        ],
+    }
 
     artifacts = {
         "instance": json.dumps(
@@ -1900,6 +1927,9 @@ def evaluate_priority_function(
         ),
         "top_ranked_columns": json.dumps(top_ranked_columns, sort_keys=True),
         "blocked_weight_histogram": json.dumps(dict(sorted(blocked_counter.items()))),
+        "parity_check_matrix": json.dumps(list(parity_rows)),
+        "generator_matrix": json.dumps(list(generator_rows)),
+        "matrix_summary": json.dumps(matrix_summary, sort_keys=True),
     }
     if attempt.success:
         artifacts["successful_code_vectors"] = json.dumps(
