@@ -113,12 +113,6 @@ To inspect the baseline without running evolution:
 LINEAR_CODE_N=7 LINEAR_CODE_K=4 LINEAR_CODE_D=3 python initial_program.py
 ```
 
-Single-run inspection writes the constructed parity-check and generator matrices
-to `matrix_verification.txt` by default. Override the path with
-`LINEAR_CODE_MATRIX_OUTPUT`; exhaustive distance reporting is skipped when the
-filled dimension exceeds `LINEAR_CODE_MATRIX_MAX_EXHAUSTIVE_K` whose default is
-`24`.
-
 To batch-run all valid `(n,k)` entries with `10 < n <= 40`, using `d = lower` from `Misc/ECCRecord.json`:
 
 ```bash

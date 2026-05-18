@@ -5,7 +5,6 @@ import io
 import json
 import os
 import sys
-import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -775,35 +774,6 @@ class TestLinearCodeBinarySearch(unittest.TestCase):
         self.assertIn('"n": 7', output)
         self.assertIn('"k": 4', output)
         self.assertIn('"d_target": 3', output)
-
-    def test_initial_program_saves_single_run_matrix_report(self):
-        """Single-run inspection should save the constructed H/G matrices."""
-        instance = self.search_core.make_instance(n=7, k=4, distance=3, restarts=1)
-        result = self.search_core.evaluate_priority_function(
-            self.initial_program.get_priority_function(),
-            instance,
-        )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_path = Path(tmpdir) / "matrix_verification.txt"
-            with mock.patch.dict(
-                os.environ,
-                {
-                    "LINEAR_CODE_MATRIX_OUTPUT": str(output_path),
-                    "LINEAR_CODE_MATRIX_MAX_EXHAUSTIVE_K": "8",
-                },
-                clear=False,
-            ):
-                saved_path = self.initial_program.save_matrix_report(result, instance)
-
-            self.assertEqual(saved_path, output_path)
-            text = output_path.read_text()
-            self.assertIn('"n": 7', text)
-            self.assertIn("d_actual: 3", text)
-            self.assertIn("H shape: 3 x 7", text)
-            self.assertIn("H rows:", text)
-            self.assertIn("G shape: 4 x 7", text)
-            self.assertIn("G rows:", text)
 
 
 if __name__ == "__main__":
