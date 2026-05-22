@@ -2,6 +2,7 @@ const state = {
   data: null,
   cellsByKey: new Map(),
   selectedDetailId: null,
+  viewMode: "nk",
 };
 
 const elements = {
@@ -12,6 +13,7 @@ const elements = {
   minK: document.getElementById("minK"),
   maxK: document.getElementById("maxK"),
   statusFilter: document.getElementById("statusFilter"),
+  viewModeToggle: document.getElementById("viewModeToggle"),
   resetFilters: document.getElementById("resetFilters"),
   tableStatus: document.getElementById("tableStatus"),
   matrixTable: document.getElementById("matrixTable"),
@@ -65,8 +67,127 @@ function numberOrDash(value) {
   return value === null || value === undefined || value === "" ? "-" : value;
 }
 
+function cellCoordinatesForView(viewMode, rowValue, columnValue) {
+  if (viewMode === "nr") {
+    const n = rowValue;
+    const k = n - columnValue;
+    return { n, k, valid: k >= 1 && k <= n };
+  }
+  return { n: rowValue, k: columnValue, valid: columnValue <= rowValue };
+}
+
+function cellMatchesFilter(cell, filters) {
+  return Boolean(cell) && (filters.status === "all" || cell.status === filters.status);
+}
+
+function cellForViewCoordinate(filters, viewMode, rowValue, columnValue) {
+  const coordinates = cellCoordinatesForView(viewMode, rowValue, columnValue);
+  if (!coordinates.valid) {
+    return null;
+  }
+  const { n, k } = coordinates;
+  if (k < filters.minK || k > filters.maxK || n < filters.minN || n > filters.maxN) {
+    return null;
+  }
+  return state.cellsByKey.get(keyFor(n, k)) || null;
+}
+
+function upperRunClassesForView(viewMode, cell, previousCell, nextCell) {
+  if (viewMode !== "nr" || !cell) {
+    return "";
+  }
+  const previousSame = Boolean(previousCell) && previousCell.upper === cell.upper;
+  const nextSame = Boolean(nextCell) && nextCell.upper === cell.upper;
+  if (!previousSame && !nextSame) {
+    return "";
+  }
+  let classes = " upper-run";
+  if (!previousSame) {
+    classes += " upper-run-start";
+  }
+  if (!nextSame) {
+    classes += " upper-run-end";
+  }
+  return classes;
+}
+
+function cellLabelParts(cell) {
+  return String(cell.label).split("-").map((part) => ({
+    text: part,
+    value: Number.parseInt(part, 10),
+  }));
+}
+
+function cellPartState(cell, value) {
+  const bestDistance = Number.isInteger(cell.bestDistance) ? cell.bestDistance : null;
+  const attemptedTargets = new Set((cell.attemptedTargets || []).map((target) => Number.parseInt(target, 10)));
+  if (bestDistance !== null && value <= bestDistance) {
+    return "found";
+  }
+  if (cell.status === "upper_failed_after_found" && value === cell.upper) {
+    return "failed";
+  }
+  if (attemptedTargets.has(value)) {
+    return "failed";
+  }
+  return "unsearched";
+}
+
+function cellPartClass(stateName) {
+  return {
+    found: "cell-value-found",
+    failed: "cell-value-failed",
+    unsearched: "cell-value-unsearched",
+  }[stateName] || "cell-value-neutral";
+}
+
+function cellPartBackground(stateName) {
+  return {
+    found: "var(--found)",
+    failed: "var(--failed)",
+    unsearched: "#ffffff",
+  }[stateName] || "#ffffff";
+}
+
+function cellBackgroundStyle(cell, matches) {
+  if (!matches) {
+    return "";
+  }
+  const parts = cellLabelParts(cell);
+  if (parts.length < 2) {
+    return "";
+  }
+  const backgrounds = parts.map((part) => cellPartBackground(cellPartState(cell, part.value)));
+  const allSame = backgrounds.every((background) => background === backgrounds[0]);
+  if (allSame) {
+    return "";
+  }
+  const stops = backgrounds
+    .map((background, index) => {
+      const position = parts.length === 1 ? 0 : Math.round((index / (parts.length - 1)) * 100);
+      return `${background} ${position}%`;
+    })
+    .join(", ");
+  return `background: linear-gradient(90deg, ${stops});`;
+}
+
+function renderCellValue(cell, matches) {
+  if (!matches) {
+    return '<span class="cell-value"></span>';
+  }
+  const parts = cellLabelParts(cell);
+  if (parts.length > 1) {
+    const htmlParts = parts.map((part) => {
+      const stateName = cellPartState(cell, part.value);
+      return `<span class="cell-value-part ${cellPartClass(stateName)}">${escapeHtml(part.text)}</span>`;
+    });
+    return `<span class="cell-value cell-value-split">${htmlParts.join('<span class="cell-value-separator">-</span>')}</span>`;
+  }
+  return `<span class="cell-value">${escapeHtml(cell.label)}</span>`;
+}
+
 async function loadData() {
-  const response = await fetch("code_table_data.json");
+  const response = await fetch(`code_table_data.json?v=${Date.now()}`, { cache: "no-store" });
   if (!response.ok) {
     throw new Error(`Failed to load code_table_data.json: ${response.status}`);
   }
@@ -106,6 +227,38 @@ function currentFilters() {
   };
 }
 
+function axisValuesForView(filters) {
+  if (state.viewMode === "nr") {
+    const rows = [];
+    for (let n = filters.minN; n <= filters.maxN; n += 1) {
+      rows.push(n);
+    }
+    const minR = Math.max(0, filters.minN - filters.maxK);
+    const maxR = Math.max(0, filters.maxN - filters.minK);
+    const columns = [];
+    for (let r = minR; r <= maxR; r += 1) {
+      columns.push(r);
+    }
+    return { cornerLabel: "n/n-k", rows, columns };
+  }
+
+  const rows = [];
+  for (let n = filters.minN; n <= filters.maxN; n += 1) {
+    rows.push(n);
+  }
+  const columns = [];
+  for (let k = filters.minK; k <= filters.maxK; k += 1) {
+    columns.push(k);
+  }
+  return { cornerLabel: "n/k", rows, columns };
+}
+
+function updateViewModeControl() {
+  const isRedundancyView = state.viewMode === "nr";
+  elements.viewModeToggle.textContent = isRedundancyView ? "View: n/(n-k)" : "View: n/k";
+  elements.viewModeToggle.setAttribute("aria-pressed", String(isRedundancyView));
+}
+
 function renderTable() {
   const filters = currentFilters();
   if (state.selectedDetailId) {
@@ -116,53 +269,64 @@ function renderTable() {
       elements.emptyDetail.hidden = false;
     }
   }
-  const kValues = [];
-  for (let k = filters.minK; k <= filters.maxK; k += 1) {
-    kValues.push(k);
-  }
+  const axes = axisValuesForView(filters);
 
   let visibleDataCells = 0;
   let matchedCells = 0;
   const header = [
-    "<thead><tr><th scope=\"col\">n/k</th>",
-    ...kValues.map((k) => `<th scope="col">${k}</th>`),
+    `<thead><tr><th scope="col">${axes.cornerLabel}</th>`,
+    ...axes.columns.map((value) => `<th scope="col">${value}</th>`),
     "</tr></thead>",
   ].join("");
 
   const rows = [];
-  for (let n = filters.minN; n <= filters.maxN; n += 1) {
-    const row = [`<tr><th scope="row">${n}</th>`];
-    for (const k of kValues) {
-      if (k > n) {
-        row.push('<td class="blank-cell" aria-label="invalid"></td>');
-        continue;
-      }
-      const cell = state.cellsByKey.get(keyFor(n, k));
+  for (let rowIndex = 0; rowIndex < axes.rows.length; rowIndex += 1) {
+    const rowValue = axes.rows[rowIndex];
+    const row = [`<tr><th scope="row">${rowValue}</th>`];
+    for (const columnValue of axes.columns) {
+      const coordinates = cellCoordinatesForView(state.viewMode, rowValue, columnValue);
+      const cell = cellForViewCoordinate(filters, state.viewMode, rowValue, columnValue);
       if (!cell) {
-        row.push('<td class="blank-cell" aria-label="missing"></td>');
+        row.push(`<td class="blank-cell" aria-label="${coordinates.valid ? "outside selected range" : "invalid"}"></td>`);
         continue;
       }
       visibleDataCells += 1;
-      const matches = filters.status === "all" || cell.status === filters.status;
+      const { n, k } = coordinates;
+      const matches = cellMatchesFilter(cell, filters);
       if (matches) {
         matchedCells += 1;
       }
+      const previousRawCell =
+        rowIndex > 0
+          ? cellForViewCoordinate(filters, state.viewMode, axes.rows[rowIndex - 1], columnValue)
+          : null;
+      const nextRawCell =
+        rowIndex + 1 < axes.rows.length
+          ? cellForViewCoordinate(filters, state.viewMode, axes.rows[rowIndex + 1], columnValue)
+          : null;
+      const previousCell = cellMatchesFilter(previousRawCell, filters) ? previousRawCell : null;
+      const nextCell = cellMatchesFilter(nextRawCell, filters) ? nextRawCell : null;
+      const upperRunClasses = matches
+        ? upperRunClassesForView(state.viewMode, cell, previousCell, nextCell)
+        : "";
       const selectedClass = cell.detailId && cell.detailId === state.selectedDetailId ? " active" : "";
       const filteredClass = matches ? "" : " filtered-cell";
-      const classes = `data-cell status-${cell.status}${selectedClass}${filteredClass}`;
+      const classes = `data-cell status-${cell.status}${selectedClass}${filteredClass}${upperRunClasses}`;
       const title =
         `n=${cell.n}, k=${cell.k}, bounds=${cell.label}, status=${statusLabel(cell.status)}`;
+      const backgroundStyle = cellBackgroundStyle(cell, matches);
+      const styleAttribute = backgroundStyle ? ` style="${backgroundStyle}"` : "";
       if (cell.detailId && matches) {
         row.push(
-          `<td class="${classes}" title="${escapeHtml(title)}">` +
+          `<td class="${classes}" title="${escapeHtml(title)}"${styleAttribute}>` +
             `<button class="cell-button" type="button" data-detail-id="${cell.detailId}" ` +
-            `aria-label="${escapeHtml(title)}"><span class="cell-value">${escapeHtml(cell.label)}</span></button>` +
+            `aria-label="${escapeHtml(title)}">${renderCellValue(cell, matches)}</button>` +
           "</td>"
         );
       } else {
         row.push(
-          `<td class="${classes}" title="${escapeHtml(title)}">` +
-            `<span class="cell-value">${matches ? escapeHtml(cell.label) : ""}</span>` +
+          `<td class="${classes}" title="${escapeHtml(title)}"${styleAttribute}>` +
+            renderCellValue(cell, matches) +
           "</td>"
         );
       }
@@ -209,11 +373,13 @@ function renderDetails(detailId) {
   elements.attemptList.innerHTML = detail.attempts
     .map((attempt) => {
       const score = numberOrDash(attempt.metrics && attempt.metrics.combined_score);
+      const iteration = numberOrDash(attempt.iteration);
+      const generation = numberOrDash(attempt.generation);
       const source = [attempt.sourceRoot, attempt.sourceRun].filter(Boolean).join(" / ");
       return (
         `<div class="attempt ${escapeHtml(attempt.status)}">` +
           `<strong>d=${escapeHtml(attempt.targetDistance)} · ${escapeHtml(attempt.status)}</strong>` +
-          `actual=${escapeHtml(numberOrDash(attempt.actualDistance))} · score=${escapeHtml(score)}` +
+          `actual=${escapeHtml(numberOrDash(attempt.actualDistance))} · score=${escapeHtml(score)} · iteration=${escapeHtml(iteration)} / generation=${escapeHtml(generation)}` +
           `${source ? `<br>source=${escapeHtml(source)}` : ""}` +
         "</div>"
       );
@@ -274,9 +440,16 @@ function resetFilters() {
   renderTable();
 }
 
+function toggleViewMode() {
+  state.viewMode = state.viewMode === "nk" ? "nr" : "nk";
+  updateViewModeControl();
+  renderTable();
+}
+
 function bindEvents() {
   elements.controls.addEventListener("input", renderTable);
   elements.controls.addEventListener("change", renderTable);
+  elements.viewModeToggle.addEventListener("click", toggleViewMode);
   elements.resetFilters.addEventListener("click", resetFilters);
   elements.closeDetail.addEventListener("click", closeDetail);
   elements.matrixTable.addEventListener("click", (event) => {
@@ -292,6 +465,7 @@ async function init() {
   try {
     await loadData();
     renderSummary();
+    updateViewModeControl();
     renderTable();
     bindEvents();
   } catch (error) {
