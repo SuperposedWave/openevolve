@@ -1,6 +1,8 @@
 # Binary Linear Code Feasibility Search
 
-This example uses OpenEvolve to optimize a FunSearch-style static scoring function `priority(column_mask, n, k, d)` for constructing one binary matrix instance at a time.
+This example uses OpenEvolve to optimize a C scoring function for constructing
+one binary matrix instance at a time. The Python search path has been removed;
+the evaluator now accepts C priority files only.
 
 ## Problem Setup
 
@@ -10,16 +12,18 @@ For a binary `[n,k,d]` code with redundancy `r = n-k`, the evaluator works with 
 
 and asks for `k` free columns in `F_2^r` such that every set of `d-1` columns in `H` is linearly independent.
 
-The fixed search skeleton:
+The fixed C search skeleton:
 
 - enumerates free columns as integer bitmasks,
 - filters out columns with weight `< d-1`,
-- scores every candidate column exactly once,
-- sorts the full candidate list by that static score,
+- scores every candidate column once to build a static ordering,
+- reranks a bounded window of currently legal candidates with dynamic features,
 - maintains exact forbidden xor layers for subsets of size up to `d-2`,
-- greedily scans the sorted list and keeps every legal column it can add.
+- accepts the best legal dynamic candidate,
+- and can repair a stuck partial construction by dropping selected columns that
+  release the most search space.
 
-Only the static `priority()` function inside `initial_program.py` is evolved.
+Only `oe_linear_code_priority()` inside `initial_program.c` is evolved.
 
 ## Single-Instance Interface
 
@@ -29,88 +33,84 @@ The evaluator reads the target instance from environment variables:
 - `LINEAR_CODE_K`
 - `LINEAR_CODE_D`
 - optional: `LINEAR_CODE_RESTARTS`
-- optional: `LINEAR_CODE_SEARCH_MODE` (`full` by default, `sampled_refill`, or `sampled_beam`)
-- optional: `LINEAR_CODE_PROGRESS` (`1` enables restart progress and sampled-step output)
-- optional: `LINEAR_CODE_LEGALITY_ENGINE` (`python` by default, or `native`)
-- optional: `LINEAR_CODE_CANDIDATE_WORKERS`
-- optional: `LINEAR_CODE_RESTART_WORKERS`
+- optional: `LINEAR_CODE_RANDOM_SEED`
+- optional: `LINEAR_CODE_DYNAMIC_WINDOW`
+- optional: `LINEAR_CODE_REPAIR_EVENTS`
+- optional: `LINEAR_CODE_REPAIR_DROP_COUNT`
+- optional: `LINEAR_CODE_REPAIR_CANDIDATE_WINDOW`
+- optional: `LINEAR_CODE_REPAIR_TABU_TENURE`
+- optional: `LINEAR_CODE_REPAIR_MODE`
+- optional: `LINEAR_CODE_REPAIR_MCTS_SIMULATIONS`
+- optional: `LINEAR_CODE_REPAIR_MCTS_DEPTH`
+- optional: `LINEAR_CODE_C_COMPILE_TIMEOUT`
+- optional: `LINEAR_CODE_C_RUN_TIMEOUT`
 
 If you do not set them, the default target is `[8,4,4]_2`.
 
-The default `full` mode scores every candidate and sorts the complete candidate
-list. `sampled_refill` mode avoids full enumeration: each restart samples
-candidate pools from Hamming-weight layers proportional to `C(r, w)`, filters
-them through the current exact forbidden state, scores only legal sampled
-candidates, and greedily accepts from that small pool before refilling.
-`sampled_beam` keeps several partial constructions per restart and expands them
-with the same sampled legality checks.
+Useful C-kernel controls:
 
-For larger exact-search runs, `LINEAR_CODE_LEGALITY_ENGINE=native` switches the
-forbidden-state engine to the optional CPython C extension. Build it first:
-
-```bash
-python setup.py build_ext --inplace
-```
-
-The native engine is explicit opt-in, supports `r <= 60`, and fails loudly if it
-is requested without a built extension. It stores exact reachable/forbidden
-membership in sparse C hash sets and accelerates `can_add`, `add`, `undo`, and
-beam-state `clone` operations while leaving sampling, priority scoring, and beam
-ranking in Python. It still exactly materializes the low-weight reachable layers;
-for large `r,d`, initialization can be intrinsically too large. The safety guard
-`LINEAR_CODE_NATIVE_MAX_INITIAL_VALUES` defaults to `200000000`.
-
-Useful sampled-search controls:
-
-- `LINEAR_CODE_RANDOM_SEED`: base seed for reproducible randomized restarts.
-- `LINEAR_CODE_SAMPLE_POOL_SIZE`: target legal sampled candidates per refill.
-- `LINEAR_CODE_SAMPLE_ATTEMPTS_PER_REFILL`: random draws allowed for one refill.
-- `LINEAR_CODE_SAMPLE_MAX_REFILLS`: maximum refills per restart.
-- `LINEAR_CODE_SAMPLE_MAX_STALE_REFILLS`: no-progress refills before abandoning a restart.
-- `LINEAR_CODE_BACKTRACK_DEPTH`: recent columns removed when sampled refill stalls.
-- `LINEAR_CODE_BACKTRACK_MAX_EVENTS`: maximum sampled-refill backtracking events per restart.
-- `LINEAR_CODE_BEAM_WIDTH`: number of partial constructions kept in sampled beam mode.
-- `LINEAR_CODE_BEAM_BRANCHES_PER_STATE`: legal branches kept from each beam state.
-- `LINEAR_CODE_BEAM_ATTEMPTS_PER_STATE`: random draws used to expand each beam state.
-- `LINEAR_CODE_BEAM_FORBIDDEN_PENALTY`: penalty for growing the exact forbidden set.
-- `LINEAR_CODE_LEGALITY_ENGINE`: use `native` to enable the C exact-legality engine.
-- `LINEAR_CODE_NATIVE_MAX_INITIAL_VALUES`: safety cap for exact native initialization.
-- `LINEAR_CODE_PROGRESS`: show a restart progress bar plus per-refill sampled-search steps.
-
-The greedy fill itself stays sequential because each accepted column updates the exact forbidden-state. The worker settings only parallelize:
-
-- candidate scoring inside one restart,
-- and evaluation across independent restart indices.
+- `LINEAR_CODE_RANDOM_SEED`: base seed for reproducible restarts.
+- `LINEAR_CODE_DYNAMIC_WINDOW`: C-kernel legal-candidate window reranked with
+  dynamic forbidden-growth features; use `0` for the old static sorted-greedy path.
+- `LINEAR_CODE_REPAIR_EVENTS`: C-kernel repair events per restart. When stuck,
+  the skeleton drops a selected column that releases the most search space, then
+  rebuilds the exact state and continues. Use `0` to disable.
+- `LINEAR_CODE_REPAIR_DROP_COUNT`: selected columns dropped per repair event.
+- `LINEAR_CODE_REPAIR_CANDIDATE_WINDOW`: sorted candidate prefix used to estimate
+  how many candidates a possible drop would release.
+- `LINEAR_CODE_REPAIR_TABU_TENURE`: recently dropped columns kept out of refill.
+- `LINEAR_CODE_REPAIR_MODE`: `greedy` by default, or `mcts` for bounded local
+  Monte Carlo repair when the dynamic fill gets stuck.
+- `LINEAR_CODE_REPAIR_MCTS_SIMULATIONS`: total root-drop rollouts used by MCTS repair.
+- `LINEAR_CODE_REPAIR_MCTS_DEPTH`: maximum local rollout actions after the first drop.
+- `LINEAR_CODE_C_COMPILE_TIMEOUT`: compilation timeout in seconds.
+- `LINEAR_CODE_C_RUN_TIMEOUT`: isolated C-kernel runtime timeout in seconds.
 
 ## Files
 
-- `initial_program.py`: baseline priority heuristic, with a single EVOLVE-BLOCK.
-- `search_core.py`: fixed legality checks, single-instance loader, greedy skeleton, and exact validation helpers.
-- `evaluator.py`: thin OpenEvolve adapter.
-- `config.yaml`: evolution config tuned for deterministic heuristic search.
+- `initial_program.c`: baseline semi-dynamic C priority heuristic, with a single EVOLVE-BLOCK.
+- `c_search_skeleton.c`: fixed C candidate enumeration, static ordering, dynamic window reranking, legality checks, and ABI entry point.
+- `c_kernel_runner.py`: compiles `initial_program.c` with `c_search_skeleton.c` and reads C metrics/output.
+- `search_core.py`: shared instance parsing, exact validation helpers, and matrix formatting.
+- `evaluator.py`: C-only OpenEvolve adapter.
+- `Configs/config_c_kernel.yaml`: evolution config for C priority-only experiments.
+- `Configs/config_c_kernel_large.yaml`: larger C-kernel evolution config.
+- `Configs/llm_config.yaml`: shared LLM/provider configuration used by the configs above.
 - `verify_distance.py`: prints the constructed `H`, the derived `G`, and the achieved `d`.
 - `run_batch.py`: sweeps many `(n,k,d)` instances from `Misc/ECCRecord.json` into separate output directories.
 
 ## Method
 
-This is intentionally closer to the FunSearch cap set pattern than to an interactive search policy:
+This is intentionally closer to the FunSearch cap set pattern than to an
+interactive search policy:
 
 - the LLM does not choose columns one by one using search state,
-- the LLM only writes a static scoring function for a single candidate column,
+- the LLM only writes a C scoring function for a single candidate column,
 - the fixed evaluator handles ordering, legality checking, and final construction.
+
+The fixed skeleton first builds a static ordering, then reranks a bounded window
+of currently legal candidates before each accepted column. The evolved C
+priority receives dynamic damage features such as current forbidden-set size and
+the candidate's exact new forbidden growth. If the dynamic fill gets stuck, the
+fixed skeleton can run a repair step: it evaluates which selected column releases
+the most high-ranked candidates / forbidden-set mass, drops that column, rebuilds
+the exact state, and continues filling. With `LINEAR_CODE_REPAIR_MODE=mcts`,
+that drop choice is replaced by a bounded local rollout search. The rollout
+objective is lexicographic: construct more columns first, then prefer fewer
+drops, fewer rollout steps, and a smaller forbidden set.
 
 ## Run
 
 ```bash
 cd examples/linear_code_binary_search
 LINEAR_CODE_N=8 LINEAR_CODE_K=4 LINEAR_CODE_D=4 \
-python ../../openevolve-run.py initial_program.py evaluator.py --config config.yaml --iterations 40
+python ../../openevolve-run.py initial_program.c evaluator.py --config Configs/config_c_kernel.yaml --iterations 40
 ```
 
 To inspect the baseline without running evolution:
 
 ```bash
-LINEAR_CODE_N=7 LINEAR_CODE_K=4 LINEAR_CODE_D=3 python initial_program.py
+LINEAR_CODE_N=7 LINEAR_CODE_K=4 LINEAR_CODE_D=3 python verify_distance.py initial_program.c
 ```
 
 Single-run inspection writes the constructed parity-check and generator matrices
@@ -134,15 +134,15 @@ python run_batch.py \
   --n-max 40 \
   --d-field lower \
   --iterations 40 \
-  --output-root batch_runs
+  --output-root outputs
 ```
 
 The batch runner automatically skips instances whose selected target distance is `d <= 2`. Those entries are not searched, but they are still written to the summary files as skipped rows.
 
-Each instance is written to its own directory such as `batch_runs/n18_k7_d7/`, including:
+Each instance is written under a target directory such as `outputs/n18_k7_d7/batch_20260629T120000Z/`, including:
 
 - the OpenEvolve output,
 - `resolved_config.yaml`,
 - `run_metadata.json`,
 - `matrix_verification.txt`,
-- and root-level `summary.jsonl` / `summary.csv`.
+- and batch-level `outputs/_summaries/<run-name>/summary.jsonl` / `summary.csv`.

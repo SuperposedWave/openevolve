@@ -15,7 +15,13 @@ from typing import Any
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_RECORD = SCRIPT_DIR / "Misc" / "ECCRecord.json"
 DEFAULT_OUTPUT = SCRIPT_DIR / "code_table_viewer" / "code_table_data.json"
-RUN_DIR_RE = re.compile(r"^n(?P<n>\d+)_k(?P<k>\d+)_d(?P<d>\d+)$")
+TARGET_DIR_RE = re.compile(r"^n(?P<n>\d+)_k(?P<k>\d+)_d(?P<d>\d+)(?:[_-].*)?$")
+STATUS_RANK = {
+    "missing": 0,
+    "unknown": 1,
+    "partial": 2,
+    "complete": 3,
+}
 
 
 def default_search_roots(base_dir: Path = SCRIPT_DIR) -> list[Path]:
@@ -24,9 +30,22 @@ def default_search_roots(base_dir: Path = SCRIPT_DIR) -> list[Path]:
     for child in sorted(base_dir.iterdir()):
         if not child.is_dir():
             continue
-        if child.name == "runs" or child.name.startswith(("batch_runs", "openevolve_output")):
+        if child.name == "outputs":
             roots.append(child)
     return roots
+
+
+def parse_target_from_path(path: Path) -> tuple[int, int, int] | None:
+    """Parse the nearest n/k/d target marker from a path."""
+    for part in reversed(path.parts):
+        match = TARGET_DIR_RE.match(part)
+        if match:
+            return (
+                int(match.group("n")),
+                int(match.group("k")),
+                int(match.group("d")),
+            )
+    return None
 
 
 def load_record(record_path: Path) -> dict[str, dict[str, dict[str, int]]]:
@@ -104,18 +123,37 @@ def parse_matrix_verification(path: Path) -> dict[str, Any]:
 def read_best_info(path: Path) -> dict[str, Any]:
     """Read best_program_info.json when present."""
     if not path.exists():
-        return {"iteration": None, "metrics": {}}
+        return {"iteration": None, "metrics": {}, "timestamp": None}
     try:
         info = json.loads(path.read_text())
     except json.JSONDecodeError:
-        return {"iteration": None, "metrics": {}}
+        return {"iteration": None, "metrics": {}, "timestamp": None}
+    best_program_time = info.get("saved_at")
+    if best_program_time is None:
+        best_program_time = info.get("timestamp")
     return {
         "iteration": info.get("iteration"),
         "generation": info.get("generation"),
         "metrics": info.get("metrics", {}),
-        "programId": info.get("id"),
-        "timestamp": info.get("timestamp"),
+        "timestamp": best_program_time,
     }
+
+
+def is_checkpoint_path(path: Path) -> bool:
+    """Return whether a run-like directory is inside an OpenEvolve checkpoint tree."""
+    return any(part == "checkpoints" or part.startswith("checkpoint_") for part in path.parts)
+
+
+def best_program_path_for(run_dir: Path) -> Path | None:
+    """Return the best program path, preferring the current C-kernel output."""
+    candidates = [
+        run_dir / "best" / "best_program.c",
+        run_dir / "best" / "best_program.py",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
 
 
 def scan_attempts(search_roots: list[Path]) -> dict[tuple[int, int], list[dict[str, Any]]]:
@@ -128,22 +166,23 @@ def scan_attempts(search_roots: list[Path]) -> dict[tuple[int, int], list[dict[s
         for run_dir in search_root.rglob("*"):
             if not run_dir.is_dir() or run_dir in seen_dirs:
                 continue
-            match = RUN_DIR_RE.match(run_dir.name)
-            if not match:
+            if is_checkpoint_path(run_dir.relative_to(search_root)):
                 continue
-            best_program_path = run_dir / "best" / "best_program.py"
+            best_program_path = best_program_path_for(run_dir)
             best_info_path = run_dir / "best" / "best_program_info.json"
             verification_path = run_dir / "matrix_verification.txt"
-            if not (best_program_path.exists() or best_info_path.exists() or verification_path.exists()):
+            if not (best_program_path or best_info_path.exists() or verification_path.exists()):
+                continue
+            relative_run_dir = run_dir.relative_to(search_root)
+            target = parse_target_from_path(relative_run_dir)
+            if target is None:
                 continue
             seen_dirs.add(run_dir)
-            n = int(match.group("n"))
-            k = int(match.group("k"))
-            target_distance = int(match.group("d"))
+            n, k, target_distance = target
             verification = parse_matrix_verification(verification_path)
             best_info = read_best_info(best_info_path)
             priority_source = (
-                best_program_path.read_text(errors="replace") if best_program_path.exists() else ""
+                best_program_path.read_text(errors="replace") if best_program_path else ""
             )
             attempts_by_cell[(n, k)].append(
                 {
@@ -159,13 +198,58 @@ def scan_attempts(search_roots: list[Path]) -> dict[tuple[int, int], list[dict[s
                     "metrics": best_info["metrics"],
                     "iteration": best_info.get("iteration"),
                     "generation": best_info.get("generation"),
-                    "programId": best_info.get("programId"),
                     "timestamp": best_info.get("timestamp"),
                     "sourceRoot": search_root.name,
-                    "sourceRun": run_dir.name,
+                    "sourceRun": str(relative_run_dir),
                 }
             )
     return attempts_by_cell
+
+
+def attempt_sort_score(attempt: dict[str, Any]) -> tuple[int, int, float, float, int, str]:
+    """Score duplicate attempts so one run contributes only its strongest row."""
+    status_rank = STATUS_RANK.get(str(attempt.get("status")), 1)
+    actual_distance = int(attempt.get("actualDistance") or -1)
+    metrics = attempt.get("metrics", {})
+    combined_score = metrics.get("combined_score", -1)
+    if not isinstance(combined_score, (int, float)):
+        combined_score = -1
+    constructed_columns = metrics.get("constructed_columns", -1)
+    if not isinstance(constructed_columns, (int, float)):
+        constructed_columns = -1
+    iteration = attempt.get("iteration")
+    if not isinstance(iteration, int):
+        iteration = -1
+    timestamp = attempt.get("timestamp") or ""
+    return (
+        status_rank,
+        actual_distance,
+        float(combined_score),
+        float(constructed_columns),
+        iteration,
+        str(timestamp),
+    )
+
+
+def deduplicate_attempts(attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove checkpoint rows and collapse duplicate rows from the same run."""
+    best_by_run: dict[tuple[int, str, str], dict[str, Any]] = {}
+    for attempt in attempts:
+        source_run = str(attempt.get("sourceRun", ""))
+        if is_checkpoint_path(Path(source_run)):
+            continue
+        key = (
+            int(attempt["targetDistance"]),
+            str(attempt.get("sourceRoot", "")),
+            source_run,
+        )
+        existing = best_by_run.get(key)
+        if existing is None or attempt_sort_score(attempt) > attempt_sort_score(existing):
+            best_by_run[key] = attempt
+    return sorted(
+        best_by_run.values(),
+        key=lambda item: (item["targetDistance"], item["sourceRoot"], item["sourceRun"]),
+    )
 
 
 def rank_attempt(attempt: dict[str, Any]) -> tuple[int, int, float, int, int]:
@@ -231,6 +315,8 @@ def build_detail(
             "actualDistance": attempt["actualDistance"],
             "metrics": attempt["metrics"],
             "iteration": attempt.get("iteration"),
+            "generation": attempt.get("generation"),
+            "timestamp": attempt.get("timestamp"),
             "sourceRoot": attempt["sourceRoot"],
             "sourceRun": attempt["sourceRun"],
         }
@@ -258,6 +344,7 @@ def build_detail(
 
 def build_dataset(record_path: Path, search_roots: list[Path]) -> dict[str, Any]:
     """Build the full static JSON payload."""
+    generated_at = datetime.now(timezone.utc).isoformat()
     record = load_record(record_path)
     attempts_by_cell = scan_attempts(search_roots)
     cells: list[dict[str, Any]] = []
@@ -270,7 +357,7 @@ def build_dataset(record_path: Path, search_roots: list[Path]) -> dict[str, Any]
             k = int(k_key)
             lower = record[n_key][k_key]["lower"]
             upper = record[n_key][k_key]["upper"]
-            attempts = attempts_by_cell.get((n, k), [])
+            attempts = deduplicate_attempts(attempts_by_cell.get((n, k), []))
             complete_attempts = [
                 attempt
                 for attempt in attempts
@@ -308,7 +395,7 @@ def build_dataset(record_path: Path, search_roots: list[Path]) -> dict[str, Any]
     scanned_roots = [root.name for root in search_roots if root.exists()]
     return {
         "meta": {
-            "generatedAt": datetime.now(timezone.utc).isoformat(),
+            "generatedAt": generated_at,
             "recordName": record_path.name,
             "scannedRootNames": scanned_roots,
             "totalCells": len(cells),

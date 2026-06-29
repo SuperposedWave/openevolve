@@ -67,6 +67,19 @@ function numberOrDash(value) {
   return value === null || value === undefined || value === "" ? "-" : value;
 }
 
+function formatTimestamp(value) {
+  if (value === null || value === undefined || value === "") {
+    return "-";
+  }
+  let date;
+  if (typeof value === "number") {
+    date = new Date(value < 1e12 ? value * 1000 : value);
+  } else {
+    date = new Date(value);
+  }
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+}
+
 function cellCoordinatesForView(viewMode, rowValue, columnValue) {
   if (viewMode === "nr") {
     const n = rowValue;
@@ -345,12 +358,29 @@ function renderMetric(name, value) {
   return `<div><dt>${escapeHtml(name)}</dt><dd>${escapeHtml(numberOrDash(value))}</dd></div>`;
 }
 
-function renderDetails(detailId) {
+function setActiveDetailCell(detailId, activeButton) {
+  const previousActive = elements.matrixTable.querySelector(".data-cell.active");
+  if (previousActive) {
+    previousActive.classList.remove("active");
+  }
+  if (!detailId) {
+    return;
+  }
+  const button = activeButton || Array.from(elements.matrixTable.querySelectorAll("[data-detail-id]"))
+    .find((candidate) => candidate.dataset.detailId === detailId);
+  const cell = button && button.closest(".data-cell");
+  if (cell) {
+    cell.classList.add("active");
+  }
+}
+
+function renderDetails(detailId, activeButton) {
   const detail = state.data.details[detailId];
   if (!detail) {
     return;
   }
   state.selectedDetailId = detailId;
+  setActiveDetailCell(detailId, activeButton);
   elements.emptyDetail.hidden = true;
   elements.detail.hidden = false;
 
@@ -376,11 +406,19 @@ function renderDetails(detailId) {
       const iteration = numberOrDash(attempt.iteration);
       const generation = numberOrDash(attempt.generation);
       const source = [attempt.sourceRoot, attempt.sourceRun].filter(Boolean).join(" / ");
+      const bestProgramTime = formatTimestamp(attempt.timestamp);
+      const method = attempt.method ? `<br>method=${escapeHtml(attempt.method)}` : "";
+      const derivedFrom = attempt.derivedFrom
+        ? `<br>derived from=n=${escapeHtml(attempt.derivedFrom.n)}, k=${escapeHtml(attempt.derivedFrom.k)}, d=${escapeHtml(attempt.derivedFrom.actualDistance)}`
+        : "";
       return (
         `<div class="attempt ${escapeHtml(attempt.status)}">` +
           `<strong>d=${escapeHtml(attempt.targetDistance)} · ${escapeHtml(attempt.status)}</strong>` +
           `actual=${escapeHtml(numberOrDash(attempt.actualDistance))} · score=${escapeHtml(score)} · iteration=${escapeHtml(iteration)} / generation=${escapeHtml(generation)}` +
           `${source ? `<br>source=${escapeHtml(source)}` : ""}` +
+          `<br>best_program time=${escapeHtml(bestProgramTime)}` +
+          method +
+          derivedFrom +
         "</div>"
       );
     })
@@ -421,14 +459,13 @@ function renderDetails(detailId) {
           2
         );
   }
-  renderTable();
 }
 
 function closeDetail() {
   state.selectedDetailId = null;
+  setActiveDetailCell(null);
   elements.detail.hidden = true;
   elements.emptyDetail.hidden = false;
-  renderTable();
 }
 
 function resetFilters() {
@@ -457,7 +494,7 @@ function bindEvents() {
     if (!button) {
       return;
     }
-    renderDetails(button.dataset.detailId);
+    renderDetails(button.dataset.detailId, button);
   });
 }
 

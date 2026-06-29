@@ -43,6 +43,9 @@ openevolve_output*/
 *.log
 demo_output*/
 pr_sanity*/
+artifacts/
+examples/*/artifacts/
+examples/*/runs/
 
 # Test cache
 .pytest_cache/
@@ -52,6 +55,7 @@ htmlcov/
 # Misc
 .DS_Store
 .venv
+core.*
 
 # For SR
 secrets.yaml
@@ -62,3 +66,8 @@ examples/linear_code_binary_search/batch_runs/
 examples/linear_code_binary_search/batch_runs_n40/
 examples/linear_code_binary_search/batch_runs*/
 examples/linear_code_binary_search/single_run*/
+examples/linear_code_binary_search/outputs/
+examples/linear_code_binary_search/benchmark_results/
+
+# max binary code search
+examples/max_binary_code_search/openevolve_output*/

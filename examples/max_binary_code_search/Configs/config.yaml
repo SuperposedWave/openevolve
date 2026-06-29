@@ -1,0 +1,140 @@
+# Configuration for binary maximum-code search.
+# Override the target before running, for example:
+#   MAX_CODE_N=17 MAX_CODE_D=4 python ../../openevolve-run.py initial_program.py evaluator.py --config Configs/config.yaml
+
+max_iterations: 120
+checkpoint_interval: 10
+log_level: "INFO"
+random_seed: 123
+
+diff_based_evolution: true
+max_code_length: 32768
+
+llm_config_path: "llm_config.yaml"
+
+environment:
+  MAX_CODE_N: "17"
+  MAX_CODE_D: "6"
+  MAX_CODE_RESTARTS: "1"
+  MAX_CODE_PARITY_FULL_BATCH_SIZE: "64"
+  MAX_CODE_PARITY_FULL_SCAN_N: "18"
+  MAX_CODE_LOCAL_SAMPLE_SIZE: "64"
+  MAX_CODE_RANDOM_SEED: "0"
+
+prompt:
+  system_message: |
+    You are improving a dynamic scoring function for binary maximum-code search.
+
+    Current default target:
+    - n = 17
+    - d = 6
+
+    A binary code is a set C of n-bit words. The goal is to make |C| as large as
+    possible while every two distinct words have Hamming distance at least d.
+    This is the classical A(n,d) maximum-code problem over F_2.
+
+    You must improve these lightweight priority functions:
+
+      priority(
+          word_mask: int,
+          n: int,
+          d: int,
+          step: int = 0,
+          word_weight: int | None = None,
+          new_forbidden_count: int = 0,
+          overlap_forbidden_count: int = 0,
+          local_available_count: int = 0,
+      ) -> float
+
+      destroy_priority(
+          word_mask: int,
+          n: int,
+          d: int,
+          blocker_count: int = 0,
+          pair_blocker_count: int = 0,
+          code_size: int = 0,
+          word_weight: int | None = None,
+          candidate_score: float = 0.0,
+          min_neighbor_distance: int = 0,
+          avg_neighbor_distance: float = 0.0,
+      ) -> float
+
+      repair_priority(
+          word_mask: int,
+          n: int,
+          d: int,
+          removed_count: int = 0,
+          blocker_count: int = 0,
+          base_size: int = 0,
+          word_weight: int | None = None,
+          candidate_score: float = 0.0,
+      ) -> float
+
+    This is a FunSearch-style setup:
+    - for target d = 4, the evaluator uses the identity A(n,4) = A(n-1,3)
+    - internally it searches centers in length n - 1 with minimum distance 3
+    - after construction, each center gets an overall parity bit to become a
+      length-n codeword with minimum distance 4
+    - the evaluator maintains legality exactly; your function only ranks legal
+      candidate centers from sampled pools
+    - for non-parity targets, the evaluator first builds a greedy packing and
+      then tries deterministic hole-driven local repair
+    - destroy_priority ranks selected codewords for local removal; higher means
+      the codeword looks more worth destroying during repair
+    - repair_priority ranks local refill candidates after one or two codewords
+      are removed; higher means try the candidate earlier
+    - dynamic features describe current damage from adding the candidate:
+      new_forbidden_count is how many future centers become newly forbidden,
+      overlap_forbidden_count is how much of that forbidden region was already
+      unavailable, and local_available_count estimates nearby remaining options
+    - lower new_forbidden_count and higher overlap/local availability are often
+      useful, but the best weighting is what evolution should discover
+
+    Success criterion:
+    - maximize the verified final code size
+    - the final fitness score is exactly the number of verified codewords
+
+    Rules:
+    - keep the same function signatures
+    - do not use randomness
+    - do not import extra libraries
+    - do not read or write files
+    - do not reimplement the greedy search or legality checks
+    - return a finite float
+
+    Useful heuristic ideas:
+    - prioritize candidates that add few new forbidden centers
+    - prefer candidates whose forbidden radius overlaps existing forbidden space
+    - preserve local availability so the greedy process leaves fewer holes
+    - use Hamming-weight, balance, bit-run, parity, complement, and hash features
+      only as secondary tie-breakers
+    - avoid ranking too many words with exactly the same score
+  num_top_programs: 5
+  num_diverse_programs: 3
+  include_artifacts: false
+  max_artifact_bytes: 10240
+
+database:
+  population_size: 128
+  archive_size: 48
+  num_islands: 16
+  elite_selection_ratio: 0.2
+  exploration_ratio: 0.45
+  exploitation_ratio: 0.35
+  feature_dimensions: ["code_size", "minimum_distance"]
+  feature_bins: 6
+  migration_interval: 4
+  migration_rate: 0.25
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 600
+  max_retries: 1
+  cascade_evaluation: false
+  parallel_evaluations: 16
+  use_llm_feedback: false
+  enable_artifacts: true
+
+early_stopping_patience: -1
+convergence_threshold: 1.0
+early_stopping_metric: "combined_score"

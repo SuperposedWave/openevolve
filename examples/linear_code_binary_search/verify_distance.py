@@ -1,45 +1,53 @@
-"""Verify the actual minimum distance reached by a priority program."""
+"""Verify the actual minimum distance reached by a C priority program."""
 
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 
-from search_core import (
-    actual_minimum_distance,
-    best_restart_for_instance,
-    generator_matrix_rows,
-    instance_from_env,
-    make_instance,
-    load_priority_function,
-    parity_check_matrix_rows,
-)
+from evaluator import evaluate
+from search_core import actual_minimum_distance, instance_from_env, make_instance
+
+
+@contextmanager
+def patched_env(updates: dict[str, str]):
+    previous = {key: os.environ.get(key) for key in updates}
+    os.environ.update(updates)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Construct H from a priority program and report the actual minimum distance."
+        description="Run the C kernel and report the actual minimum distance."
     )
     parser.add_argument(
         "program_path",
         nargs="?",
-        default="initial_program.py",
-        help="Path to a Python file that defines priority(column_mask, n, k, d).",
+        default="initial_program.c",
+        help="Path to a C file that defines oe_linear_code_priority().",
     )
     parser.add_argument(
         "--no-progress",
         action="store_true",
-        help="Disable progress bars.",
+        help="Accepted for compatibility; the C verifier does not show progress bars.",
     )
     parser.add_argument("--N", type=int, dest="n", help="Code length n.")
     parser.add_argument("--K", type=int, dest="k", help="Code dimension k.")
     parser.add_argument("--D", type=int, dest="d", help="Target minimum distance d.")
-    parser.add_argument("--restarts", type=int, help="Number of randomized restarts.")
+    parser.add_argument("--restarts", type=int, help="Number of C-kernel restarts.")
     args = parser.parse_args()
 
     program_path = Path(args.program_path).resolve()
-    priority_fn = load_priority_function(str(program_path))
     env_instance = instance_from_env()
     instance = make_instance(
         n=args.n if args.n is not None else env_instance.n,
@@ -47,15 +55,24 @@ def main() -> None:
         distance=args.d if args.d is not None else env_instance.target_distance,
         restarts=args.restarts if args.restarts is not None else env_instance.restarts,
     )
-    attempt = best_restart_for_instance(
-        instance,
-        priority_fn,
-        show_progress=not args.no_progress,
-    )
-    d_actual = actual_minimum_distance(instance.r, attempt.selected_free_columns)
-    matrix_rows = parity_check_matrix_rows(instance.r, attempt.selected_free_columns)
-    generator_rows = generator_matrix_rows(instance.r, attempt.selected_free_columns)
-    is_complete = attempt.added_free_columns == instance.k
+    env = {
+        "LINEAR_CODE_N": str(instance.n),
+        "LINEAR_CODE_K": str(instance.k),
+        "LINEAR_CODE_D": str(instance.target_distance),
+        "LINEAR_CODE_RESTARTS": str(instance.restarts),
+    }
+
+    with patched_env(env):
+        result = evaluate(str(program_path))
+
+    search_result = json.loads(result.artifacts.get("search_result", "{}"))
+    selected_bits = search_result.get("selected_free_columns", [])
+    selected = tuple(int(bits, 2) for bits in selected_bits)
+    added_free_columns = int(search_result.get("added_free_columns", len(selected)))
+    d_actual = actual_minimum_distance(instance.r, selected)
+    matrix_rows = json.loads(result.artifacts.get("parity_check_matrix", "[]"))
+    generator_rows = json.loads(result.artifacts.get("generator_matrix", "[]"))
+    is_complete = added_free_columns == instance.k
 
     print(f"program_path: {program_path}")
     print(
@@ -75,13 +92,11 @@ def main() -> None:
         "construction:",
         json.dumps(
             {
-                "success": attempt.success,
-                "added_free_columns": attempt.added_free_columns,
-                "remaining_free_columns": instance.k - attempt.added_free_columns,
-                "selected_free_columns": [
-                    format(column_mask, f"0{instance.r}b")
-                    for column_mask in attempt.selected_free_columns
-                ],
+                "success": bool(search_result.get("success", False)),
+                "search_mode": search_result.get("search_mode", "c_kernel"),
+                "added_free_columns": added_free_columns,
+                "remaining_free_columns": instance.k - added_free_columns,
+                "selected_free_columns": selected_bits,
             },
             sort_keys=True,
         ),
@@ -92,11 +107,8 @@ def main() -> None:
         print(f"d_partial: {d_actual}")
         print("warning: construction is incomplete, so this distance only applies to the partial column set")
 
-    print(f"H shape: {instance.r} x {attempt.added_free_columns + instance.r}")
-    if is_complete:
-        print("H rows:")
-    else:
-        print("Partial H rows:")
+    print(f"H shape: {instance.r} x {added_free_columns + instance.r}")
+    print("H rows:" if is_complete else "Partial H rows:")
     for row in matrix_rows:
         print(row)
 
@@ -104,7 +116,7 @@ def main() -> None:
         print(f"G shape: {instance.k} x {instance.n}")
         print("G rows:")
     else:
-        print(f"Partial G shape: {attempt.added_free_columns} x {attempt.added_free_columns + instance.r}")
+        print(f"Partial G shape: {added_free_columns} x {added_free_columns + instance.r}")
         print("Partial G rows:")
     for row in generator_rows:
         print(row)

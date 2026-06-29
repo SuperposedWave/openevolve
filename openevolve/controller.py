@@ -25,6 +25,20 @@ from openevolve.utils.format_utils import format_improvement_safe, format_metric
 logger = logging.getLogger(__name__)
 
 
+class BestSolutionConsoleFormatter(logging.Formatter):
+    """Highlight new-best notifications in console output."""
+
+    GREEN = "\033[92m"
+    RESET = "\033[0m"
+    NEW_BEST_MARKER = "New best solution found"
+
+    def format(self, record: logging.LogRecord) -> str:
+        formatted = super().format(record)
+        if self.NEW_BEST_MARKER in record.getMessage():
+            return f"{self.GREEN}{formatted}{self.RESET}"
+        return formatted
+
+
 def _format_metrics(metrics: Dict[str, Any]) -> str:
     """Safely format metrics, handling both numeric and string values"""
     formatted_parts = []
@@ -207,7 +221,9 @@ class OpenEvolve:
 
         # Add console handler
         console_handler = logging.StreamHandler()
-        console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        console_handler.setFormatter(
+            BestSolutionConsoleFormatter("%(asctime)s - %(levelname)s - %(message)s")
+        )
         root_logger.addHandler(console_handler)
 
         logger.info(f"Logging to {log_file}")

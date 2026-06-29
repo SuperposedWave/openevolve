@@ -78,6 +78,7 @@ class LLMModelConfig:
 
     # Reasoning parameters
     reasoning_effort: Optional[str] = None
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
 
     # Manual mode (human-in-the-loop)
     manual_mode: Optional[bool] = None
@@ -120,6 +121,7 @@ class LLMConfig(LLMModelConfig):
 
     # Reasoning parameters (inherited from LLMModelConfig but can be overridden)
     reasoning_effort: Optional[str] = None
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
 
     # Manual mode switch
     manual_mode: bool = False
@@ -178,6 +180,7 @@ class LLMConfig(LLMModelConfig):
             "retry_delay": self.retry_delay,
             "random_seed": self.random_seed,
             "reasoning_effort": self.reasoning_effort,
+            "chat_template_kwargs": self.chat_template_kwargs,
             "manual_mode": self.manual_mode,
         }
         self.update_model_params(shared_config)
@@ -232,6 +235,7 @@ class LLMConfig(LLMModelConfig):
             "retry_delay": self.retry_delay,
             "random_seed": self.random_seed,
             "reasoning_effort": self.reasoning_effort,
+            "chat_template_kwargs": self.chat_template_kwargs,
         }
         self.update_model_params(shared_config)
 
@@ -409,8 +413,10 @@ class Config:
     random_seed: Optional[int] = 42
     language: str = None
     file_suffix: str = ".py"
+    environment: Dict[str, str] = field(default_factory=dict)
 
     # Component configurations
+    llm_config_path: Optional[str] = None
     llm: LLMConfig = field(default_factory=LLMConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
@@ -436,6 +442,7 @@ class Config:
         config_path = Path(path).resolve()
         with open(config_path, "r") as f:
             config_dict = yaml.safe_load(f)
+        cls._load_external_llm_config(config_dict, config_path)
         config = cls.from_dict(config_dict)
 
         # Resolve template_dir relative to config file location
@@ -445,6 +452,33 @@ class Config:
                 config.prompt.template_dir = str((config_path.parent / template_path).resolve())
 
         return config
+
+    @staticmethod
+    def _load_external_llm_config(config_dict: Dict[str, Any], config_path: Path) -> None:
+        """Merge llm settings from an optional external YAML file."""
+        llm_config_path = config_dict.get("llm_config_path")
+        if not llm_config_path:
+            return
+
+        external_path = Path(str(llm_config_path)).expanduser()
+        if not external_path.is_absolute():
+            external_path = config_path.parent / external_path
+        external_path = external_path.resolve()
+
+        with open(external_path, "r") as f:
+            external_dict = yaml.safe_load(f) or {}
+
+        external_llm = external_dict.get("llm", external_dict)
+        if not isinstance(external_llm, dict):
+            raise ValueError(f"External LLM config must be a mapping: {external_path}")
+
+        inline_llm = config_dict.get("llm") or {}
+        if not isinstance(inline_llm, dict):
+            raise ValueError("Inline llm config must be a mapping")
+
+        merged_llm = dict(external_llm)
+        merged_llm.update(inline_llm)
+        config_dict["llm"] = merged_llm
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "Config":
@@ -503,6 +537,9 @@ def load_config(config_path: Optional[Union[str, Path]] = None) -> Config:
         api_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
 
         config.llm.update_model_params({"api_key": api_key, "api_base": api_base})
+
+    for key, value in config.environment.items():
+        os.environ[str(key)] = str(value)
 
     # Make the system message available to the individual models, in case it is not provided from the prompt sampler
     config.llm.update_model_params({"system_message": config.prompt.system_message})

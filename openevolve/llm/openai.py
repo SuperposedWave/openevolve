@@ -63,6 +63,7 @@ class OpenAILLM(LLMInterface):
         self.api_key = model_cfg.api_key
         self.random_seed = getattr(model_cfg, "random_seed", None)
         self.reasoning_effort = getattr(model_cfg, "reasoning_effort", None)
+        self.chat_template_kwargs = getattr(model_cfg, "chat_template_kwargs", None)
 
         # Manual mode: enabled via llm.manual_mode in config.yaml
         self.manual_mode = (getattr(model_cfg, "manual_mode", False) is True)
@@ -164,6 +165,11 @@ class OpenAILLM(LLMInterface):
             if reasoning_effort is not None:
                 params["reasoning_effort"] = reasoning_effort
 
+        chat_template_kwargs = kwargs.get("chat_template_kwargs", self.chat_template_kwargs)
+        if chat_template_kwargs is not None:
+            extra_body = params.setdefault("extra_body", {})
+            extra_body["chat_template_kwargs"] = chat_template_kwargs
+
         # Add seed parameter for reproducibility if configured
         # Skip seed parameter for Google AI Studio endpoint as it doesn't support it
         # Seed only makes sense for actual API calls
@@ -252,6 +258,7 @@ class OpenAILLM(LLMInterface):
                 "temperature": params.get("temperature"),
                 "top_p": params.get("top_p"),
                 "reasoning_effort": params.get("reasoning_effort"),
+                "chat_template_kwargs": params.get("extra_body", {}).get("chat_template_kwargs"),
                 "verbosity": params.get("verbosity"),
             },
         }

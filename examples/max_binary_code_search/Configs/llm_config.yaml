@@ -1,0 +1,45 @@
+# LLM configuration for binary maximum-code search.
+
+llm:
+  # api_base: "https://api.deepseek.com/v1"
+  # api_base: "https://o8kjqm58o8ogcm5ek8aggddkb5ggk8dp.openapi-sj.sii.edu.cn/v1"
+  api_base: "https://cbpecq8oomh5cpbbk9gm5ck85cbpoaoe.openapi-sj.sii.edu.cn/v1"
+  api_key: "stpmj/4hRawPjQCf0fk70W6HnObgXtkonX3qHCCNsPc="
+  models:
+    - name: "glm5.1-w4a8-4maas"
+      weight: 1.0
+  temperature: 0.7
+  max_tokens: 32768
+  timeout: 3600
+  chat_template_kwargs:
+    enable_thinking: false
+
+# llm:
+#   # api_base: "https://api.deepseek.com/v1"
+#   # api_base: "https://o8kjqm58o8ogcm5ek8aggddkb5ggk8dp.openapi-sj.sii.edu.cn/v1"
+#   api_base: "https://o8kjqm58o8ogcm5ek8aggddkb5ggk8dp.openapi-sj.sii.edu.cn/v1"
+#   api_key: "MajUa5noC1OtfZ3RxznY23AZYWYisTPGc4MKZJyXB9Q="
+#   models:
+#     - name: "ds-v4-pro"
+#       weight: 1.0
+#   temperature: 0.7
+#   max_tokens: 32768
+#   timeout: 3600
+#   chat_template_kwargs:
+#     enable_thinking: false
+
+
+# llm:
+#   api_base: "https://api.deepseek.com/v1"
+#   # api_base: "https://o8kjqm58o8ogcm5ek8aggddkb5ggk8dp.openapi-sj.sii.edu.cn/v1"
+#   # api_base: "https://o8kjqm58o8ogcm5ek8aggddkb5ggk8dp.openapi-sj.sii.edu.cn/v1"
+#   api_key: "sk-c5bcdfcbc67a4652a00b0111a44ec52a"
+#   models:
+#     - name: "deepseek-v4-pro"
+#       weight: 1.0
+#   temperature: 0.7
+#   max_tokens: 32768
+#   timeout: 3600
+#   chat_template_kwargs:
+#     enable_thinking: true
+

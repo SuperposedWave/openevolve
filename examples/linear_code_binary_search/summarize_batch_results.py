@@ -13,9 +13,10 @@ from openpyxl.styles import Alignment, Font, PatternFill
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_SUMMARY = SCRIPT_DIR / "batch_runs" / "summary.jsonl"
-DEFAULT_MD = SCRIPT_DIR / "batch_runs" / "experiment_summary.md"
-DEFAULT_XLSX = SCRIPT_DIR / "batch_runs" / "experiment_summary.xlsx"
+DEFAULT_SUMMARY_DIR = SCRIPT_DIR / "outputs" / "_summaries" / "latest"
+DEFAULT_SUMMARY = DEFAULT_SUMMARY_DIR / "summary.jsonl"
+DEFAULT_MD = DEFAULT_SUMMARY_DIR / "experiment_summary.md"
+DEFAULT_XLSX = DEFAULT_SUMMARY_DIR / "experiment_summary.xlsx"
 
 
 def parse_args() -> argparse.Namespace:

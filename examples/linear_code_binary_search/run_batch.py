@@ -20,11 +20,12 @@ from typing import Iterable, Sequence
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
 DEFAULT_RECORD = SCRIPT_DIR / "Misc" / "ECCRecord.json"
-DEFAULT_CONFIG = SCRIPT_DIR / "config.yaml"
-DEFAULT_OUTPUT_ROOT = SCRIPT_DIR / "batch_runs"
+DEFAULT_CONFIG = SCRIPT_DIR / "Configs" / "config_c_kernel.yaml"
+DEFAULT_OUTPUT_ROOT = SCRIPT_DIR / "outputs"
 TARGET_BLOCK_RE = re.compile(
     r"(?m)^    Current target:\n(?:^    - .*\n){4}"
 )
+LLM_CONFIG_PATH_RE = re.compile(r"(?m)^(llm_config_path:\s*)[\"']?([^\"'\n]+)[\"']?\s*$")
 
 
 @dataclass(frozen=True)
@@ -63,7 +64,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         default=str(DEFAULT_OUTPUT_ROOT),
-        help="Root directory where per-instance outputs are written.",
+        help="Root directory where outputs are written as n{n}_k{k}_d{d}/{run_name}.",
+    )
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help="Run-record folder name under each n/k/d directory. Defaults to batch_<UTC timestamp>.",
     )
     parser.add_argument(
         "--n-min",
@@ -155,7 +161,7 @@ def load_tasks_from_record(
     return tasks, skipped
 
 
-def render_resolved_config(base_config_text: str, task: SweepTask) -> str:
+def render_resolved_config(base_config_text: str, task: SweepTask, base_config_path: Path) -> str:
     """Inject the current target block into the base config prompt."""
     replacement = (
         f"    Current target:\n"
@@ -166,13 +172,21 @@ def render_resolved_config(base_config_text: str, task: SweepTask) -> str:
     )
     if not TARGET_BLOCK_RE.search(base_config_text):
         raise ValueError("Failed to find the 'Current target' block in the base config.")
-    return TARGET_BLOCK_RE.sub(replacement, base_config_text, count=1)
+    resolved_text = TARGET_BLOCK_RE.sub(replacement, base_config_text, count=1)
+
+    def resolve_llm_path(match: re.Match[str]) -> str:
+        llm_path = Path(match.group(2)).expanduser()
+        if not llm_path.is_absolute():
+            llm_path = (base_config_path.parent / llm_path).resolve()
+        return f'{match.group(1)}"{llm_path}"'
+
+    return LLM_CONFIG_PATH_RE.sub(resolve_llm_path, resolved_text, count=1)
 
 
 def write_resolved_config(base_config_path: Path, output_dir: Path, task: SweepTask) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     resolved_config = output_dir / "resolved_config.yaml"
-    resolved_config.write_text(render_resolved_config(base_config_path.read_text(), task))
+    resolved_config.write_text(render_resolved_config(base_config_path.read_text(), task, base_config_path))
     return resolved_config
 
 
@@ -212,11 +226,12 @@ def run_instance(
     task: SweepTask,
     base_config_path: Path,
     output_root: Path,
+    run_name: str,
     iterations: int,
     force: bool = False,
 ) -> dict:
     """Run OpenEvolve for one task and save verification artifacts."""
-    instance_dir = output_root / task.instance_name
+    instance_dir = output_root / task.instance_name / run_name
     if instance_dir.exists():
         if not force:
             return {
@@ -243,7 +258,7 @@ def run_instance(
     openevolve_cmd = [
         sys.executable,
         str(REPO_ROOT / "openevolve-run.py"),
-        "initial_program.py",
+        "initial_program.c",
         "evaluator.py",
         "--config",
         str(resolved_config_path),
@@ -286,7 +301,7 @@ def run_instance(
     }
     summary_row.update(extract_best_metrics(instance_dir))
 
-    best_program_path = instance_dir / "best" / "best_program.py"
+    best_program_path = instance_dir / "best" / "best_program.c"
     if best_program_path.exists():
         verify_cmd = [
             sys.executable,
@@ -335,6 +350,7 @@ def run_batch(
     record_path: Path,
     base_config_path: Path,
     output_root: Path,
+    run_name: str | None = None,
     n_min: int = 11,
     n_max: int = 40,
     d_field: str = "lower",
@@ -347,9 +363,13 @@ def run_batch(
         n_max=n_max,
         d_field=d_field,
     )
+    if run_name is None:
+        run_name = f"batch_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     output_root.mkdir(parents=True, exist_ok=True)
-    summary_jsonl = output_root / "summary.jsonl"
-    summary_csv = output_root / "summary.csv"
+    summary_dir = output_root / "_summaries" / run_name
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    summary_jsonl = summary_dir / "summary.jsonl"
+    summary_csv = summary_dir / "summary.csv"
     if force and summary_jsonl.exists():
         summary_jsonl.unlink()
 
@@ -375,6 +395,7 @@ def run_batch(
             task,
             base_config_path=base_config_path,
             output_root=output_root,
+            run_name=run_name,
             iterations=iterations,
             force=force,
         )
@@ -395,6 +416,7 @@ def main() -> None:
         record_path=Path(args.record).resolve(),
         base_config_path=Path(args.config).resolve(),
         output_root=Path(args.output_root).resolve(),
+        run_name=args.run_name,
         n_min=args.n_min,
         n_max=args.n_max,
         d_field=args.d_field,

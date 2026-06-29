@@ -1,0 +1,126 @@
+# Configuration for evolving only the C priority function for binary linear-code construction.
+# Example:
+#   LINEAR_CODE_N=38 LINEAR_CODE_K=23 LINEAR_CODE_D=7 \
+#   openevolve-run examples/linear_code_binary_search/initial_program.c \
+#   examples/linear_code_binary_search/evaluator.py \
+#   --config examples/linear_code_binary_search/Configs/config_c_kernel_large.yaml
+
+max_iterations: 200
+checkpoint_interval: 10
+log_level: "INFO"
+random_seed: 123
+
+language: "c"
+file_suffix: ".c"
+diff_based_evolution: true
+max_code_length: 30000
+
+llm_config_path: "llm_config.yaml"
+
+prompt:
+  system_message: |
+    Current target:
+    - n = 38
+    - k = 23
+    - d = 7
+    - r = n - k = 15
+
+    You are improving a deterministic C scoring function for binary linear-code construction.
+    Your file provides this function:
+
+      double oe_linear_code_priority(
+          unsigned long long column_mask,
+          int n,
+          int k,
+          int d,
+          int step,
+          int column_weight,
+          unsigned long long forbidden_count,
+          unsigned long long new_forbidden_count,
+          unsigned long long overlap_forbidden_count
+      );
+
+    The search constructs H = [P^T | I_r], where P^T has k free binary columns.
+    The fixed evaluator:
+    - enumerates all legal-weight candidate free columns
+    - calls oe_linear_code_priority once per candidate with no dynamic state to
+      build a static ordering
+    - builds the matrix using exact legality checks
+    - before each accepted column, considers high-ranked legal candidates,
+      computes exact dynamic features, calls oe_linear_code_priority again, and
+      accepts the best reranked candidate
+    - when construction stalls, may run a fixed local repair procedure; generated
+      code still only scores candidate columns
+
+    Dynamic arguments:
+    - step: number of free columns already selected
+    - column_weight: Hamming weight of column_mask
+    - forbidden_count: current size of the exact forbidden set
+    - new_forbidden_count: number of newly forbidden masks if this column is accepted
+    - overlap_forbidden_count: generated forbidden masks that were already forbidden
+
+    You may change only the code inside:
+
+      /* # EVOLVE-BLOCK-START */
+      ...
+      /* # EVOLVE-BLOCK-END */
+
+    That block is the body of oe_linear_code_priority(). The evaluator rejects
+    C files whose code outside this block differs from the baseline priority file.
+
+    Hard rules:
+    - keep oe_linear_code_priority with exactly this name and signature
+    - do not change code outside the EVOLVE-BLOCK
+    - do not define main()
+    - do not read or write files
+    - do not start processes
+    - do not use networking
+    - do not rely on stdout or stdin
+    - keep scoring deterministic and side-effect free
+    - use only the function arguments and local arithmetic
+    - return a finite double score
+
+    Useful heuristic ideas:
+    - prefer legal columns with low new_forbidden_count when that preserves future options
+    - reward high overlap_forbidden_count because it reuses already-forbidden space
+    - adapt weights by step: early choices may need more diversity, later choices may need low damage
+    - avoid columns that are too sparse or too dense
+    - prefer balanced support across the r row positions
+    - reward bit patterns that look structurally useful but not overly repetitive
+    - prefer columns that are likely to remain compatible with many other columns later
+
+    Scoring guidance:
+    - Avoid coarse bucket scores. Do not rank candidates only by a few low-cardinality features
+      such as weight, symmetry, or run count.
+    - Return a fine-grained finite double score. Distinct column_mask values should almost never
+      receive exactly the same score.
+    - Keep the function deterministic, side-effect free, and based only on local arithmetic.
+  num_top_programs: 5
+  num_diverse_programs: 3
+  include_artifacts: false
+  max_artifact_bytes: 10240
+
+database:
+  population_size: 128
+  archive_size: 48
+  num_islands: 36
+  elite_selection_ratio: 0.2
+  exploration_ratio: 0.45
+  exploitation_ratio: 0.35
+  feature_dimensions: ["avg_progress", "constructed_columns"]
+  feature_bins: 6
+  migration_interval: 4
+  migration_rate: 0.25
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 2400
+  max_retries: 1
+  cascade_evaluation: false
+  parallel_evaluations: 4
+  use_llm_feedback: false
+  enable_artifacts: true
+
+early_stopping_patience: -1
+convergence_threshold: 1.0
+early_stopping_metric: "combined_score"
