@@ -396,10 +396,16 @@ def _success_artifacts(
         "added_free_columns": constructed_columns,
         "candidate_count": int(metrics[METRIC_CANDIDATE_COUNT]),
         "sample_attempts": int(metrics[METRIC_SAMPLE_ATTEMPTS]),
-        "sampled_candidates": 0,
+        "max_candidates": _env_int("LINEAR_CODE_MAX_CANDIDATES", 1_000_000_000),
+        "sampled_candidates": (
+            int(metrics[METRIC_SCORED_CANDIDATES])
+            if int(metrics[METRIC_SCORED_CANDIDATES]) < int(metrics[METRIC_CANDIDATE_COUNT])
+            else 0
+        ),
         "scored_candidates": int(metrics[METRIC_SCORED_CANDIDATES]),
         "backtrack_events": int(metrics[METRIC_BACKTRACK_EVENTS]),
         "repair_mode": os.environ.get("LINEAR_CODE_REPAIR_MODE", "greedy"),
+        "dynamic_growth_estimate": os.environ.get("LINEAR_CODE_DYNAMIC_GROWTH_ESTIMATE", "1"),
         "repair_mcts_simulations": _env_int("LINEAR_CODE_REPAIR_MCTS_SIMULATIONS", 64),
         "repair_mcts_depth": _env_int("LINEAR_CODE_REPAIR_MCTS_DEPTH", 4),
         "blocked_candidates": int(metrics[METRIC_BLOCKED_CANDIDATES]),

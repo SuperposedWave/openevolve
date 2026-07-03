@@ -66,6 +66,15 @@ typedef struct {
     uint64_t forbidden_count_value;
 } RepairReward;
 
+typedef struct {
+    uint64_t *bits;
+    uint64_t *touched_values;
+    uint64_t touched_count;
+    uint64_t touched_cap;
+    uint64_t word_count;
+    int overflowed;
+} ScratchSet;
+
 extern double oe_linear_code_priority(
     uint64_t column_mask,
     int n,
@@ -126,6 +135,65 @@ static int set_bit_if_new(uint64_t *bits, uint64_t value) {
         return 0;
     }
     bits[word_index] |= bit;
+    return 1;
+}
+
+static int init_scratch_set(ScratchSet *scratch, uint64_t word_count, uint64_t touched_cap) {
+    memset(scratch, 0, sizeof(*scratch));
+    scratch->word_count = word_count;
+    scratch->touched_cap = touched_cap;
+    scratch->bits = (uint64_t *)calloc((size_t)word_count, sizeof(uint64_t));
+    if (!scratch->bits) {
+        return 0;
+    }
+    if (touched_cap > 0ULL) {
+        scratch->touched_values = (uint64_t *)calloc((size_t)touched_cap, sizeof(uint64_t));
+        if (!scratch->touched_values) {
+            free(scratch->bits);
+            memset(scratch, 0, sizeof(*scratch));
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void clear_scratch_set(ScratchSet *scratch) {
+    if (!scratch || !scratch->bits) {
+        return;
+    }
+    if (scratch->overflowed) {
+        memset(scratch->bits, 0, (size_t)scratch->word_count * sizeof(uint64_t));
+    } else {
+        for (uint64_t i = 0; i < scratch->touched_count; i++) {
+            uint64_t value = scratch->touched_values[i];
+            scratch->bits[value >> 6] &= ~(1ULL << (value & 63U));
+        }
+    }
+    scratch->touched_count = 0;
+    scratch->overflowed = 0;
+}
+
+static void free_scratch_set(ScratchSet *scratch) {
+    if (!scratch) {
+        return;
+    }
+    free(scratch->bits);
+    free(scratch->touched_values);
+    memset(scratch, 0, sizeof(*scratch));
+}
+
+static int scratch_set_if_new(ScratchSet *scratch, uint64_t value) {
+    uint64_t word_index = value >> 6;
+    uint64_t bit = 1ULL << (value & 63U);
+    if (scratch->bits[word_index] & bit) {
+        return 0;
+    }
+    scratch->bits[word_index] |= bit;
+    if (!scratch->overflowed && scratch->touched_count < scratch->touched_cap) {
+        scratch->touched_values[scratch->touched_count++] = value;
+    } else {
+        scratch->overflowed = 1;
+    }
     return 1;
 }
 
@@ -307,17 +375,11 @@ static uint64_t generated_values_for_add(DenseState *state) {
 static uint64_t estimate_forbidden_growth(
     DenseState *state,
     uint64_t column_mask,
-    uint32_t *scratch_marks,
-    uint32_t *scratch_epoch
+    ScratchSet *scratch
 ) {
     uint64_t new_count = 0;
     if (state->max_subset_size <= 0) {
         return 0;
-    }
-    uint32_t epoch = ++(*scratch_epoch);
-    if (epoch == 0U) {
-        memset(scratch_marks, 0, (size_t)state->value_count * sizeof(uint32_t));
-        epoch = ++(*scratch_epoch);
     }
     for (int subset_size = state->max_subset_size; subset_size >= 1; subset_size--) {
         uint64_t *previous = state->layers[subset_size - 1];
@@ -338,15 +400,15 @@ static uint64_t estimate_forbidden_growth(
                 uint64_t new_value = value ^ column_mask;
                 if (
                     !get_bit(state->forbidden_union, new_value)
-                    && scratch_marks[new_value] != epoch
+                    && scratch_set_if_new(scratch, new_value)
                 ) {
-                    scratch_marks[new_value] = epoch;
                     new_count++;
                 }
                 bits &= bits - 1ULL;
             }
         }
     }
+    clear_scratch_set(scratch);
     return new_count;
 }
 
@@ -415,11 +477,22 @@ static uint64_t candidate_count_for_instance(int r, int d) {
             return UINT64_MAX;
         }
         count += layer_count;
-        if (count > BASELINE_MAX_CANDIDATES) {
-            return count;
-        }
     }
     return count;
+}
+
+static uint64_t next_power_of_two_u64(uint64_t value) {
+    if (value <= 1ULL) {
+        return 1ULL;
+    }
+    value--;
+    value |= value >> 1;
+    value |= value >> 2;
+    value |= value >> 4;
+    value |= value >> 8;
+    value |= value >> 16;
+    value |= value >> 32;
+    return value + 1ULL;
 }
 
 static uint64_t next_combination(uint64_t mask) {
@@ -446,6 +519,104 @@ static uint64_t generate_candidate_masks(Candidate *candidates, int r, int d) {
             mask = next_combination(mask);
         }
     }
+    return index;
+}
+
+static int insert_seen_mask(uint64_t *seen, uint64_t seen_cap, uint64_t mask) {
+    uint64_t index = mix64(mask) & (seen_cap - 1ULL);
+    while (seen[index] != 0ULL) {
+        if (seen[index] == mask) {
+            return 0;
+        }
+        index = (index + 1ULL) & (seen_cap - 1ULL);
+    }
+    seen[index] = mask;
+    return 1;
+}
+
+static int choose_sample_weight(int r, int d, uint64_t total_count, uint64_t *rng_state) {
+    int min_weight = d - 1;
+    if (min_weight < 1) {
+        min_weight = 1;
+    }
+    uint64_t rank = rng_next(rng_state) % total_count;
+    for (int weight = min_weight; weight <= r; weight++) {
+        uint64_t layer_count = binomial_u64(r, weight);
+        if (rank < layer_count) {
+            return weight;
+        }
+        rank -= layer_count;
+    }
+    return r;
+}
+
+static uint64_t random_mask_with_weight(int r, int weight, uint64_t *rng_state) {
+    uint64_t mask = 0ULL;
+    int chosen = 0;
+    while (chosen < weight) {
+        int bit_index = (int)(rng_next(rng_state) % (uint64_t)r);
+        uint64_t bit = 1ULL << bit_index;
+        if ((mask & bit) == 0ULL) {
+            mask |= bit;
+            chosen++;
+        }
+    }
+    return mask;
+}
+
+static uint64_t generate_sampled_candidate_masks(
+    Candidate *candidates,
+    uint64_t sample_count,
+    uint64_t total_count,
+    int r,
+    int d,
+    uint64_t seed
+) {
+    uint64_t seen_cap = next_power_of_two_u64(sample_count * 4ULL);
+    if (seen_cap < 16ULL) {
+        seen_cap = 16ULL;
+    }
+    if (seen_cap < sample_count) {
+        return 0ULL;
+    }
+    uint64_t *seen = (uint64_t *)calloc((size_t)seen_cap, sizeof(uint64_t));
+    if (!seen) {
+        return 0ULL;
+    }
+
+    uint64_t rng_state = mix64(seed ^ ((uint64_t)r << 32) ^ ((uint64_t)d << 16) ^ sample_count);
+    uint64_t index = 0;
+    uint64_t attempts = 0;
+    uint64_t max_attempts = sample_count * 64ULL + 1024ULL;
+    while (index < sample_count && attempts < max_attempts) {
+        attempts++;
+        int weight = choose_sample_weight(r, d, total_count, &rng_state);
+        uint64_t mask = random_mask_with_weight(r, weight, &rng_state);
+        if (mask != 0ULL && insert_seen_mask(seen, seen_cap, mask)) {
+            candidates[index].mask = mask;
+            index++;
+        }
+    }
+
+    if (index < sample_count) {
+        uint64_t limit = 1ULL << r;
+        int min_weight = d - 1;
+        if (min_weight < 1) {
+            min_weight = 1;
+        }
+        for (int weight = min_weight; weight <= r && index < sample_count; weight++) {
+            uint64_t mask = (1ULL << weight) - 1ULL;
+            while (mask && mask < limit && index < sample_count) {
+                if (insert_seen_mask(seen, seen_cap, mask)) {
+                    candidates[index].mask = mask;
+                    index++;
+                }
+                mask = next_combination(mask);
+            }
+        }
+    }
+
+    free(seen);
     return index;
 }
 
@@ -542,8 +713,8 @@ static int choose_dynamic_candidate(
     uint64_t window_size,
     const uint64_t *tabu_masks,
     int tabu_count,
-    uint32_t *scratch_marks,
-    uint32_t *scratch_epoch,
+    ScratchSet *scratch,
+    int estimate_growth,
     uint64_t *selected_mask,
     uint64_t *selected_growth,
     uint64_t *blocked_out,
@@ -555,7 +726,7 @@ static int choose_dynamic_candidate(
     uint64_t best_growth = 0;
     int found = 0;
     uint64_t legal_seen = 0;
-    uint64_t generated_count = generated_values_for_add(state);
+    uint64_t generated_count = estimate_growth ? generated_values_for_add(state) : 0ULL;
 
     for (uint64_t i = 0; i < candidate_count; i++) {
         uint64_t mask = candidates[i].mask;
@@ -566,13 +737,8 @@ static int choose_dynamic_candidate(
             (*blocked_out)++;
             continue;
         }
-        uint64_t growth = estimate_forbidden_growth(
-            state,
-            mask,
-            scratch_marks,
-            scratch_epoch
-        );
-        uint64_t overlap = generated_count > growth ? generated_count - growth : 0;
+        uint64_t growth = estimate_growth ? estimate_forbidden_growth(state, mask, scratch) : 0ULL;
+        uint64_t overlap = estimate_growth && generated_count > growth ? generated_count - growth : 0;
         double dynamic_score = oe_linear_code_priority(
             mask,
             n,
@@ -787,6 +953,7 @@ static int rollout_after_first_drop(
     uint64_t rollout_depth,
     const uint64_t *tabu_masks,
     int tabu_count,
+    int estimate_growth,
     RepairReward *reward_out,
     uint64_t *after_first_drop_forbidden_out,
     uint64_t *dynamic_evaluations_out
@@ -824,14 +991,15 @@ static int rollout_after_first_drop(
     uint64_t current_forbidden_count = first_drop_forbidden_count;
     trial_tabu[trial_tabu_count++] = selected[first_drop_index];
 
-    uint32_t *scratch_marks = (uint32_t *)calloc((size_t)trial_state.value_count, sizeof(uint32_t));
-    if (!scratch_marks) {
+    ScratchSet scratch;
+    memset(&scratch, 0, sizeof(scratch));
+    uint64_t scratch_touched_cap = env_u64("LINEAR_CODE_GROWTH_SCRATCH_TOUCHED_CAP", 1048576ULL);
+    if (estimate_growth && !init_scratch_set(&scratch, trial_state.word_count, scratch_touched_cap)) {
         free_state(&trial_state);
         free(trial_selected);
         free(trial_tabu);
         return 0;
     }
-    uint32_t scratch_epoch = 0;
     uint64_t rng_state = mix64(
         seed
         ^ ((uint64_t)restart << 32)
@@ -860,15 +1028,19 @@ static int rollout_after_first_drop(
             dynamic_window,
             trial_tabu,
             trial_tabu_count,
-            scratch_marks,
-            &scratch_epoch,
+            &scratch,
+            estimate_growth,
             &mask,
             &growth,
             &blocked,
             &evals
         )) {
             add_column(&trial_state, mask);
-            current_forbidden_count += growth;
+            if (estimate_growth) {
+                current_forbidden_count += growth;
+            } else {
+                current_forbidden_count = forbidden_count(&trial_state);
+            }
             trial_selected[trial_count++] = mask;
             dynamic_evaluations += evals;
             steps++;
@@ -905,7 +1077,7 @@ static int rollout_after_first_drop(
     *after_first_drop_forbidden_out = first_drop_forbidden_count;
     *dynamic_evaluations_out = dynamic_evaluations;
 
-    free(scratch_marks);
+    free_scratch_set(&scratch);
     free_state(&trial_state);
     free(trial_selected);
     free(trial_tabu);
@@ -928,6 +1100,7 @@ static int choose_repair_drop_index_mcts(
     uint64_t simulations,
     const uint64_t *tabu_masks,
     int tabu_count,
+    int estimate_growth,
     int *drop_index_out,
     uint64_t *after_forbidden_count_out,
     uint64_t *dynamic_evaluations_out
@@ -962,6 +1135,7 @@ static int choose_repair_drop_index_mcts(
             rollout_depth,
             tabu_masks,
             tabu_count,
+            estimate_growth,
             &reward,
             &after_forbidden,
             &evals
@@ -1026,9 +1200,20 @@ int oe_linear_code_run(
         restarts = 1;
     }
 
-    uint64_t candidate_count = candidate_count_for_instance(r, d);
-    if (candidate_count > BASELINE_MAX_CANDIDATES) {
+    uint64_t total_candidate_count = candidate_count_for_instance(r, d);
+    uint64_t max_candidates = env_u64("LINEAR_CODE_MAX_CANDIDATES", BASELINE_MAX_CANDIDATES);
+    uint64_t candidate_count = total_candidate_count;
+    int use_sampled_candidates = 0;
+    if (max_candidates > 0ULL && candidate_count > max_candidates) {
+        candidate_count = max_candidates;
+        use_sampled_candidates = 1;
+    }
+    if (!use_sampled_candidates && candidate_count > BASELINE_MAX_CANDIDATES) {
         write_error(error_out, error_cap, "too many candidates for baseline C kernel");
+        return -5;
+    }
+    if (candidate_count == 0ULL) {
+        write_error(error_out, error_cap, "empty candidate set");
         return -5;
     }
     Candidate *candidates = (Candidate *)calloc((size_t)candidate_count, sizeof(Candidate));
@@ -1038,7 +1223,9 @@ int oe_linear_code_run(
     }
 
     double stage_started_at = monotonic_seconds();
-    uint64_t generated_count = generate_candidate_masks(candidates, r, d);
+    uint64_t generated_count = use_sampled_candidates
+        ? generate_sampled_candidate_masks(candidates, candidate_count, total_candidate_count, r, d, seed)
+        : generate_candidate_masks(candidates, r, d);
     metrics_out[METRIC_CANDIDATE_GENERATION_SECONDS] = monotonic_seconds() - stage_started_at;
     if (generated_count != candidate_count) {
         free(candidates);
@@ -1085,6 +1272,7 @@ int oe_linear_code_run(
     int repair_mcts_enabled = env_equals("LINEAR_CODE_REPAIR_MODE", "mcts");
     uint64_t repair_mcts_simulations = env_u64("LINEAR_CODE_REPAIR_MCTS_SIMULATIONS", 64ULL);
     uint64_t repair_mcts_depth = env_u64("LINEAR_CODE_REPAIR_MCTS_DEPTH", 4ULL);
+    int estimate_dynamic_growth = !env_equals("LINEAR_CODE_DYNAMIC_GROWTH_ESTIMATE", "0");
     uint64_t repair_tabu_cap_u64 = repair_tabu_tenure;
     uint64_t max_reasonable_tabu = (uint64_t)k + repair_max_events * repair_drop_count + 1ULL;
     if (repair_tabu_cap_u64 > max_reasonable_tabu) {
@@ -1119,11 +1307,11 @@ int oe_linear_code_run(
             write_error(error_out, error_cap, "selection allocation failed");
             return -11;
         }
-        uint32_t *scratch_marks = NULL;
-        uint32_t scratch_epoch = 0;
-        if (dynamic_window > 0) {
-            scratch_marks = (uint32_t *)calloc((size_t)state.value_count, sizeof(uint32_t));
-            if (!scratch_marks) {
+        ScratchSet scratch;
+        memset(&scratch, 0, sizeof(scratch));
+        if (dynamic_window > 0 && estimate_dynamic_growth) {
+            uint64_t scratch_touched_cap = env_u64("LINEAR_CODE_GROWTH_SCRATCH_TOUCHED_CAP", 1048576ULL);
+            if (!init_scratch_set(&scratch, state.word_count, scratch_touched_cap)) {
                 free(current_selected);
                 free_state(&state);
                 free(candidates);
@@ -1139,7 +1327,7 @@ int oe_linear_code_run(
         if (dynamic_window > 0 && repair_max_events > 0 && tabu_capacity > 0) {
             tabu_masks = (uint64_t *)calloc((size_t)tabu_capacity, sizeof(uint64_t));
             if (!tabu_masks) {
-                free(scratch_marks);
+                free_scratch_set(&scratch);
                 free(current_selected);
                 free_state(&state);
                 free(candidates);
@@ -1171,8 +1359,8 @@ int oe_linear_code_run(
                     dynamic_window,
                     tabu_masks,
                     tabu_count,
-                    scratch_marks,
-                    &scratch_epoch,
+                    &scratch,
+                    estimate_dynamic_growth,
                     &mask,
                     &growth,
                     &blocked,
@@ -1214,6 +1402,7 @@ int oe_linear_code_run(
                                 repair_mcts_simulations,
                                 tabu_masks,
                                 tabu_count,
+                                estimate_dynamic_growth,
                                 &drop_index,
                                 &repaired_forbidden_count,
                                 &repair_dynamic_evaluations
@@ -1262,7 +1451,7 @@ int oe_linear_code_run(
                             current_count
                         )) {
                             free(tabu_masks);
-                            free(scratch_marks);
+                            free_scratch_set(&scratch);
                             free(current_selected);
                             free_state(&state);
                             free(candidates);
@@ -1283,7 +1472,11 @@ int oe_linear_code_run(
                     continue;
                 }
                 add_column(&state, mask);
-                current_forbidden_count += growth;
+                if (estimate_dynamic_growth) {
+                    current_forbidden_count += growth;
+                } else {
+                    current_forbidden_count = forbidden_count(&state);
+                }
                 current_selected[current_count++] = mask;
                 total_dynamic_evaluations += dynamic_evaluations;
                 if (current_count > best_count) {
@@ -1317,7 +1510,7 @@ int oe_linear_code_run(
             memcpy(best_selected, current_selected, (size_t)current_count * sizeof(uint64_t));
         }
         free(tabu_masks);
-        free(scratch_marks);
+        free_scratch_set(&scratch);
         free(current_selected);
         free_state(&state);
         if (best_count == k) {
@@ -1330,7 +1523,7 @@ int oe_linear_code_run(
     }
     metrics_out[METRIC_SUCCESS] = best_count == k ? 1.0 : 0.0;
     metrics_out[METRIC_CONSTRUCTED_COLUMNS] = (double)best_count;
-    metrics_out[METRIC_CANDIDATE_COUNT] = (double)candidate_count;
+    metrics_out[METRIC_CANDIDATE_COUNT] = (double)total_candidate_count;
     metrics_out[METRIC_SCORED_CANDIDATES] = (double)candidate_count;
     metrics_out[METRIC_SAMPLE_ATTEMPTS] = (double)total_dynamic_evaluations;
     metrics_out[METRIC_BACKTRACK_EVENTS] = (double)total_repair_events;
