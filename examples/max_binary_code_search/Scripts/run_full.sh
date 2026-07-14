@@ -88,7 +88,7 @@ def resolve_llm_path(match):
         llm_path = (template_path.parent / llm_path).resolve()
     return f'{match.group(1)}"{llm_path}"'
 
-resolved_text = llm_path_re.sub(resolve_llm_path, resolved_text, count=1)
+resolved_text = llm_path_re.sub(resolve_llm_path, resolved_text)
 resolved_path.write_text(resolved_text)
 PY
 

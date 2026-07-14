@@ -4,8 +4,7 @@ set -euo pipefail
 . /inspire/hdd/project/qproject-multireasoning/zhouzhixiang-240107010008/miniconda3/bin/activate
 conda activate openevolve
 cd /inspire/hdd/project/qproject-multireasoning/zhouzhixiang-240107010008/Project/openevolve-c-kernel
-
-export OPENAI_API_KEY=sk-c5bcdfcbc67a4652a00b0111a44ec52a
+. examples/linear_code_binary_search/Scripts/record_sqlite.sh
 
 # 码长 n。
 LINEAR_CODE_N=50
@@ -39,6 +38,8 @@ LINEAR_CODE_REPAIR_MCTS_DEPTH=3
 LINEAR_CODE_NATIVE_MAX_INITIAL_VALUES=2000000000000
 # 单次 C kernel 评估的超时时间，单位秒。
 LINEAR_CODE_C_RUN_TIMEOUT=2400
+# early stop 后的 OpenEvolve worker 关闭策略；terminate 会尽快停止评估进程，脚本仍会继续写 SQLite 记录。
+EARLY_STOPPING_SHUTDOWN_MODE=${EARLY_STOPPING_SHUTDOWN_MODE:-terminate}
 # OpenEvolve 总迭代次数。
 ITERATIONS=120
 
@@ -95,6 +96,9 @@ def resolve_llm_path(match):
 resolved_path.write_text(llm_path_re.sub(resolve_llm_path, resolved_text, count=1))
 PY
 
+linear_code_set_early_stopping_shutdown_mode "$RESOLVED_CONFIG" "$EARLY_STOPPING_SHUTDOWN_MODE"
+
+set +e
 LINEAR_CODE_PROFILE=1 \
 LINEAR_CODE_NATIVE_MAX_INITIAL_VALUES="$LINEAR_CODE_NATIVE_MAX_INITIAL_VALUES" \
 LINEAR_CODE_CANDIDATE_EXECUTOR=process \
@@ -119,3 +123,8 @@ python openevolve-run.py \
   --config "$RESOLVED_CONFIG" \
   --iterations "$ITERATIONS" \
   --output "$OUTPUT_DIR"
+openevolve_status=$?
+set -e
+
+linear_code_record_sqlite "$OUTPUT_DIR" "$OUTPUT_ROOT"
+exit "$openevolve_status"

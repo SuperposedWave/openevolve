@@ -68,12 +68,33 @@ The evaluator reads the target instance from environment variables:
 - optional: `MAX_CODE_PARITY_MAX_REFILLS`
 - optional: `MAX_CODE_PARITY_MAX_STALE_REFILLS`
 - optional: `MAX_CODE_LOCAL_SAMPLE_SIZE`
+- optional: `MAX_CODE_REPAIR_MODE`
+- optional: `MAX_CODE_REPAIR_EVENTS`
+- optional: `MAX_CODE_REPAIR_DROP_COUNT`
+- optional: `MAX_CODE_REPAIR_TABU_TENURE`
+- optional: `MAX_CODE_REPAIR_CANDIDATE_WINDOW`
+- optional: `MAX_CODE_REPAIR_MCTS_SIMULATIONS`
+- optional: `MAX_CODE_REPAIR_MCTS_DEPTH`
+- optional: `MAX_CODE_REPAIR_MCTS_DROP_TOPK`
 
 If unset, the default target is `A(17,4)` with four deterministic restarts.
 
 `MAX_CODE_MAX_CANDIDATES` defaults to `2^22` as a safety guard for the stage-one
 full-enumeration path. Later sampled/C-kernel stages should lift this limit by
 avoiding complete enumeration.
+
+Set `MAX_CODE_REPAIR_MODE=mcts` to enable bounded local MCTS repair. For `d = 4`,
+this runs inside the parity-transform center search. For non-`d=4` targets, it
+switches from static greedy to a dynamic-window greedy fill over the full ranked
+candidate list, then applies the same MCTS repair when no legal candidate remains
+in the dynamic window. Each root drop is evaluated with
+`MAX_CODE_REPAIR_MCTS_SIMULATIONS` rollouts, each limited by
+`MAX_CODE_REPAIR_MCTS_DEPTH`. The real search applies only the chosen drop, puts
+that word or center in a tabu queue, rebuilds the exact forbidden state, and
+resumes dynamic refill. Follow-up drops inside rollouts are sampled from the best
+`MAX_CODE_REPAIR_MCTS_DROP_TOPK` release choices; use `0` for uniform random
+follow-up drops. `search_result.repair_rollout_evaluations` records how many
+dynamic candidates were scored inside MCTS rollouts.
 
 ## Run
 

@@ -10,7 +10,8 @@ random_seed: 123
 diff_based_evolution: true
 max_code_length: 32768
 
-llm_config_path: "llm_config.yaml"
+# llm_config_path: "llm_config.yaml"
+llm_config_path: "llm_config_Boyue.yaml"
 
 environment:
   MAX_CODE_N: "17"
@@ -20,6 +21,14 @@ environment:
   MAX_CODE_PARITY_FULL_SCAN_N: "18"
   MAX_CODE_LOCAL_SAMPLE_SIZE: "64"
   MAX_CODE_RANDOM_SEED: "0"
+  MAX_CODE_REPAIR_MODE: "greedy"
+  MAX_CODE_REPAIR_EVENTS: "4"
+  MAX_CODE_REPAIR_DROP_COUNT: "1"
+  MAX_CODE_REPAIR_TABU_TENURE: "4"
+  MAX_CODE_REPAIR_CANDIDATE_WINDOW: "65536"
+  MAX_CODE_REPAIR_MCTS_SIMULATIONS: "64"
+  MAX_CODE_REPAIR_MCTS_DEPTH: "4"
+  MAX_CODE_REPAIR_MCTS_DROP_TOPK: "2"
 
 prompt:
   system_message: |
@@ -77,8 +86,12 @@ prompt:
       length-n codeword with minimum distance 4
     - the evaluator maintains legality exactly; your function only ranks legal
       candidate centers from sampled pools
-    - for non-parity targets, the evaluator first builds a greedy packing and
-      then tries deterministic hole-driven local repair
+    - when MAX_CODE_REPAIR_MODE=mcts, a stuck dynamic search runs bounded
+      local rollouts to choose which selected word or center to remove, then
+      rebuilds the exact forbidden state and continues dynamic refill
+    - for non-parity targets, MAX_CODE_REPAIR_MODE=mcts uses a dynamic-window
+      MCTS repair search; otherwise the evaluator preserves the static greedy
+      packing plus deterministic hole-driven local repair
     - destroy_priority ranks selected codewords for local removal; higher means
       the codeword looks more worth destroying during repair
     - repair_priority ranks local refill candidates after one or two codewords
@@ -138,3 +151,4 @@ evaluator:
 early_stopping_patience: -1
 convergence_threshold: 1.0
 early_stopping_metric: "combined_score"
+early_stopping_shutdown_mode: "terminate"

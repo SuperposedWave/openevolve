@@ -68,6 +68,8 @@ examples/linear_code_binary_search/batch_runs*/
 examples/linear_code_binary_search/single_run*/
 examples/linear_code_binary_search/outputs/
 examples/linear_code_binary_search/benchmark_results/
+examples/linear_code_binary_search/*.sqlite
+examples/linear_code_binary_search/*.sqlite3
 
 # max binary code search
 examples/max_binary_code_search/openevolve_output*/

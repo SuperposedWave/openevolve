@@ -69,6 +69,30 @@ class SearchResult:
     forbidden_count: int
     repair_moves: int = 0
     repair_gain: int = 0
+    repair_rollout_evaluations: int = 0
+
+
+@dataclass(frozen=True)
+class RepairReward:
+    """Rollout outcome used to compare MCTS repair choices."""
+
+    constructed_count: int
+    dropped_count: int
+    steps: int
+    forbidden_count: int
+
+
+@dataclass
+class RepairStats:
+    """Aggregated rollout statistics for one root drop."""
+
+    visits: int = 0
+    success_count: int = 0
+    total_constructed: int = 0
+    total_dropped: int = 0
+    total_steps: int = 0
+    total_forbidden: int = 0
+    best_reward: RepairReward | None = None
 
 
 DEFAULT_INSTANCE = MaxCodeInstance(
@@ -402,6 +426,23 @@ class ForbiddenBallState:
         for offset in self.offsets:
             self.forbidden.add(word_mask ^ offset)
 
+    def damage_features(
+        self,
+        word_mask: int,
+        local_offsets: Sequence[int] = tuple(),
+    ) -> tuple[int, int, int]:
+        """Return new forbidden count, overlap count, and local availability estimate."""
+        new_forbidden_count = 0
+        for offset in self.offsets:
+            if (word_mask ^ offset) not in self.forbidden:
+                new_forbidden_count += 1
+        overlap_forbidden_count = len(self.offsets) - new_forbidden_count
+        local_available_count = 0
+        for offset in local_offsets:
+            if (word_mask ^ offset) not in self.forbidden:
+                local_available_count += 1
+        return new_forbidden_count, overlap_forbidden_count, local_available_count
+
 
 def _forbidden_count_for_codewords(n: int, distance: int, codewords: Sequence[int]) -> int:
     forbidden: set[int] = set()
@@ -410,6 +451,16 @@ def _forbidden_count_for_codewords(n: int, distance: int, codewords: Sequence[in
         for offset in offsets:
             forbidden.add(word_mask ^ offset)
     return len(forbidden)
+
+
+def _rebuild_forbidden_state(
+    instance: MaxCodeInstance,
+    codewords: Sequence[int],
+) -> ForbiddenBallState:
+    state = ForbiddenBallState(instance.n, instance.distance)
+    for codeword in codewords:
+        state.add(codeword)
+    return state
 
 
 def _repair_rounds() -> int:
@@ -745,6 +796,694 @@ class ParityTransformState:
         return new_forbidden_count, overlap_forbidden_count, local_available_count
 
 
+def _rebuild_parity_state(search_n: int, centers: Sequence[int]) -> ParityTransformState:
+    state = ParityTransformState(search_n)
+    for center in centers:
+        state.add(center)
+    return state
+
+
+def _rebuild_parity_accepted_records(
+    centers: Sequence[int],
+    instance: MaxCodeInstance,
+    score_by_center: dict[int, float],
+) -> tuple[AcceptedWordRecord, ...]:
+    search_n = instance.n - 1
+    records: list[AcceptedWordRecord] = []
+    for index, center in enumerate(centers[1:], start=1):
+        extended_word = parity_extend_word(center, search_n)
+        records.append(
+            AcceptedWordRecord(
+                fill_index=index + 1,
+                rank=index,
+                word=format_word(extended_word, instance.n),
+                weight=popcount(extended_word),
+                score=score_by_center.get(center, 0.0),
+            )
+        )
+    return tuple(records)
+
+
+def _parity_sample_dynamic_candidate(
+    state: ParityTransformState,
+    priority_fn: PriorityFn,
+    restart_index: int,
+    rng: random.Random,
+    pool_size: int,
+    attempts_per_refill: int,
+    tabu: set[int],
+) -> tuple[int | None, float, int, int]:
+    """Sample legal centers and return the best dynamic-priority candidate."""
+    pool: list[tuple[float, float, int]] = []
+    local_seen: set[int] = set()
+    blocked = 0
+    attempts = 0
+    while len(pool) < pool_size and attempts < attempts_per_refill:
+        attempts += 1
+        candidate = rng.randrange(1, state.universe_size)
+        if candidate in local_seen or candidate in tabu:
+            continue
+        local_seen.add(candidate)
+        if not state.can_add(candidate):
+            blocked += 1
+            continue
+        new_forbidden, overlap_forbidden, local_available = state.damage_features(candidate)
+        score = _safe_priority(
+            priority_fn,
+            candidate,
+            state.search_n,
+            3,
+            len(state.codewords),
+            popcount(candidate),
+            new_forbidden,
+            overlap_forbidden,
+            local_available,
+        )
+        pool.append((score, rng.random(), candidate))
+    if not pool:
+        return None, 0.0, blocked, 0
+    pool.sort(reverse=True)
+    score, _tie, candidate = pool[0]
+    return candidate, float(score), blocked, len(pool)
+
+
+def _parity_count_sampled_legal(
+    state: ParityTransformState,
+    rng: random.Random,
+    sample_count: int,
+    tabu: set[int],
+) -> int:
+    legal = 0
+    seen: set[int] = set()
+    attempts = 0
+    max_attempts = max(sample_count * 4, sample_count + 128)
+    while len(seen) < sample_count and attempts < max_attempts:
+        attempts += 1
+        candidate = rng.randrange(1, state.universe_size)
+        if candidate in seen or candidate in tabu:
+            continue
+        seen.add(candidate)
+        if state.can_add(candidate):
+            legal += 1
+    return legal
+
+
+def _parity_drop_choice_is_better(
+    candidate_legal_count: int,
+    candidate_release: int,
+    candidate_tie: int,
+    current_legal_count: int,
+    current_release: int,
+    current_tie: int,
+) -> bool:
+    return (
+        candidate_legal_count > current_legal_count
+        or (
+            candidate_legal_count == current_legal_count
+            and candidate_release > current_release
+        )
+        or (
+            candidate_legal_count == current_legal_count
+            and candidate_release == current_release
+            and candidate_tie > current_tie
+        )
+    )
+
+
+def _parity_choose_rollout_drop_index(
+    centers: Sequence[int],
+    search_n: int,
+    restart_index: int,
+    repair_event_index: int,
+    step: int,
+    before_forbidden_count: int,
+    candidate_window: int,
+    tabu: set[int],
+    drop_topk: int,
+    rng: random.Random,
+) -> int | None:
+    removable = [index for index in range(1, len(centers)) if centers[index] not in tabu]
+    if not removable:
+        return None
+    if drop_topk == 0:
+        return removable[rng.randrange(len(removable))]
+
+    top: list[tuple[int, int, int, int]] = []
+    for drop_index in removable:
+        trial_centers = [center for index, center in enumerate(centers) if index != drop_index]
+        trial_state = _rebuild_parity_state(search_n, trial_centers)
+        release = max(0, before_forbidden_count - len(trial_state.forbidden_centers))
+        legal_count = _parity_count_sampled_legal(
+            trial_state,
+            rng,
+            candidate_window,
+            tabu | {centers[drop_index]},
+        )
+        tie = _deterministic_tiebreak(
+            centers[drop_index],
+            restart_index + repair_event_index + step + 4099,
+        )
+        item = (legal_count, release, tie, drop_index)
+        insert_at = len(top)
+        while insert_at > 0 and _parity_drop_choice_is_better(
+            legal_count,
+            release,
+            tie,
+            top[insert_at - 1][0],
+            top[insert_at - 1][1],
+            top[insert_at - 1][2],
+        ):
+            insert_at -= 1
+        top.insert(insert_at, item)
+        if len(top) > drop_topk:
+            top.pop()
+
+    if not top:
+        return removable[rng.randrange(len(removable))]
+    return top[rng.randrange(len(top))][3]
+
+
+def _repair_reward_is_better(
+    candidate: RepairReward,
+    current: RepairReward | None,
+) -> bool:
+    if current is None:
+        return True
+    if candidate.constructed_count != current.constructed_count:
+        return candidate.constructed_count > current.constructed_count
+    if candidate.dropped_count != current.dropped_count:
+        return candidate.dropped_count < current.dropped_count
+    if candidate.steps != current.steps:
+        return candidate.steps < current.steps
+    return candidate.forbidden_count < current.forbidden_count
+
+
+def _repair_stats_is_better(
+    candidate: RepairStats,
+    current: RepairStats | None,
+) -> bool:
+    if candidate.visits <= 0 or candidate.best_reward is None:
+        return False
+    if current is None or current.visits <= 0 or current.best_reward is None:
+        return True
+    if candidate.success_count * current.visits != current.success_count * candidate.visits:
+        return candidate.success_count * current.visits > current.success_count * candidate.visits
+    if _repair_reward_is_better(candidate.best_reward, current.best_reward):
+        return True
+    if _repair_reward_is_better(current.best_reward, candidate.best_reward):
+        return False
+    if candidate.total_constructed * current.visits != current.total_constructed * candidate.visits:
+        return candidate.total_constructed * current.visits > current.total_constructed * candidate.visits
+    if candidate.total_dropped * current.visits != current.total_dropped * candidate.visits:
+        return candidate.total_dropped * current.visits < current.total_dropped * candidate.visits
+    if candidate.total_steps * current.visits != current.total_steps * candidate.visits:
+        return candidate.total_steps * current.visits < current.total_steps * candidate.visits
+    return candidate.total_forbidden * current.visits < current.total_forbidden * candidate.visits
+
+
+def _parity_update_root_stats(
+    stats: RepairStats,
+    reward: RepairReward,
+    original_count: int,
+) -> None:
+    stats.visits += 1
+    stats.total_constructed += reward.constructed_count
+    stats.total_dropped += reward.dropped_count
+    stats.total_steps += reward.steps
+    stats.total_forbidden += reward.forbidden_count
+    if reward.constructed_count >= original_count:
+        stats.success_count += 1
+    if _repair_reward_is_better(reward, stats.best_reward):
+        stats.best_reward = reward
+
+
+def _parity_rollout_after_first_drop(
+    centers: Sequence[int],
+    first_drop_index: int,
+    priority_fn: PriorityFn,
+    search_n: int,
+    restart_index: int,
+    repair_event_index: int,
+    seed: int,
+    pool_size: int,
+    attempts_per_refill: int,
+    rollout_depth: int,
+    drop_topk: int,
+    candidate_window: int,
+    tabu: set[int],
+) -> tuple[RepairReward, int]:
+    trial_centers = [center for index, center in enumerate(centers) if index != first_drop_index]
+    trial_state = _rebuild_parity_state(search_n, trial_centers)
+    trial_tabu = set(tabu)
+    trial_tabu.add(centers[first_drop_index])
+    rng = random.Random(
+        seed
+        ^ (restart_index << 32)
+        ^ (repair_event_index << 16)
+        ^ (first_drop_index + 1)
+    )
+    dropped_count = 1
+    steps = 0
+    evaluations = 0
+
+    while len(trial_state.codewords) < trial_state.universe_size and steps < rollout_depth:
+        candidate, _score, _blocked, evals = _parity_sample_dynamic_candidate(
+            trial_state,
+            priority_fn,
+            restart_index + repair_event_index + steps + 1,
+            rng,
+            pool_size,
+            attempts_per_refill,
+            trial_tabu,
+        )
+        evaluations += evals
+        if candidate is not None:
+            trial_state.add(candidate)
+            steps += 1
+            continue
+
+        if len(trial_state.codewords) <= 1:
+            break
+        drop_index = _parity_choose_rollout_drop_index(
+            trial_state.codewords,
+            search_n,
+            restart_index,
+            repair_event_index,
+            steps,
+            len(trial_state.forbidden_centers),
+            candidate_window,
+            trial_tabu,
+            drop_topk,
+            rng,
+        )
+        if drop_index is None:
+            break
+        dropped = trial_state.codewords[drop_index]
+        trial_tabu.add(dropped)
+        trial_centers = [
+            center for index, center in enumerate(trial_state.codewords) if index != drop_index
+        ]
+        trial_state = _rebuild_parity_state(search_n, trial_centers)
+        dropped_count += 1
+        steps += 1
+
+    return (
+        RepairReward(
+            constructed_count=len(trial_state.codewords),
+            dropped_count=dropped_count,
+            steps=steps,
+            forbidden_count=len(trial_state.forbidden_centers),
+        ),
+        evaluations,
+    )
+
+
+def _parity_choose_mcts_drop_index_with_evaluations(
+    state: ParityTransformState,
+    priority_fn: PriorityFn,
+    restart_index: int,
+    repair_event_index: int,
+    seed: int,
+    pool_size: int,
+    attempts_per_refill: int,
+    tabu: set[int],
+) -> tuple[int | None, int]:
+    centers = tuple(state.codewords)
+    if len(centers) <= 1:
+        return None, 0
+
+    removable = [index for index in range(1, len(centers)) if centers[index] not in tabu]
+    if not removable:
+        return None, 0
+
+    rollout_depth = _parity_repair_mcts_depth()
+    simulations = _parity_repair_mcts_simulations()
+    drop_topk = _parity_repair_mcts_drop_topk()
+    candidate_window = _parity_repair_candidate_window(state.search_n)
+    root_stats = {index: RepairStats() for index in removable}
+    total_evaluations = 0
+
+    for simulation in range(simulations):
+        drop_index = removable[simulation % len(removable)]
+        reward, evaluations = _parity_rollout_after_first_drop(
+            centers,
+            drop_index,
+            priority_fn,
+            state.search_n,
+            restart_index,
+            repair_event_index,
+            seed + simulation * 0x9E3779B97F4A7C15,
+            pool_size,
+            attempts_per_refill,
+            rollout_depth,
+            drop_topk,
+            candidate_window,
+            tabu,
+        )
+        total_evaluations += evaluations
+        _parity_update_root_stats(root_stats[drop_index], reward, len(centers))
+
+    best_index: int | None = None
+    for drop_index, stats in root_stats.items():
+        current = root_stats[best_index] if best_index is not None else None
+        if _repair_stats_is_better(stats, current):
+            best_index = drop_index
+
+    if best_index is None:
+        return None, total_evaluations
+    best_reward = root_stats[best_index].best_reward
+    if best_reward is None or best_reward.constructed_count < len(centers):
+        return None, total_evaluations
+    return best_index, total_evaluations
+
+
+def _parity_choose_mcts_drop_index(
+    state: ParityTransformState,
+    priority_fn: PriorityFn,
+    restart_index: int,
+    repair_event_index: int,
+    seed: int,
+    pool_size: int,
+    attempts_per_refill: int,
+    tabu: set[int],
+) -> int | None:
+    drop_index, _evaluations = _parity_choose_mcts_drop_index_with_evaluations(
+        state,
+        priority_fn,
+        restart_index,
+        repair_event_index,
+        seed,
+        pool_size,
+        attempts_per_refill,
+        tabu,
+    )
+    return drop_index
+
+
+def _parity_apply_drop(
+    state: ParityTransformState,
+    drop_index: int,
+) -> tuple[ParityTransformState, int]:
+    dropped = state.codewords[drop_index]
+    centers = [center for index, center in enumerate(state.codewords) if index != drop_index]
+    return _rebuild_parity_state(state.search_n, centers), dropped
+
+
+def _parity_add_tabu(
+    tabu_queue: list[int],
+    tabu_set: set[int],
+    word_mask: int,
+    tenure: int,
+) -> None:
+    if tenure <= 0:
+        return
+    tabu_queue.append(word_mask)
+    tabu_set.add(word_mask)
+    while len(tabu_queue) > tenure:
+        expired = tabu_queue.pop(0)
+        if expired not in tabu_queue:
+            tabu_set.discard(expired)
+
+
+def _dynamic_repair_local_offsets(instance: MaxCodeInstance) -> tuple[int, ...]:
+    return sampled_exact_weight_offsets(
+        instance.n,
+        instance.distance,
+        _env_int("MAX_CODE_LOCAL_SAMPLE_SIZE", 64, minimum=0),
+    )
+
+
+def _choose_dynamic_candidate_from_ranked(
+    ranked_scores: Sequence[tuple[int, float]],
+    state: ForbiddenBallState,
+    priority_fn: PriorityFn,
+    instance: MaxCodeInstance,
+    restart_index: int,
+    window_size: int,
+    tabu: set[int],
+    local_offsets: Sequence[int],
+) -> tuple[int | None, float, int, int]:
+    """Choose the best dynamic candidate from the next legal ranked window."""
+    best_word: int | None = None
+    best_score = -math.inf
+    best_tie = -1
+    blocked = 0
+    evaluations = 0
+    legal_seen = 0
+    step = len(state.codewords)
+    effective_window = window_size if window_size > 0 else len(ranked_scores)
+
+    for word_mask, _static_score in ranked_scores:
+        if word_mask in tabu:
+            continue
+        if not state.can_add(word_mask):
+            blocked += 1
+            continue
+        new_forbidden, overlap_forbidden, local_available = state.damage_features(
+            word_mask,
+            local_offsets,
+        )
+        score = _safe_priority(
+            priority_fn,
+            word_mask,
+            instance.n,
+            instance.distance,
+            step,
+            popcount(word_mask),
+            new_forbidden,
+            overlap_forbidden,
+            local_available,
+        )
+        tie = _deterministic_tiebreak(word_mask, restart_index + step + 1)
+        evaluations += 1
+        if score > best_score or (score == best_score and tie > best_tie):
+            best_word = word_mask
+            best_score = score
+            best_tie = tie
+        legal_seen += 1
+        if legal_seen >= effective_window:
+            break
+
+    if best_word is None:
+        return None, 0.0, blocked, evaluations
+    return best_word, float(best_score), blocked, evaluations
+
+
+def _count_legal_candidates_in_ranked_prefix(
+    ranked_scores: Sequence[tuple[int, float]],
+    state: ForbiddenBallState,
+    prefix_size: int,
+    tabu: set[int],
+) -> int:
+    legal_count = 0
+    limit = prefix_size if prefix_size > 0 else len(ranked_scores)
+    for word_mask, _score in ranked_scores[:limit]:
+        if word_mask in tabu:
+            continue
+        if state.can_add(word_mask):
+            legal_count += 1
+    return legal_count
+
+
+def _choose_rollout_drop_index(
+    codewords: Sequence[int],
+    instance: MaxCodeInstance,
+    ranked_scores: Sequence[tuple[int, float]],
+    restart_index: int,
+    repair_event_index: int,
+    step: int,
+    before_forbidden_count: int,
+    candidate_window: int,
+    tabu: set[int],
+    drop_topk: int,
+    rng: random.Random,
+) -> int | None:
+    removable = [index for index in range(1, len(codewords)) if codewords[index] not in tabu]
+    if not removable:
+        return None
+    if drop_topk == 0:
+        return removable[rng.randrange(len(removable))]
+
+    top: list[tuple[int, int, int, int]] = []
+    for drop_index in removable:
+        trial_codewords = [
+            codeword for index, codeword in enumerate(codewords) if index != drop_index
+        ]
+        trial_state = _rebuild_forbidden_state(instance, trial_codewords)
+        release = max(0, before_forbidden_count - len(trial_state.forbidden))
+        legal_count = _count_legal_candidates_in_ranked_prefix(
+            ranked_scores,
+            trial_state,
+            candidate_window,
+            tabu | {codewords[drop_index]},
+        )
+        tie = _deterministic_tiebreak(
+            codewords[drop_index],
+            restart_index + repair_event_index + step + 4099,
+        )
+        item = (legal_count, release, tie, drop_index)
+        insert_at = len(top)
+        while insert_at > 0 and _parity_drop_choice_is_better(
+            legal_count,
+            release,
+            tie,
+            top[insert_at - 1][0],
+            top[insert_at - 1][1],
+            top[insert_at - 1][2],
+        ):
+            insert_at -= 1
+        top.insert(insert_at, item)
+        if len(top) > drop_topk:
+            top.pop()
+
+    if not top:
+        return removable[rng.randrange(len(removable))]
+    return top[rng.randrange(len(top))][3]
+
+
+def _rollout_after_first_drop(
+    codewords: Sequence[int],
+    first_drop_index: int,
+    instance: MaxCodeInstance,
+    ranked_scores: Sequence[tuple[int, float]],
+    priority_fn: PriorityFn,
+    restart_index: int,
+    repair_event_index: int,
+    seed: int,
+    dynamic_window: int,
+    rollout_depth: int,
+    drop_topk: int,
+    candidate_window: int,
+    tabu: set[int],
+    local_offsets: Sequence[int],
+) -> tuple[RepairReward, int]:
+    trial_codewords = [
+        codeword for index, codeword in enumerate(codewords) if index != first_drop_index
+    ]
+    trial_state = _rebuild_forbidden_state(instance, trial_codewords)
+    trial_tabu = set(tabu)
+    trial_tabu.add(codewords[first_drop_index])
+    rng = random.Random(
+        seed
+        ^ (restart_index << 32)
+        ^ (repair_event_index << 16)
+        ^ (first_drop_index + 1)
+    )
+    dropped_count = 1
+    steps = 0
+    evaluations = 0
+
+    while steps < rollout_depth:
+        candidate, _score, _blocked, evals = _choose_dynamic_candidate_from_ranked(
+            ranked_scores,
+            trial_state,
+            priority_fn,
+            instance,
+            restart_index + repair_event_index + steps + 1,
+            dynamic_window,
+            trial_tabu,
+            local_offsets,
+        )
+        evaluations += evals
+        if candidate is not None:
+            trial_state.add(candidate)
+            trial_codewords.append(candidate)
+            steps += 1
+            continue
+
+        if len(trial_codewords) <= 1:
+            break
+        drop_index = _choose_rollout_drop_index(
+            trial_codewords,
+            instance,
+            ranked_scores,
+            restart_index,
+            repair_event_index,
+            steps,
+            len(trial_state.forbidden),
+            candidate_window,
+            trial_tabu,
+            drop_topk,
+            rng,
+        )
+        if drop_index is None:
+            break
+        dropped = trial_codewords[drop_index]
+        trial_tabu.add(dropped)
+        trial_codewords = [
+            codeword for index, codeword in enumerate(trial_codewords) if index != drop_index
+        ]
+        trial_state = _rebuild_forbidden_state(instance, trial_codewords)
+        dropped_count += 1
+        steps += 1
+
+    reward = RepairReward(
+        constructed_count=len(trial_codewords),
+        dropped_count=dropped_count,
+        steps=steps,
+        forbidden_count=len(trial_state.forbidden),
+    )
+    return reward, evaluations
+
+
+def _choose_mcts_drop_index(
+    codewords: Sequence[int],
+    instance: MaxCodeInstance,
+    ranked_scores: Sequence[tuple[int, float]],
+    priority_fn: PriorityFn,
+    restart_index: int,
+    repair_event_index: int,
+    seed: int,
+    dynamic_window: int,
+    tabu: set[int],
+    local_offsets: Sequence[int],
+) -> tuple[int | None, int]:
+    removable = [index for index in range(1, len(codewords)) if codewords[index] not in tabu]
+    if not removable:
+        return None, 0
+
+    rollout_depth = _parity_repair_mcts_depth()
+    simulations = _parity_repair_mcts_simulations()
+    drop_topk = _parity_repair_mcts_drop_topk()
+    candidate_window = _parity_repair_candidate_window(instance.n)
+    root_stats = {index: RepairStats() for index in removable}
+    total_evaluations = 0
+
+    for simulation in range(simulations):
+        drop_index = removable[simulation % len(removable)]
+        reward, evaluations = _rollout_after_first_drop(
+            codewords,
+            drop_index,
+            instance,
+            ranked_scores,
+            priority_fn,
+            restart_index,
+            repair_event_index,
+            seed + simulation * 0x9E3779B97F4A7C15,
+            dynamic_window,
+            rollout_depth,
+            drop_topk,
+            candidate_window,
+            tabu,
+            local_offsets,
+        )
+        total_evaluations += evaluations
+        _parity_update_root_stats(root_stats[drop_index], reward, len(codewords))
+
+    best_index: int | None = None
+    for drop_index, stats in root_stats.items():
+        current = root_stats[best_index] if best_index is not None else None
+        if _repair_stats_is_better(stats, current):
+            best_index = drop_index
+
+    if best_index is None:
+        return None, total_evaluations
+    best_reward = root_stats[best_index].best_reward
+    if best_reward is None or best_reward.constructed_count < len(codewords):
+        return None, total_evaluations
+    return best_index, total_evaluations
+
+
 def greedy_construct(
     instance: MaxCodeInstance,
     static_scores: Sequence[tuple[int, float]],
@@ -808,6 +1547,121 @@ def greedy_construct(
     )
 
 
+def dynamic_mcts_construct(
+    instance: MaxCodeInstance,
+    static_scores: Sequence[tuple[int, float]],
+    restart_index: int,
+    priority_fn: PriorityFn,
+) -> SearchResult:
+    """Run dynamic-window greedy fill with bounded MCTS repair for stuck states."""
+    search_state = ForbiddenBallState(instance.n, instance.distance)
+    search_state.add(0)
+    ranked_scores = _ranked_scores(static_scores, restart_index)
+    local_offsets = _dynamic_repair_local_offsets(instance)
+    score_by_word = _score_lookup(static_scores)
+    accepted_records: list[AcceptedWordRecord] = []
+    blocked_candidate_count = 0
+    repair_moves = 0
+    repair_gain_start_size: int | None = None
+    repair_rollout_evaluations = 0
+    repair_events = _parity_repair_events()
+    repair_drop_count = _parity_repair_drop_count()
+    repair_tabu_tenure = _parity_repair_tabu_tenure()
+    repair_tabu_queue: list[int] = []
+    repair_tabu_set: set[int] = set()
+    dynamic_window = _parity_repair_candidate_window(instance.n)
+
+    while len(search_state.forbidden) < (1 << instance.n):
+        candidate, score, blocked, _evaluations = _choose_dynamic_candidate_from_ranked(
+            ranked_scores,
+            search_state,
+            priority_fn,
+            instance,
+            restart_index,
+            dynamic_window,
+            repair_tabu_set,
+            local_offsets,
+        )
+        blocked_candidate_count += blocked
+        if candidate is not None:
+            search_state.add(candidate)
+            score_by_word[candidate] = float(score)
+            accepted_records.append(
+                AcceptedWordRecord(
+                    fill_index=len(search_state.codewords),
+                    rank=len(accepted_records) + 1,
+                    word=format_word(candidate, instance.n),
+                    weight=popcount(candidate),
+                    score=float(score),
+                )
+            )
+            continue
+
+        repaired = False
+        if repair_moves < repair_events and len(search_state.codewords) > 1:
+            for _drop_event in range(repair_drop_count):
+                if repair_moves >= repair_events or len(search_state.codewords) <= 1:
+                    break
+                drop_index, rollout_evaluations = _choose_mcts_drop_index(
+                    tuple(search_state.codewords),
+                    instance,
+                    ranked_scores,
+                    priority_fn,
+                    restart_index,
+                    repair_moves,
+                    _sampled_seed(restart_index),
+                    dynamic_window,
+                    repair_tabu_set,
+                    local_offsets,
+                )
+                repair_rollout_evaluations += rollout_evaluations
+                if drop_index is None:
+                    break
+                if repair_gain_start_size is None:
+                    repair_gain_start_size = len(search_state.codewords)
+                dropped = search_state.codewords[drop_index]
+                retained = [
+                    codeword
+                    for index, codeword in enumerate(search_state.codewords)
+                    if index != drop_index
+                ]
+                search_state = _rebuild_forbidden_state(instance, retained)
+                _parity_add_tabu(
+                    repair_tabu_queue,
+                    repair_tabu_set,
+                    dropped,
+                    repair_tabu_tenure,
+                )
+                repair_moves += 1
+                repaired = True
+        if repaired:
+            continue
+        break
+
+    codewords = tuple(search_state.codewords)
+    accepted_records = list(_rebuild_accepted_records(codewords, instance, score_by_word))
+    repair_gain = (
+        max(0, len(codewords) - repair_gain_start_size)
+        if repair_gain_start_size is not None
+        else 0
+    )
+    minimum_distance = actual_minimum_distance(codewords)
+    valid = minimum_distance >= instance.distance
+    return SearchResult(
+        codewords=codewords,
+        accepted_records=tuple(accepted_records),
+        candidate_count=(1 << instance.n) - 1,
+        blocked_candidate_count=blocked_candidate_count,
+        restart_index=restart_index,
+        valid=valid,
+        minimum_distance=minimum_distance,
+        forbidden_count=len(search_state.forbidden),
+        repair_moves=repair_moves,
+        repair_gain=repair_gain,
+        repair_rollout_evaluations=repair_rollout_evaluations,
+    )
+
+
 def _sampled_seed(restart_index: int) -> int:
     base_seed = _env_int("MAX_CODE_RANDOM_SEED", 0, minimum=0)
     return (base_seed + restart_index * 1000003) & 0xFFFFFFFF
@@ -839,6 +1693,40 @@ def _parity_full_batch_size() -> int:
     return _env_int("MAX_CODE_PARITY_FULL_BATCH_SIZE", 64)
 
 
+def _parity_repair_mode() -> str:
+    return os.environ.get("MAX_CODE_REPAIR_MODE", "greedy").strip().lower()
+
+
+def _parity_repair_events() -> int:
+    return _env_int("MAX_CODE_REPAIR_EVENTS", 4, minimum=0)
+
+
+def _parity_repair_drop_count() -> int:
+    return _env_int("MAX_CODE_REPAIR_DROP_COUNT", 1, minimum=1)
+
+
+def _parity_repair_tabu_tenure() -> int:
+    default_tenure = _parity_repair_events() * _parity_repair_drop_count()
+    return _env_int("MAX_CODE_REPAIR_TABU_TENURE", default_tenure, minimum=0)
+
+
+def _parity_repair_candidate_window(search_n: int) -> int:
+    default_window = max(4096, min(65536, search_n * 4096))
+    return _env_int("MAX_CODE_REPAIR_CANDIDATE_WINDOW", default_window)
+
+
+def _parity_repair_mcts_simulations() -> int:
+    return _env_int("MAX_CODE_REPAIR_MCTS_SIMULATIONS", 64, minimum=1)
+
+
+def _parity_repair_mcts_depth() -> int:
+    return _env_int("MAX_CODE_REPAIR_MCTS_DEPTH", 4, minimum=1)
+
+
+def _parity_repair_mcts_drop_topk() -> int:
+    return _env_int("MAX_CODE_REPAIR_MCTS_DROP_TOPK", 2, minimum=0)
+
+
 def parity_extend_word(word_mask: int, search_n: int) -> int:
     """Append an overall parity bit, mapping distance 3 to distance 4."""
     parity_bit = popcount(word_mask) & 1
@@ -858,11 +1746,23 @@ def parity_transform_full_scan_construct(
     blocked_candidate_count = 0
     batch_size = _parity_full_batch_size()
     scan_index = 0
+    repair_moves = 0
+    repair_gain_start_size: int | None = None
+    repair_rollout_evaluations = 0
+    repair_mode = _parity_repair_mode()
+    repair_events = _parity_repair_events()
+    repair_drop_count = _parity_repair_drop_count()
+    repair_tabu_tenure = _parity_repair_tabu_tenure()
+    repair_tabu_queue: list[int] = []
+    repair_tabu_set: set[int] = set()
+    score_by_center: dict[int, float] = {0: 0.0}
 
     while len(search_state.forbidden_centers) < search_state.universe_size:
         scan_index += 1
         pool: list[tuple[float, int, int]] = []
         for candidate in range(1, search_state.universe_size):
+            if candidate in repair_tabu_set:
+                continue
             if not search_state.can_add(candidate):
                 blocked_candidate_count += 1
                 continue
@@ -884,6 +1784,37 @@ def parity_transform_full_scan_construct(
             pool.append((score, tie_break, candidate))
 
         if not pool:
+            repaired = False
+            if repair_mode == "mcts" and repair_moves < repair_events:
+                for _drop_event in range(repair_drop_count):
+                    if repair_moves >= repair_events:
+                        break
+                    drop_index, rollout_evaluations = _parity_choose_mcts_drop_index_with_evaluations(
+                        search_state,
+                        priority_fn,
+                        restart_index,
+                        repair_moves,
+                        _sampled_seed(restart_index),
+                        batch_size,
+                        max(batch_size * 8, 128),
+                        repair_tabu_set,
+                    )
+                    repair_rollout_evaluations += rollout_evaluations
+                    if drop_index is None:
+                        break
+                    if repair_gain_start_size is None:
+                        repair_gain_start_size = len(search_state.codewords)
+                    search_state, dropped = _parity_apply_drop(search_state, drop_index)
+                    _parity_add_tabu(
+                        repair_tabu_queue,
+                        repair_tabu_set,
+                        dropped,
+                        repair_tabu_tenure,
+                    )
+                    repair_moves += 1
+                    repaired = True
+            if repaired:
+                continue
             break
 
         pool.sort(reverse=True)
@@ -894,6 +1825,7 @@ def parity_transform_full_scan_construct(
             if not search_state.can_add(candidate):
                 continue
             search_state.add(candidate)
+            score_by_center[candidate] = float(score)
             accepted_this_scan += 1
             extended_word = parity_extend_word(candidate, search_n)
             accepted_records.append(
@@ -907,10 +1839,48 @@ def parity_transform_full_scan_construct(
             )
 
         if accepted_this_scan == 0:
-            break
+            repaired = False
+            if repair_mode == "mcts" and repair_moves < repair_events:
+                for _drop_event in range(repair_drop_count):
+                    if repair_moves >= repair_events:
+                        break
+                    drop_index, rollout_evaluations = _parity_choose_mcts_drop_index_with_evaluations(
+                        search_state,
+                        priority_fn,
+                        restart_index,
+                        repair_moves,
+                        _sampled_seed(restart_index),
+                        batch_size,
+                        max(batch_size * 8, 128),
+                        repair_tabu_set,
+                    )
+                    repair_rollout_evaluations += rollout_evaluations
+                    if drop_index is None:
+                        break
+                    if repair_gain_start_size is None:
+                        repair_gain_start_size = len(search_state.codewords)
+                    search_state, dropped = _parity_apply_drop(search_state, drop_index)
+                    _parity_add_tabu(
+                        repair_tabu_queue,
+                        repair_tabu_set,
+                        dropped,
+                        repair_tabu_tenure,
+                    )
+                    repair_moves += 1
+                    repaired = True
+            if not repaired:
+                break
 
     transformed_codewords = tuple(
         parity_extend_word(word_mask, search_n) for word_mask in search_state.codewords
+    )
+    accepted_records = list(
+        _rebuild_parity_accepted_records(search_state.codewords, instance, score_by_center)
+    )
+    repair_gain = (
+        max(0, len(search_state.codewords) - repair_gain_start_size)
+        if repair_gain_start_size is not None
+        else 0
     )
     return SearchResult(
         codewords=transformed_codewords,
@@ -921,6 +1891,9 @@ def parity_transform_full_scan_construct(
         valid=True,
         minimum_distance=instance.distance,
         forbidden_count=len(search_state.forbidden_centers),
+        repair_moves=repair_moves,
+        repair_gain=repair_gain,
+        repair_rollout_evaluations=repair_rollout_evaluations,
     )
 
 
@@ -947,6 +1920,50 @@ def parity_transform_construct(
     accepted_records: list[AcceptedWordRecord] = []
     blocked_candidate_count = 0
     stale_refills = 0
+    repair_moves = 0
+    repair_gain_start_size: int | None = None
+    repair_rollout_evaluations = 0
+    repair_mode = _parity_repair_mode()
+    repair_events = _parity_repair_events()
+    repair_drop_count = _parity_repair_drop_count()
+    repair_tabu_tenure = _parity_repair_tabu_tenure()
+    repair_tabu_queue: list[int] = []
+    repair_tabu_set: set[int] = set()
+    score_by_center: dict[int, float] = {0: 0.0}
+
+    def try_mcts_repair(repair_event_seed: int) -> bool:
+        nonlocal search_state, repair_moves, repair_gain_start_size, repair_rollout_evaluations
+        if repair_mode != "mcts" or repair_moves >= repair_events:
+            return False
+        repaired = False
+        for _drop_event in range(repair_drop_count):
+            if repair_moves >= repair_events:
+                break
+            drop_index, rollout_evaluations = _parity_choose_mcts_drop_index_with_evaluations(
+                search_state,
+                priority_fn,
+                restart_index,
+                repair_moves,
+                repair_event_seed,
+                pool_size,
+                attempts_per_refill,
+                repair_tabu_set,
+            )
+            repair_rollout_evaluations += rollout_evaluations
+            if drop_index is None:
+                break
+            if repair_gain_start_size is None:
+                repair_gain_start_size = len(search_state.codewords)
+            search_state, dropped = _parity_apply_drop(search_state, drop_index)
+            _parity_add_tabu(
+                repair_tabu_queue,
+                repair_tabu_set,
+                dropped,
+                repair_tabu_tenure,
+            )
+            repair_moves += 1
+            repaired = True
+        return repaired
 
     for refill_index in range(1, max_refills + 1):
         if len(search_state.forbidden_centers) >= search_state.universe_size:
@@ -958,7 +1975,7 @@ def parity_transform_construct(
         while len(pool) < pool_size and attempts < attempts_per_refill:
             attempts += 1
             candidate = rng.randrange(1, search_state.universe_size)
-            if candidate in local_seen:
+            if candidate in local_seen or candidate in repair_tabu_set:
                 continue
             local_seen.add(candidate)
             if not search_state.can_add(candidate):
@@ -990,6 +2007,9 @@ def parity_transform_construct(
             )
 
         if not pool:
+            if try_mcts_repair(_sampled_seed(restart_index) + refill_index * 7919):
+                stale_refills = 0
+                continue
             stale_refills += 1
             if stale_refills >= max_stale_refills:
                 break
@@ -1007,6 +2027,7 @@ def parity_transform_construct(
         ) in enumerate(pool, start=1):
             if search_state.can_add(candidate):
                 search_state.add(candidate)
+                score_by_center[candidate] = float(score)
                 accepted_this_refill += 1
                 extended_word = parity_extend_word(candidate, search_n)
                 accepted_records.append(
@@ -1022,6 +2043,9 @@ def parity_transform_construct(
         if accepted_this_refill:
             stale_refills = 0
         else:
+            if try_mcts_repair(_sampled_seed(restart_index) + refill_index * 104729):
+                stale_refills = 0
+                continue
             stale_refills += 1
             if stale_refills >= max_stale_refills:
                 break
@@ -1031,6 +2055,8 @@ def parity_transform_construct(
         while len(search_state.forbidden_centers) < search_state.universe_size:
             progress = 0
             for candidate in range(1, search_state.universe_size):
+                if candidate in repair_tabu_set:
+                    continue
                 if not search_state.can_add(candidate):
                     continue
                 sweep_rank += 1
@@ -1049,6 +2075,7 @@ def parity_transform_construct(
                     local_available,
                 )
                 search_state.add(candidate)
+                score_by_center[candidate] = float(score)
                 progress += 1
                 extended_word = parity_extend_word(candidate, search_n)
                 accepted_records.append(
@@ -1061,10 +2088,20 @@ def parity_transform_construct(
                     )
                 )
             if progress == 0:
+                if try_mcts_repair(_sampled_seed(restart_index) + sweep_rank * 65537):
+                    continue
                 break
 
     transformed_codewords = tuple(
         parity_extend_word(word_mask, search_n) for word_mask in search_state.codewords
+    )
+    accepted_records = list(
+        _rebuild_parity_accepted_records(search_state.codewords, instance, score_by_center)
+    )
+    repair_gain = (
+        max(0, len(search_state.codewords) - repair_gain_start_size)
+        if repair_gain_start_size is not None
+        else 0
     )
     return SearchResult(
         codewords=transformed_codewords,
@@ -1075,6 +2112,9 @@ def parity_transform_construct(
         valid=True,
         minimum_distance=instance.distance,
         forbidden_count=len(search_state.forbidden_centers),
+        repair_moves=repair_moves,
+        repair_gain=repair_gain,
+        repair_rollout_evaluations=repair_rollout_evaluations,
     )
 
 
@@ -1142,14 +2182,30 @@ def evaluate_priority_function(
             parity_transform_construct(instance, priority_fn, restart_index)
             for restart_index in range(instance.restarts)
         ]
-        search_mode = "parity_transform_dynamic"
+        search_mode = (
+            "parity_transform_dynamic_mcts_repair"
+            if _parity_repair_mode() == "mcts"
+            else "parity_transform_dynamic"
+        )
     else:
         static_scores = score_static_candidates(instance, priority_fn)
-        results = [
-            greedy_construct(instance, static_scores, restart_index, priority_fn=priority_fn)
-            for restart_index in range(instance.restarts)
-        ]
-        search_mode = "static_full_greedy"
+        if _parity_repair_mode() == "mcts":
+            results = [
+                dynamic_mcts_construct(
+                    instance,
+                    static_scores,
+                    restart_index,
+                    priority_fn,
+                )
+                for restart_index in range(instance.restarts)
+            ]
+            search_mode = "dynamic_mcts_repair"
+        else:
+            results = [
+                greedy_construct(instance, static_scores, restart_index, priority_fn=priority_fn)
+                for restart_index in range(instance.restarts)
+            ]
+            search_mode = "static_full_greedy"
     best = max(
         results,
         key=lambda result: (
@@ -1187,8 +2243,27 @@ def evaluate_priority_function(
                 "restart_index": best.restart_index,
                 "candidate_count": best.candidate_count,
                 "forbidden_count": best.forbidden_count,
+                "repair_mode": _parity_repair_mode() if instance.distance == 4 else (
+                    "mcts" if search_mode == "dynamic_mcts_repair" else "local"
+                ),
+                "repair_mcts_simulations": (
+                    _parity_repair_mcts_simulations()
+                    if instance.distance == 4 or search_mode == "dynamic_mcts_repair"
+                    else 0
+                ),
+                "repair_mcts_depth": (
+                    _parity_repair_mcts_depth()
+                    if instance.distance == 4 or search_mode == "dynamic_mcts_repair"
+                    else 0
+                ),
+                "repair_mcts_drop_topk": (
+                    _parity_repair_mcts_drop_topk()
+                    if instance.distance == 4 or search_mode == "dynamic_mcts_repair"
+                    else 0
+                ),
                 "repair_moves": best.repair_moves,
                 "repair_gain": best.repair_gain,
+                "repair_rollout_evaluations": best.repair_rollout_evaluations,
                 "accepted_words": [record.__dict__ for record in best.accepted_records],
             },
             indent=2,

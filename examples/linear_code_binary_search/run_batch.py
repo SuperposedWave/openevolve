@@ -16,16 +16,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
+import code_table_db
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
 DEFAULT_RECORD = SCRIPT_DIR / "Misc" / "ECCRecord.json"
 DEFAULT_CONFIG = SCRIPT_DIR / "Configs" / "config_c_kernel.yaml"
 DEFAULT_OUTPUT_ROOT = SCRIPT_DIR / "outputs"
+DEFAULT_SQLITE_DB = SCRIPT_DIR / "code_table_records.sqlite"
+DEFAULT_VIEWER_JSON = SCRIPT_DIR / "code_table_viewer" / "code_table_data.json"
 TARGET_BLOCK_RE = re.compile(
     r"(?m)^    Current target:\n(?:^    - .*\n){4}"
 )
 LLM_CONFIG_PATH_RE = re.compile(r"(?m)^(llm_config_path:\s*)[\"']?([^\"'\n]+)[\"']?\s*$")
+EARLY_STOPPING_SHUTDOWN_MODE_RE = re.compile(
+    r'(?m)^early_stopping_shutdown_mode:\s*["\']?(wait|terminate)["\']?\s*$'
+)
 
 
 @dataclass(frozen=True)
@@ -96,9 +103,30 @@ def parse_args() -> argparse.Namespace:
         help="Max OpenEvolve iterations per instance.",
     )
     parser.add_argument(
+        "--early-stopping-shutdown-mode",
+        choices=("wait", "terminate"),
+        default="terminate",
+        help="How OpenEvolve stops worker evaluations after early stopping.",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Delete an existing instance directory and rerun it.",
+    )
+    parser.add_argument(
+        "--sqlite-db",
+        default=str(DEFAULT_SQLITE_DB),
+        help="SQLite record store updated after each completed instance.",
+    )
+    parser.add_argument(
+        "--viewer-output",
+        default=str(DEFAULT_VIEWER_JSON),
+        help="Viewer JSON refreshed after SQLite is updated.",
+    )
+    parser.add_argument(
+        "--no-sqlite-update",
+        action="store_true",
+        help="Do not update the SQLite record store or viewer JSON.",
     )
     return parser.parse_args()
 
@@ -161,7 +189,12 @@ def load_tasks_from_record(
     return tasks, skipped
 
 
-def render_resolved_config(base_config_text: str, task: SweepTask, base_config_path: Path) -> str:
+def render_resolved_config(
+    base_config_text: str,
+    task: SweepTask,
+    base_config_path: Path,
+    early_stopping_shutdown_mode: str = "terminate",
+) -> str:
     """Inject the current target block into the base config prompt."""
     replacement = (
         f"    Current target:\n"
@@ -180,13 +213,31 @@ def render_resolved_config(base_config_text: str, task: SweepTask, base_config_p
             llm_path = (base_config_path.parent / llm_path).resolve()
         return f'{match.group(1)}"{llm_path}"'
 
-    return LLM_CONFIG_PATH_RE.sub(resolve_llm_path, resolved_text, count=1)
+    resolved_text = LLM_CONFIG_PATH_RE.sub(resolve_llm_path, resolved_text, count=1)
+    mode_line = f'early_stopping_shutdown_mode: "{early_stopping_shutdown_mode}"'
+    if EARLY_STOPPING_SHUTDOWN_MODE_RE.search(resolved_text):
+        return EARLY_STOPPING_SHUTDOWN_MODE_RE.sub(mode_line, resolved_text, count=1)
+    if resolved_text.endswith("\n"):
+        return f"{resolved_text}{mode_line}\n"
+    return f"{resolved_text}\n{mode_line}\n"
 
 
-def write_resolved_config(base_config_path: Path, output_dir: Path, task: SweepTask) -> Path:
+def write_resolved_config(
+    base_config_path: Path,
+    output_dir: Path,
+    task: SweepTask,
+    early_stopping_shutdown_mode: str = "terminate",
+) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     resolved_config = output_dir / "resolved_config.yaml"
-    resolved_config.write_text(render_resolved_config(base_config_path.read_text(), task, base_config_path))
+    resolved_config.write_text(
+        render_resolved_config(
+            base_config_path.read_text(),
+            task,
+            base_config_path,
+            early_stopping_shutdown_mode=early_stopping_shutdown_mode,
+        )
+    )
     return resolved_config
 
 
@@ -228,6 +279,7 @@ def run_instance(
     output_root: Path,
     run_name: str,
     iterations: int,
+    early_stopping_shutdown_mode: str = "terminate",
     force: bool = False,
 ) -> dict:
     """Run OpenEvolve for one task and save verification artifacts."""
@@ -244,7 +296,12 @@ def run_instance(
         shutil.rmtree(instance_dir)
 
     instance_dir.mkdir(parents=True, exist_ok=True)
-    resolved_config_path = write_resolved_config(base_config_path, instance_dir, task)
+    resolved_config_path = write_resolved_config(
+        base_config_path,
+        instance_dir,
+        task,
+        early_stopping_shutdown_mode=early_stopping_shutdown_mode,
+    )
 
     env = os.environ.copy()
     env.update(
@@ -278,6 +335,7 @@ def run_instance(
                 "LINEAR_CODE_N": env["LINEAR_CODE_N"],
                 "LINEAR_CODE_K": env["LINEAR_CODE_K"],
                 "LINEAR_CODE_D": env["LINEAR_CODE_D"],
+                "EARLY_STOPPING_SHUTDOWN_MODE": early_stopping_shutdown_mode,
             },
         },
     )
@@ -346,6 +404,21 @@ def write_summary_csv(summary_path: Path, rows: Sequence[dict]) -> None:
             writer.writerow(row)
 
 
+def update_sqlite_records(
+    db_path: Path,
+    record_path: Path,
+    output_root: Path,
+    viewer_output: Path,
+) -> None:
+    """Refresh the persistent code-table record store from local outputs."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with code_table_db.connect(db_path) as conn:
+        code_table_db.init_db(conn)
+        code_table_db.import_bounds(conn, record_path)
+        code_table_db.import_runs(conn, [output_root])
+        code_table_db.export_viewer_json(conn, viewer_output)
+
+
 def run_batch(
     record_path: Path,
     base_config_path: Path,
@@ -355,7 +428,10 @@ def run_batch(
     n_max: int = 40,
     d_field: str = "lower",
     iterations: int = 40,
+    early_stopping_shutdown_mode: str = "terminate",
     force: bool = False,
+    sqlite_db: Path | None = DEFAULT_SQLITE_DB,
+    viewer_output: Path = DEFAULT_VIEWER_JSON,
 ) -> list[dict]:
     tasks, skipped = load_tasks_from_record(
         record_path,
@@ -397,10 +473,14 @@ def run_batch(
             output_root=output_root,
             run_name=run_name,
             iterations=iterations,
+            early_stopping_shutdown_mode=early_stopping_shutdown_mode,
             force=force,
         )
         rows.append(row)
         append_summary_jsonl(summary_jsonl, row)
+        if sqlite_db is not None and row["status"] != "skipped_existing":
+            update_sqlite_records(sqlite_db, record_path, output_root, viewer_output)
+            print(f"[sqlite] updated {sqlite_db} and {viewer_output}")
         print(
             f"[{row['status']}] {task.instance_name} "
             f"(score={row.get('combined_score', 'n/a')}, verification={row.get('verification_status', 'n/a')})"
@@ -421,7 +501,10 @@ def main() -> None:
         n_max=args.n_max,
         d_field=args.d_field,
         iterations=args.iterations,
+        early_stopping_shutdown_mode=args.early_stopping_shutdown_mode,
         force=args.force,
+        sqlite_db=None if args.no_sqlite_update else Path(args.sqlite_db).resolve(),
+        viewer_output=Path(args.viewer_output).resolve(),
     )
 
 

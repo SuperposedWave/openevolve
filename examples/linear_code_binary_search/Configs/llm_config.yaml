@@ -2,6 +2,7 @@
 
 llm:
   api_base: "https://api.deepseek.com/v1"
+  api_key: "sk-c5bcdfcbc67a4652a00b0111a44ec52a"
   models:
     - name: "deepseek-chat"
       weight: 1.0

@@ -25,6 +25,11 @@ class TestEarlyStoppingConfigDefaults(unittest.TestCase):
         config = Config()
         self.assertEqual(config.early_stopping_metric, "combined_score")
 
+    def test_shutdown_mode_default(self):
+        """Test that early_stopping_shutdown_mode defaults to wait"""
+        config = Config()
+        self.assertEqual(config.early_stopping_shutdown_mode, "wait")
+
 
 class TestEarlyStoppingConfigFromDict(unittest.TestCase):
     """Tests for loading early stopping config from dict"""
@@ -63,11 +68,13 @@ class TestEarlyStoppingConfigFromDict(unittest.TestCase):
             "early_stopping_patience": 100,
             "convergence_threshold": 0.005,
             "early_stopping_metric": "validity",
+            "early_stopping_shutdown_mode": "terminate",
         }
         config = Config.from_dict(config_dict)
         self.assertEqual(config.early_stopping_patience, 100)
         self.assertEqual(config.convergence_threshold, 0.005)
         self.assertEqual(config.early_stopping_metric, "validity")
+        self.assertEqual(config.early_stopping_shutdown_mode, "terminate")
 
     def test_zero_patience_disables_early_stopping(self):
         """Test that patience=0 effectively disables early stopping"""
@@ -100,6 +107,7 @@ class TestEarlyStoppingWithYaml(unittest.TestCase):
         self.assertIn("early_stopping_patience", config_dict)
         self.assertIn("convergence_threshold", config_dict)
         self.assertIn("early_stopping_metric", config_dict)
+        self.assertIn("early_stopping_shutdown_mode", config_dict)
 
 
 if __name__ == "__main__":

@@ -42,6 +42,8 @@ The evaluator reads the target instance from environment variables:
 - optional: `LINEAR_CODE_REPAIR_MODE`
 - optional: `LINEAR_CODE_REPAIR_MCTS_SIMULATIONS`
 - optional: `LINEAR_CODE_REPAIR_MCTS_DEPTH`
+- optional: `LINEAR_CODE_REPAIR_MCTS_WORKERS`
+- optional: `LINEAR_CODE_REPAIR_MCTS_DROP_TOPK`
 - optional: `LINEAR_CODE_C_COMPILE_TIMEOUT`
 - optional: `LINEAR_CODE_C_RUN_TIMEOUT`
 
@@ -63,6 +65,12 @@ Useful C-kernel controls:
   Monte Carlo repair when the dynamic fill gets stuck.
 - `LINEAR_CODE_REPAIR_MCTS_SIMULATIONS`: total root-drop rollouts used by MCTS repair.
 - `LINEAR_CODE_REPAIR_MCTS_DEPTH`: maximum local rollout actions after the first drop.
+- `LINEAR_CODE_REPAIR_MCTS_WORKERS`: pthread worker count for parallel MCTS
+  rollouts. The default is `1` to preserve old behavior; use `0` to auto-select
+  CPU count, capped internally at 64 and by the simulation count.
+- `LINEAR_CODE_REPAIR_MCTS_DROP_TOPK`: when an MCTS rollout gets stuck after the
+  first drop, rank possible follow-up drops by released search space and sample
+  from the top-k choices. The default is `2`; use `0` for the old random drop.
 - `LINEAR_CODE_C_COMPILE_TIMEOUT`: compilation timeout in seconds.
 - `LINEAR_CODE_C_RUN_TIMEOUT`: isolated C-kernel runtime timeout in seconds.
 
@@ -95,9 +103,12 @@ the candidate's exact new forbidden growth. If the dynamic fill gets stuck, the
 fixed skeleton can run a repair step: it evaluates which selected column releases
 the most high-ranked candidates / forbidden-set mass, drops that column, rebuilds
 the exact state, and continues filling. With `LINEAR_CODE_REPAIR_MODE=mcts`,
-that drop choice is replaced by a bounded local rollout search. The rollout
-objective is lexicographic: construct more columns first, then prefer fewer
-drops, fewer rollout steps, and a smaller forbidden set.
+that drop choice is replaced by a bounded local rollout search. Root drops are
+compared with aggregated rollout statistics, and stuck follow-up rollout drops
+can be sampled from a small heuristic top-k rather than uniformly at random. The
+rollouts can be evaluated in parallel with `LINEAR_CODE_REPAIR_MCTS_WORKERS`.
+The rollout objective is lexicographic: construct more columns first, then
+prefer fewer drops, fewer rollout steps, and a smaller forbidden set.
 
 ## Run
 
@@ -146,3 +157,58 @@ Each instance is written under a target directory such as `outputs/n18_k7_d7/bat
 - `run_metadata.json`,
 - `matrix_verification.txt`,
 - and batch-level `outputs/_summaries/<run-name>/summary.jsonl` / `summary.csv`.
+
+## Persistent Code Table Records
+
+The static viewer still reads `code_table_viewer/code_table_data.json`, but
+ongoing experiment records can be kept in SQLite with `code_table_db.py`.
+
+Initialize the local record store from the current viewer JSON:
+
+```bash
+python code_table_db.py import-viewer \
+  --db code_table_records.sqlite \
+  --input code_table_viewer/code_table_data.json
+```
+
+After new experiments finish under `outputs/`, import the new runs and refresh
+the viewer JSON:
+
+```bash
+python code_table_db.py import-runs \
+  --db code_table_records.sqlite \
+  --search-root outputs
+
+python code_table_db.py export-viewer \
+  --db code_table_records.sqlite \
+  --output code_table_viewer/code_table_data.json
+```
+
+For a clean rebuild from `Misc/ECCRecord.json` plus run directories:
+
+```bash
+python code_table_db.py rebuild-viewer \
+  --db code_table_records.sqlite \
+  --record Misc/ECCRecord.json \
+  --search-root outputs \
+  --output code_table_viewer/code_table_data.json
+```
+
+The database file is ignored by git, so it can grow as a local experiment log
+while the exported JSON remains the portable artifact for the browser viewer.
+
+`run_batch.py` updates `code_table_records.sqlite` and refreshes the viewer JSON
+after each completed instance by default. Pass `--no-sqlite-update` to disable
+that for a temporary run.
+
+The shell scripts in `Scripts/` source `Scripts/record_sqlite.sh` and call it
+after OpenEvolve finishes. Set `LINEAR_CODE_SQLITE_RECORD=0` to skip the automatic
+record update, or override `LINEAR_CODE_SQLITE_DB`, `LINEAR_CODE_VIEWER_JSON`, and
+`LINEAR_CODE_RECORD_PATH` when writing to a different local record store.
+
+Best-program saves include evaluator artifacts when available, including
+`search_result`, `matrix_summary`, `parity_check_matrix`, and
+`generator_matrix`. The SQLite importer uses those saved matrix artifacts, or an
+existing `matrix_verification.txt`, to populate the viewer without rerunning the
+search. Set `LINEAR_CODE_VERIFY_ON_RECORD=1` only when you explicitly want the
+recorder to run `verify_distance.py` and write a fresh `matrix_verification.txt`.

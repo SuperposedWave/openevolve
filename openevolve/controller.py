@@ -307,6 +307,7 @@ class OpenEvolve:
             initial_metrics = await self.evaluator.evaluate_program(
                 self.initial_program_code, initial_program_id
             )
+            initial_artifacts = self.evaluator.get_pending_artifacts(initial_program_id)
 
             initial_program = Program(
                 id=initial_program_id,
@@ -318,6 +319,8 @@ class OpenEvolve:
             )
 
             self.database.add(initial_program)
+            if initial_artifacts:
+                self.database.store_artifacts(initial_program.id, initial_artifacts)
 
             # Check if combined_score is present in the metrics
             if "combined_score" not in initial_metrics:
@@ -490,16 +493,10 @@ class OpenEvolve:
                 import json
 
                 json.dump(
-                    {
-                        "id": best_program.id,
-                        "generation": best_program.generation,
-                        "iteration": best_program.iteration_found,
-                        "current_iteration": iteration,
-                        "metrics": best_program.metrics,
-                        "language": best_program.language,
-                        "timestamp": best_program.timestamp,
-                        "saved_at": time.time(),
-                    },
+                    self._best_program_info_payload(
+                        best_program,
+                        current_iteration=iteration,
+                    ),
                     f,
                     indent=2,
                 )
@@ -510,6 +507,42 @@ class OpenEvolve:
             )
 
         logger.info(f"Saved checkpoint at iteration {iteration} to {checkpoint_path}")
+
+    def _serializable_artifacts(self, program: Program) -> dict:
+        """Return JSON-serializable artifacts stored for a program."""
+        artifacts = self.database.get_artifacts(program.id)
+        serializable = {}
+        for key, value in artifacts.items():
+            if isinstance(value, bytes):
+                serializable[key] = value.decode("utf-8", errors="replace")
+            else:
+                serializable[key] = value
+        return serializable
+
+    def _best_program_info_payload(
+        self,
+        program: Program,
+        current_iteration: Optional[int] = None,
+    ) -> dict:
+        """Build the JSON payload saved next to a best program."""
+        payload = {
+            "id": program.id,
+            "generation": program.generation,
+            "iteration": program.iteration_found,
+            "metrics": program.metrics,
+            "language": program.language,
+            "timestamp": program.timestamp,
+            "saved_at": time.time(),
+        }
+        if current_iteration is not None:
+            payload["current_iteration"] = current_iteration
+        if program.parent_id is not None:
+            payload["parent_id"] = program.parent_id
+
+        artifacts = self._serializable_artifacts(program)
+        if artifacts:
+            payload["artifacts"] = artifacts
+        return payload
 
     def _load_checkpoint(self, checkpoint_path: str) -> None:
         """Load state from a checkpoint directory"""
@@ -581,19 +614,6 @@ class OpenEvolve:
         with open(info_path, "w") as f:
             import json
 
-            json.dump(
-                {
-                    "id": program.id,
-                    "generation": program.generation,
-                    "iteration": program.iteration_found,
-                    "timestamp": program.timestamp,
-                    "parent_id": program.parent_id,
-                    "metrics": program.metrics,
-                    "language": program.language,
-                    "saved_at": time.time(),
-                },
-                f,
-                indent=2,
-            )
+            json.dump(self._best_program_info_payload(program), f, indent=2)
 
         logger.info(f"Saved best program to {code_path} with program info to {info_path}")

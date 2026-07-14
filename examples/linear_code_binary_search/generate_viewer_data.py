@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from search_core import actual_minimum_distance
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_RECORD = SCRIPT_DIR / "Misc" / "ECCRecord.json"
@@ -120,14 +122,71 @@ def parse_matrix_verification(path: Path) -> dict[str, Any]:
     }
 
 
+def parse_artifact_json(value: Any, fallback: Any) -> Any:
+    """Decode a JSON artifact value if it is present."""
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return fallback
+    return value
+
+
+def parse_best_info_artifacts(best_info: dict[str, Any], n: int, k: int) -> dict[str, Any]:
+    """Build verification data from artifacts saved with best_program_info.json."""
+    artifacts = best_info.get("artifacts") or {}
+    if not isinstance(artifacts, dict):
+        return {
+            "status": "missing",
+            "distance": None,
+            "selectedFreeColumns": [],
+            "hRows": [],
+            "gRows": [],
+        }
+
+    search_result = parse_artifact_json(artifacts.get("search_result"), {})
+    matrix_summary = parse_artifact_json(artifacts.get("matrix_summary"), {})
+    h_rows = parse_artifact_json(artifacts.get("parity_check_matrix"), [])
+    g_rows = parse_artifact_json(artifacts.get("generator_matrix"), [])
+    selected_free_columns = list(search_result.get("selected_free_columns") or [])
+    if not selected_free_columns:
+        selected_free_columns = list(matrix_summary.get("selected_free_columns") or [])
+
+    if not selected_free_columns:
+        return {
+            "status": "missing",
+            "distance": None,
+            "selectedFreeColumns": [],
+            "hRows": list(h_rows) if isinstance(h_rows, list) else [],
+            "gRows": list(g_rows) if isinstance(g_rows, list) else [],
+        }
+
+    r = n - k
+    selected = tuple(int(bits, 2) for bits in selected_free_columns)
+    added_free_columns = int(search_result.get("added_free_columns", len(selected)))
+    complete = bool(search_result.get("success")) or bool(matrix_summary.get("complete"))
+    complete = complete and added_free_columns == k and len(selected) == k
+    distance = actual_minimum_distance(r, selected)
+
+    return {
+        "status": "complete" if complete else "partial",
+        "distance": distance,
+        "selectedFreeColumns": selected_free_columns,
+        "hRows": list(h_rows) if isinstance(h_rows, list) else [],
+        "gRows": list(g_rows) if isinstance(g_rows, list) else [],
+    }
+
+
 def read_best_info(path: Path) -> dict[str, Any]:
     """Read best_program_info.json when present."""
     if not path.exists():
-        return {"iteration": None, "metrics": {}, "timestamp": None}
+        return {"iteration": None, "metrics": {}, "timestamp": None, "artifacts": {}}
     try:
         info = json.loads(path.read_text())
     except json.JSONDecodeError:
-        return {"iteration": None, "metrics": {}, "timestamp": None}
+        return {"iteration": None, "metrics": {}, "timestamp": None, "artifacts": {}}
     best_program_time = info.get("saved_at")
     if best_program_time is None:
         best_program_time = info.get("timestamp")
@@ -136,6 +195,7 @@ def read_best_info(path: Path) -> dict[str, Any]:
         "generation": info.get("generation"),
         "metrics": info.get("metrics", {}),
         "timestamp": best_program_time,
+        "artifacts": info.get("artifacts", {}),
     }
 
 
@@ -181,6 +241,8 @@ def scan_attempts(search_roots: list[Path]) -> dict[tuple[int, int], list[dict[s
             n, k, target_distance = target
             verification = parse_matrix_verification(verification_path)
             best_info = read_best_info(best_info_path)
+            if verification["status"] == "missing":
+                verification = parse_best_info_artifacts(best_info, n, k)
             priority_source = (
                 best_program_path.read_text(errors="replace") if best_program_path else ""
             )
@@ -308,8 +370,11 @@ def build_detail(
 ) -> dict[str, Any]:
     """Build detail data for a searched cell."""
     complete_attempt = best_attempt if best_attempt and best_attempt["status"] == "complete" else None
-    serialized_attempts = [
-        {
+    serialized_attempts = []
+    for attempt in sorted(
+        attempts, key=lambda item: (item["targetDistance"], item["sourceRoot"], item["sourceRun"])
+    ):
+        serialized_attempt = {
             "targetDistance": attempt["targetDistance"],
             "status": attempt["status"],
             "actualDistance": attempt["actualDistance"],
@@ -320,8 +385,10 @@ def build_detail(
             "sourceRoot": attempt["sourceRoot"],
             "sourceRun": attempt["sourceRun"],
         }
-        for attempt in sorted(attempts, key=lambda item: (item["targetDistance"], item["sourceRoot"], item["sourceRun"]))
-    ]
+        for optional_key in ("method", "derivedFrom"):
+            if optional_key in attempt:
+                serialized_attempt[optional_key] = attempt[optional_key]
+        serialized_attempts.append(serialized_attempt)
     return {
         "n": n,
         "k": k,

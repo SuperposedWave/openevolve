@@ -124,3 +124,4 @@ evaluator:
 early_stopping_patience: -1
 convergence_threshold: 1.0
 early_stopping_metric: "combined_score"
+early_stopping_shutdown_mode: "terminate"

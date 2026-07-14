@@ -432,6 +432,7 @@ class Config:
     early_stopping_patience: Optional[int] = None
     convergence_threshold: float = 0.001
     early_stopping_metric: str = "combined_score"
+    early_stopping_shutdown_mode: str = "wait"  # Options: "wait", "terminate"
 
     # Parallel controller settings
     max_tasks_per_child: Optional[int] = None

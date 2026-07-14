@@ -1,4 +1,4 @@
-"""Compile and run evolved C priority functions for linear codes."""
+"""Compile and run evolved C priorities for binary maximum-code search."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ except Exception:
         Path(__file__).resolve().parents[2] / "openevolve" / "evaluation_result.py"
     )
     _EVAL_RESULT_SPEC = importlib.util.spec_from_file_location(
-        "openevolve_evaluation_result_c_kernel_fallback",
+        "openevolve_evaluation_result_max_c_kernel_fallback",
         _EVAL_RESULT_PATH,
     )
     if _EVAL_RESULT_SPEC is None or _EVAL_RESULT_SPEC.loader is None:
@@ -31,20 +31,15 @@ except Exception:
     _EVAL_RESULT_SPEC.loader.exec_module(_EVAL_RESULT_MODULE)
     EvaluationResult = _EVAL_RESULT_MODULE.EvaluationResult
 
-from search_core import (
-    format_mask,
-    generator_matrix_rows,
-    instance_from_env,
-    parity_check_matrix_rows,
-)
+from search_core import format_word, instance_from_env, validate_code
 
 
-METRIC_SUCCESS = 0
-METRIC_CONSTRUCTED_COLUMNS = 1
+METRIC_CODE_SIZE = 0
+METRIC_VALID = 1
 METRIC_CANDIDATE_COUNT = 2
 METRIC_SCORED_CANDIDATES = 3
-METRIC_SAMPLE_ATTEMPTS = 4
-METRIC_BACKTRACK_EVENTS = 5
+METRIC_REPAIR_ROLLOUT_EVALUATIONS = 4
+METRIC_REPAIR_EVENTS = 5
 METRIC_RESTART_INDEX = 6
 METRIC_BLOCKED_CANDIDATES = 7
 METRIC_FORBIDDEN_COUNT = 8
@@ -55,14 +50,14 @@ METRIC_STATE_INIT_SECONDS = 12
 METRIC_GREEDY_SCAN_SECONDS = 13
 METRIC_FORBIDDEN_COUNT_SECONDS = 14
 METRIC_C_RUN_SECONDS = 15
-METRIC_COUNT = 16
+METRIC_MINIMUM_DISTANCE = 16
+METRIC_COUNT = 17
 
-SELECTED_CAP = 4096
+SELECTED_CAP = 8192
 ERROR_CAP = 4096
-C_KERNEL_R_LIMIT = 60
-DENSE_BASELINE_R_LIMIT = 24
+MAX_SUPPORTED_N = 24
 COMPILE_TIMEOUT_SECONDS = 20
-RUN_TIMEOUT_SECONDS = 240
+RUN_TIMEOUT_SECONDS = 600
 
 BANNED_SOURCE_TOKENS = (
     "system(",
@@ -94,15 +89,15 @@ class CKernelCallResult:
 
 
 def evaluate_c_program_path(program_path: str) -> EvaluationResult:
-    """Evaluate a C priority function with the fixed search skeleton."""
+    """Evaluate a C priority function with the fixed maximum-code kernel."""
     instance = instance_from_env()
     started_at = time.perf_counter()
     program = Path(program_path)
 
-    if instance.r > C_KERNEL_R_LIMIT:
+    if instance.n > MAX_SUPPORTED_N:
         return _failure_result(
             "unsupported_instance",
-            f"C kernel ABI supports r <= {C_KERNEL_R_LIMIT}; got r={instance.r}",
+            f"C kernel currently supports n <= {MAX_SUPPORTED_N}; got n={instance.n}",
             started_at,
         )
 
@@ -110,7 +105,7 @@ def evaluate_c_program_path(program_path: str) -> EvaluationResult:
     if source_error:
         return _failure_result("source_rejected", source_error, started_at)
 
-    with tempfile.TemporaryDirectory(prefix="linear_code_c_kernel_") as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix="max_code_c_kernel_") as tmp_dir:
         shared_object = Path(tmp_dir) / "kernel.so"
         compile_started_at = time.perf_counter()
         compile_error = _compile_c_kernel(program, shared_object)
@@ -119,37 +114,36 @@ def evaluate_c_program_path(program_path: str) -> EvaluationResult:
             return _failure_result("compile_error", compile_error, started_at)
 
         seed = _env_seed()
-        run_call_started_at = time.perf_counter()
+        run_started_at = time.perf_counter()
         call_result = _run_kernel_with_timeout(
             shared_object,
             instance.n,
-            instance.k,
-            instance.target_distance,
+            instance.distance,
             instance.restarts,
             seed,
         )
-        run_call_seconds = time.perf_counter() - run_call_started_at
+        run_call_seconds = time.perf_counter() - run_started_at
 
     elapsed_seconds = time.perf_counter() - started_at
     if call_result.status != "ok":
         return _failure_result(call_result.status, call_result.error, started_at)
 
     metrics = call_result.metrics + (0.0,) * max(0, METRIC_COUNT - len(call_result.metrics))
-    selected = tuple(int(value) for value in call_result.selected[: instance.k])
-    constructed_columns = min(len(selected), instance.k)
-    is_success = call_result.return_code == 0 and constructed_columns == instance.k
-    progress = constructed_columns / instance.k
-    combined_score = 1.0 if is_success else progress
+    code_size = max(0, min(int(metrics[METRIC_CODE_SIZE]), SELECTED_CAP))
+    selected = tuple(int(value) for value in call_result.selected[:code_size])
+    valid = bool(call_result.return_code == 0 and metrics[METRIC_VALID] >= 0.5)
+    if selected:
+        valid = valid and validate_code(selected, instance.distance)
+    minimum_distance = int(metrics[METRIC_MINIMUM_DISTANCE])
+    combined_score = float(code_size if valid else 0)
 
     artifacts = _success_artifacts(
         instance_name=instance.name,
         n=instance.n,
-        k=instance.k,
-        d=instance.target_distance,
+        d=instance.distance,
         restarts=instance.restarts,
         selected=selected,
-        success=is_success,
-        constructed_columns=constructed_columns,
+        valid=valid,
         metrics=metrics,
         c_return_code=call_result.return_code,
         c_error=call_result.error,
@@ -160,15 +154,14 @@ def evaluate_c_program_path(program_path: str) -> EvaluationResult:
     return EvaluationResult(
         metrics={
             "combined_score": combined_score,
-            "success_rate": float(is_success),
-            "avg_progress": progress,
-            "constructed_columns": constructed_columns,
+            "code_size": float(code_size),
+            "valid": float(valid),
+            "minimum_distance": float(minimum_distance),
+            "target_distance": float(instance.distance),
+            "n": float(instance.n),
             "scored_candidates": metrics[METRIC_SCORED_CANDIDATES],
             "forbidden_count": metrics[METRIC_FORBIDDEN_COUNT],
-            "target_columns": instance.k,
-            "target_distance": instance.target_distance,
-            "n": instance.n,
-            "k": instance.k,
+            "repair_rollout_evaluations": metrics[METRIC_REPAIR_ROLLOUT_EVALUATIONS],
             "evaluation_time_seconds": elapsed_seconds,
         },
         artifacts=artifacts,
@@ -183,14 +176,11 @@ def _scan_source(program_path: Path) -> str | None:
     for token in BANNED_SOURCE_TOKENS:
         if token in source:
             return f"C source uses banned token: {token}"
-    priority_only_error = _validate_priority_only_source(source)
-    if priority_only_error:
-        return priority_only_error
-    return None
+    return _validate_priority_only_source(source)
 
 
 def _validate_priority_only_source(source: str) -> str | None:
-    """Reject C variants that modify code outside the priority EVOLVE-BLOCK."""
+    """Reject variants that modify code outside the priority EVOLVE-BLOCK."""
     try:
         baseline = BASELINE_C_PROGRAM.read_text(encoding="utf-8")
     except OSError as exc:
@@ -203,12 +193,11 @@ def _validate_priority_only_source(source: str) -> str | None:
     if baseline_error:
         return f"baseline C source is invalid: {baseline_error}"
     if source_protected != baseline_protected:
-        return "C source changed code outside the oe_linear_code_priority EVOLVE-BLOCK"
+        return "C source changed code outside the oe_max_code_priority EVOLVE-BLOCK"
     return None
 
 
 def _protected_source(source: str) -> tuple[str, str | None]:
-    """Return source with evolve-block contents removed, preserving protected text."""
     lines = source.splitlines(keepends=True)
     protected_lines: list[str] = []
     in_block = False
@@ -262,7 +251,7 @@ def _compile_c_kernel(program_path: Path, shared_object: Path) -> str | None:
             check=False,
             capture_output=True,
             text=True,
-            timeout=_env_int("LINEAR_CODE_C_COMPILE_TIMEOUT", COMPILE_TIMEOUT_SECONDS),
+            timeout=_env_int("MAX_CODE_C_COMPILE_TIMEOUT", COMPILE_TIMEOUT_SECONDS),
         )
     except subprocess.TimeoutExpired:
         return "C kernel compilation timed out"
@@ -276,7 +265,6 @@ def _compile_c_kernel(program_path: Path, shared_object: Path) -> str | None:
 def _run_kernel_with_timeout(
     shared_object: Path,
     n: int,
-    k: int,
     d: int,
     restarts: int,
     seed: int,
@@ -285,10 +273,10 @@ def _run_kernel_with_timeout(
     result_queue = context.Queue(maxsize=1)
     process = context.Process(
         target=_call_kernel_worker,
-        args=(str(shared_object), n, k, d, restarts, seed, result_queue),
+        args=(str(shared_object), n, d, restarts, seed, result_queue),
     )
     process.start()
-    timeout = _env_int("LINEAR_CODE_C_RUN_TIMEOUT", RUN_TIMEOUT_SECONDS)
+    timeout = _env_int("MAX_CODE_C_RUN_TIMEOUT", RUN_TIMEOUT_SECONDS)
     process.join(timeout)
     if process.is_alive():
         process.terminate()
@@ -307,7 +295,6 @@ def _run_kernel_with_timeout(
 def _call_kernel_worker(
     shared_object: str,
     n: int,
-    k: int,
     d: int,
     restarts: int,
     seed: int,
@@ -315,9 +302,8 @@ def _call_kernel_worker(
 ) -> None:
     try:
         library = ctypes.CDLL(shared_object)
-        run_fn = library.oe_linear_code_run
+        run_fn = library.oe_max_code_run
         run_fn.argtypes = [
-            ctypes.c_int,
             ctypes.c_int,
             ctypes.c_int,
             ctypes.c_int,
@@ -330,7 +316,7 @@ def _call_kernel_worker(
             ctypes.c_int,
         ]
         run_fn.restype = ctypes.c_int
-        getattr(library, "oe_linear_code_priority")
+        getattr(library, "oe_max_code_priority")
 
         selected_out = (ctypes.c_ulonglong * SELECTED_CAP)()
         metrics_out = (ctypes.c_double * METRIC_COUNT)()
@@ -338,7 +324,6 @@ def _call_kernel_worker(
         return_code = int(
             run_fn(
                 n,
-                k,
                 d,
                 restarts,
                 seed,
@@ -350,7 +335,7 @@ def _call_kernel_worker(
                 ERROR_CAP,
             )
         )
-        selected_count = max(0, min(int(metrics_out[METRIC_CONSTRUCTED_COLUMNS]), SELECTED_CAP))
+        selected_count = max(0, min(int(metrics_out[METRIC_CODE_SIZE]), SELECTED_CAP))
         payload = {
             "status": "ok",
             "return_code": return_code,
@@ -369,12 +354,10 @@ def _success_artifacts(
     *,
     instance_name: str,
     n: int,
-    k: int,
     d: int,
     restarts: int,
     selected: tuple[int, ...],
-    success: bool,
-    constructed_columns: int,
+    valid: bool,
     metrics: Sequence[float],
     c_return_code: int,
     c_error: str,
@@ -382,37 +365,29 @@ def _success_artifacts(
     run_call_seconds: float,
     evaluation_seconds: float,
 ) -> dict[str, str]:
-    r = n - k
-    parity_rows = parity_check_matrix_rows(r, selected)
-    generator_rows = generator_matrix_rows(r, selected)
-    selected_bits = [format_mask(mask, r) for mask in selected]
+    codewords = [format_word(mask, n) for mask in selected]
     search_result = {
-        "success": success,
-        "search_mode": "c_kernel",
+        "search_mode": "c_kernel_mcts",
         "legality_engine": "c_kernel",
-        "native_r_limit": 0,
-        "forbidden_count": int(metrics[METRIC_FORBIDDEN_COUNT]),
-        "restart": int(metrics[METRIC_RESTART_INDEX]),
-        "added_free_columns": constructed_columns,
+        "valid": valid,
+        "code_size": int(metrics[METRIC_CODE_SIZE]),
+        "minimum_distance": int(metrics[METRIC_MINIMUM_DISTANCE]),
         "candidate_count": int(metrics[METRIC_CANDIDATE_COUNT]),
-        "sample_attempts": int(metrics[METRIC_SAMPLE_ATTEMPTS]),
-        "max_candidates": _env_int("LINEAR_CODE_MAX_CANDIDATES", 1_000_000_000),
-        "sampled_candidates": (
-            int(metrics[METRIC_SCORED_CANDIDATES])
-            if int(metrics[METRIC_SCORED_CANDIDATES]) < int(metrics[METRIC_CANDIDATE_COUNT])
-            else 0
-        ),
         "scored_candidates": int(metrics[METRIC_SCORED_CANDIDATES]),
-        "backtrack_events": int(metrics[METRIC_BACKTRACK_EVENTS]),
-        "repair_mode": os.environ.get("LINEAR_CODE_REPAIR_MODE", "greedy"),
-        "dynamic_growth_estimate": os.environ.get("LINEAR_CODE_DYNAMIC_GROWTH_ESTIMATE", "1"),
-        "repair_mcts_simulations": _env_int("LINEAR_CODE_REPAIR_MCTS_SIMULATIONS", 64),
-        "repair_mcts_depth": _env_int("LINEAR_CODE_REPAIR_MCTS_DEPTH", 4),
-        "repair_mcts_workers": os.environ.get("LINEAR_CODE_REPAIR_MCTS_WORKERS", "1"),
         "blocked_candidates": int(metrics[METRIC_BLOCKED_CANDIDATES]),
-        "target_free_columns": k,
-        "selected_free_columns": selected_bits,
-        "chosen_weights": [mask.bit_count() for mask in selected],
+        "forbidden_count": int(metrics[METRIC_FORBIDDEN_COUNT]),
+        "restart_index": int(metrics[METRIC_RESTART_INDEX]),
+        "repair_mode": os.environ.get("MAX_CODE_REPAIR_MODE", "greedy"),
+        "repair_moves": int(metrics[METRIC_REPAIR_EVENTS]),
+        "repair_gain": 0,
+        "repair_rollout_evaluations": int(metrics[METRIC_REPAIR_ROLLOUT_EVALUATIONS]),
+        "repair_candidate_window": _env_int("MAX_CODE_REPAIR_CANDIDATE_WINDOW", 65536),
+        "dynamic_window": _env_int("MAX_CODE_DYNAMIC_WINDOW", 4096),
+        "repair_mcts_simulations": _env_int("MAX_CODE_REPAIR_MCTS_SIMULATIONS", 64),
+        "repair_mcts_depth": _env_int("MAX_CODE_REPAIR_MCTS_DEPTH", 4),
+        "repair_mcts_drop_topk": _env_int("MAX_CODE_REPAIR_MCTS_DROP_TOPK", 2),
+        "repair_mcts_workers": _env_int_min("MAX_CODE_REPAIR_MCTS_WORKERS", 1, 0),
+        "max_supported_n": MAX_SUPPORTED_N,
         "c_return_code": c_return_code,
         "c_error": c_error,
         "timing_seconds": {
@@ -428,28 +403,13 @@ def _success_artifacts(
             "forbidden_count_total": metrics[METRIC_FORBIDDEN_COUNT_SECONDS],
         },
     }
-    matrix_summary = {
-        "form": "H=[P^T|I_r], G=[I_k|P]",
-        "complete": constructed_columns == k,
-        "n": n,
-        "k": k,
-        "d": d,
-        "r": r,
-        "filled_free_columns": constructed_columns,
-        "target_free_columns": k,
-        "h_shape": [r, constructed_columns + r],
-        "g_shape": [constructed_columns, constructed_columns + r],
-        "selected_free_columns": selected_bits,
-    }
     return {
         "instance": json.dumps(
-            {"name": instance_name, "n": n, "k": k, "d": d, "restarts": restarts},
+            {"name": instance_name, "n": n, "d": d, "restarts": restarts},
             sort_keys=True,
         ),
+        "codewords": json.dumps(codewords),
         "search_result": json.dumps(search_result, sort_keys=True),
-        "matrix_summary": json.dumps(matrix_summary, sort_keys=True),
-        "parity_check_matrix": json.dumps(list(parity_rows)),
-        "generator_matrix": json.dumps(list(generator_rows)),
     }
 
 
@@ -461,21 +421,25 @@ def _failure_result(error_type: str, message: str, started_at: float) -> Evaluat
             {
                 "name": instance.name,
                 "n": instance.n,
-                "k": instance.k,
-                "d": instance.target_distance,
+                "d": instance.distance,
                 "restarts": instance.restarts,
             },
             sort_keys=True,
         ),
+        "codewords": json.dumps([]),
         "search_result": json.dumps(
             {
-                "success": False,
-                "search_mode": "c_kernel",
+                "search_mode": "c_kernel_mcts",
+                "legality_engine": "c_kernel",
                 "error_type": error_type,
                 "error": message,
-                "added_free_columns": 0,
-                "target_free_columns": instance.k,
-                "selected_free_columns": [],
+                "valid": False,
+                "code_size": 0,
+                "minimum_distance": 0,
+                "repair_mode": os.environ.get("MAX_CODE_REPAIR_MODE", "greedy"),
+                "repair_moves": 0,
+                "repair_gain": 0,
+                "repair_rollout_evaluations": 0,
             },
             sort_keys=True,
         ),
@@ -484,15 +448,14 @@ def _failure_result(error_type: str, message: str, started_at: float) -> Evaluat
     return EvaluationResult(
         metrics={
             "combined_score": 0.0,
-            "success_rate": 0.0,
-            "avg_progress": 0.0,
-            "constructed_columns": 0.0,
+            "code_size": 0.0,
+            "valid": 0.0,
+            "minimum_distance": 0.0,
+            "target_distance": float(instance.distance),
+            "n": float(instance.n),
             "scored_candidates": 0.0,
             "forbidden_count": 0.0,
-            "target_columns": instance.k,
-            "target_distance": instance.target_distance,
-            "n": instance.n,
-            "k": instance.k,
+            "repair_rollout_evaluations": 0.0,
             "evaluation_time_seconds": elapsed_seconds,
         },
         artifacts=artifacts,
@@ -500,7 +463,7 @@ def _failure_result(error_type: str, message: str, started_at: float) -> Evaluat
 
 
 def _env_seed() -> int:
-    raw_value = os.environ.get("LINEAR_CODE_RANDOM_SEED", "0")
+    raw_value = os.environ.get("MAX_CODE_RANDOM_SEED", "0")
     try:
         return max(int(raw_value), 0)
     except ValueError:
@@ -508,10 +471,14 @@ def _env_seed() -> int:
 
 
 def _env_int(name: str, default: int) -> int:
+    return _env_int_min(name, default, 1)
+
+
+def _env_int_min(name: str, default: int, minimum: int) -> int:
     raw_value = os.environ.get(name)
     if raw_value is None:
         return default
     try:
-        return max(int(raw_value), 1)
+        return max(int(raw_value), minimum)
     except ValueError:
         return default

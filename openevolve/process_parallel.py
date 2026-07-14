@@ -5,6 +5,7 @@ Process-based parallel controller for true parallelism
 import asyncio
 import logging
 import multiprocessing as mp
+import os
 import pickle
 import signal
 import time
@@ -38,11 +39,16 @@ class SerializableResult:
 
 def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
     """Initialize worker process with necessary components"""
-    import os
 
     # Set environment from parent process
     if parent_env:
         os.environ.update(parent_env)
+
+    if hasattr(os, "setpgrp"):
+        try:
+            os.setpgrp()
+        except OSError:
+            logger.debug("Could not isolate worker process group", exc_info=True)
 
     global _worker_config
     global _worker_evaluation_file
@@ -399,6 +405,7 @@ class ProcessParallelController:
             "early_stopping_patience": config.early_stopping_patience,
             "convergence_threshold": config.convergence_threshold,
             "early_stopping_metric": config.early_stopping_metric,
+            "early_stopping_shutdown_mode": config.early_stopping_shutdown_mode,
             "max_tasks_per_child": config.max_tasks_per_child,
         }
 
@@ -437,11 +444,87 @@ class ProcessParallelController:
         """Stop the process pool"""
         self.shutdown_event.set()
 
-        if self.executor:
-            self.executor.shutdown(wait=True)
-            self.executor = None
+        self._shutdown_executor(wait=True, cancel_futures=True)
 
         logger.info("Stopped process pool")
+
+    def _shutdown_executor(
+        self,
+        *,
+        wait: bool,
+        cancel_futures: bool,
+        terminate_workers: bool = False,
+    ) -> None:
+        """Shut down the process pool, optionally terminating active workers."""
+        if not self.executor:
+            return
+
+        executor = self.executor
+        processes = self._executor_processes(executor) if terminate_workers else []
+
+        if terminate_workers:
+            self._terminate_worker_processes(processes, signal.SIGTERM, join_timeout=2.0)
+
+        executor.shutdown(wait=wait and not terminate_workers, cancel_futures=cancel_futures)
+        self.executor = None
+
+        if terminate_workers:
+            alive_processes = [process for process in processes if process.is_alive()]
+            if alive_processes:
+                kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+                self._terminate_worker_processes(alive_processes, kill_signal, join_timeout=1.0)
+
+    def _executor_processes(self, executor: ProcessPoolExecutor) -> List[mp.Process]:
+        """Return currently known worker processes for Python versions without public terminate APIs."""
+        processes = getattr(executor, "_processes", None)
+        if not processes:
+            return []
+        return list(processes.values())
+
+    def _terminate_worker_processes(
+        self,
+        processes: List[mp.Process],
+        sig: signal.Signals,
+        *,
+        join_timeout: float,
+    ) -> None:
+        """Terminate workers and their child process groups when possible."""
+        for process in processes:
+            if not process.is_alive():
+                continue
+            try:
+                if os.name != "nt" and process.pid is not None:
+                    pgid = os.getpgid(process.pid)
+                    if pgid == process.pid:
+                        os.killpg(pgid, sig)
+                    else:
+                        process.terminate()
+                else:
+                    process.terminate()
+            except ProcessLookupError:
+                continue
+            except OSError:
+                logger.debug("Failed to signal worker process %s", process.pid, exc_info=True)
+
+        for process in processes:
+            process.join(join_timeout)
+
+    def _early_stopping_shutdown_mode(self) -> str:
+        mode = str(getattr(self.config, "early_stopping_shutdown_mode", "wait")).lower()
+        if mode not in {"wait", "terminate"}:
+            logger.warning(
+                "Unknown early_stopping_shutdown_mode=%r; falling back to 'wait'",
+                mode,
+            )
+            return "wait"
+        return mode
+
+    def _cancel_pending_futures(self, pending_futures: Dict[int, Future], reason: str) -> None:
+        if not pending_futures:
+            return
+        logger.info("%s, canceling %d pending evaluations...", reason, len(pending_futures))
+        for future in pending_futures.values():
+            future.cancel()
 
     def request_shutdown(self) -> None:
         """Request graceful shutdown"""
@@ -788,9 +871,17 @@ class ProcessParallelController:
 
         # Handle shutdown
         if self.shutdown_event.is_set():
-            logger.info("Shutdown requested, canceling remaining evaluations...")
-            for future in pending_futures.values():
-                future.cancel()
+            self._cancel_pending_futures(pending_futures, "Shutdown requested")
+
+        if self.early_stopping_triggered:
+            self._cancel_pending_futures(pending_futures, "Early stopping triggered")
+            if self._early_stopping_shutdown_mode() == "terminate":
+                logger.info("Terminating process pool due to early stopping")
+                self._shutdown_executor(
+                    wait=False,
+                    cancel_futures=True,
+                    terminate_workers=True,
+                )
 
         # Log completion reason
         if self.early_stopping_triggered:

@@ -1,0 +1,125 @@
+# Configuration for C-kernel binary maximum-code search.
+# Override the target before running, for example:
+#   MAX_CODE_N=17 MAX_CODE_D=6 python ../../openevolve-run.py initial_program.c evaluator.py --config Configs/config_c_kernel.yaml
+
+max_iterations: 120
+checkpoint_interval: 10
+log_level: "INFO"
+random_seed: 123
+
+diff_based_evolution: true
+max_code_length: 32768
+
+llm_config_path: "llm_config_Boyue.yaml"
+
+environment:
+  MAX_CODE_N: "17"
+  MAX_CODE_D: "6"
+  MAX_CODE_RESTARTS: "1"
+  MAX_CODE_PARITY_FULL_BATCH_SIZE: "64"
+  MAX_CODE_PARITY_FULL_SCAN_N: "18"
+  MAX_CODE_LOCAL_SAMPLE_SIZE: "64"
+  MAX_CODE_RANDOM_SEED: "0"
+  MAX_CODE_REPAIR_MODE: "mcts"
+  MAX_CODE_DYNAMIC_WINDOW: "4096"
+  MAX_CODE_REPAIR_EVENTS: "4"
+  MAX_CODE_REPAIR_DROP_COUNT: "1"
+  MAX_CODE_REPAIR_TABU_TENURE: "4"
+  MAX_CODE_REPAIR_CANDIDATE_WINDOW: "65536"
+  MAX_CODE_REPAIR_MCTS_SIMULATIONS: "64"
+  MAX_CODE_REPAIR_MCTS_DEPTH: "4"
+  MAX_CODE_REPAIR_MCTS_DROP_TOPK: "2"
+  MAX_CODE_REPAIR_MCTS_WORKERS: "1"
+
+prompt:
+  system_message: |
+    You are improving a C priority function for binary maximum-code search.
+
+    Current default target:
+    - n = 17
+    - d = 6
+
+    A binary code is a set C of n-bit words. The goal is to make |C| as large as
+    possible while every two distinct words have Hamming distance at least d.
+    This is the classical A(n,d) maximum-code problem over F_2.
+
+    The fixed C skeleton handles candidate enumeration, forbidden-ball bitsets,
+    exact legality, dynamic refill, tabu repair, and MCTS root-drop rollouts.
+    Your program should only improve the EVOLVE-BLOCK inside:
+
+      double oe_max_code_priority(
+          uint64_t word_mask,
+          int n,
+          int d,
+          int step,
+          int word_weight,
+          uint64_t forbidden_count,
+          uint64_t new_forbidden_count,
+          uint64_t overlap_forbidden_count,
+          uint64_t local_available_count
+      )
+
+    Feature meaning:
+    - word_mask is the candidate n-bit word represented as a uint64_t.
+    - step is the number of codewords already accepted, including the forced zero word.
+    - word_weight is the Hamming weight of word_mask.
+    - forbidden_count is the current size of the forbidden union.
+    - new_forbidden_count is how many words would become newly forbidden if this candidate were accepted.
+    - overlap_forbidden_count is how much of the candidate ball was already forbidden.
+    - local_available_count estimates nearby legal future candidates.
+
+    Search behavior:
+    - the zero word is fixed in the code and is never dropped by MCTS repair
+    - the skeleton first performs dynamic greedy fill over a bounded candidate window
+    - when stuck and MAX_CODE_REPAIR_MODE=mcts, it evaluates root drops with bounded rollout refill
+    - root rewards prefer more constructed codewords, then fewer drops, fewer rollout steps, and smaller forbidden sets
+    - C-internal MCTS rollout workers are controlled by MAX_CODE_REPAIR_MCTS_WORKERS
+
+    Success criterion:
+    - maximize the verified final code size
+    - the final fitness score is exactly the number of verified codewords
+
+    Rules:
+    - keep the same C function signature
+    - keep all edits inside the EVOLVE-BLOCK
+    - do not use randomness
+    - do not use system calls, file I/O, networking, or dynamic allocation
+    - do not reimplement the search or legality checks
+    - return a finite double
+
+    Useful heuristic ideas:
+    - prioritize candidates that add few new forbidden words
+    - prefer candidates whose forbidden ball overlaps already-forbidden space
+    - preserve local availability so the greedy process leaves fewer holes
+    - use Hamming weight, bit balance, runs, endpoints, complements, and simple hashes as secondary tie-breakers
+    - avoid ranking too many candidates with exactly the same score
+  num_top_programs: 5
+  num_diverse_programs: 3
+  include_artifacts: false
+  max_artifact_bytes: 10240
+
+database:
+  population_size: 128
+  archive_size: 48
+  num_islands: 16
+  elite_selection_ratio: 0.2
+  exploration_ratio: 0.45
+  exploitation_ratio: 0.35
+  feature_dimensions: ["code_size", "minimum_distance"]
+  feature_bins: 6
+  migration_interval: 4
+  migration_rate: 0.25
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 600
+  max_retries: 1
+  cascade_evaluation: false
+  parallel_evaluations: 1
+  use_llm_feedback: false
+  enable_artifacts: true
+
+early_stopping_patience: -1
+convergence_threshold: 1.0
+early_stopping_metric: "combined_score"
+early_stopping_shutdown_mode: "terminate"

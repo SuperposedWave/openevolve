@@ -1,0 +1,11 @@
+# Shared LLM configuration for binary linear-code search.
+
+llm:
+  api_base: "http://35.220.164.252:3888/v1"
+  api_key: "sk-SwQpGOozeLWWhh81d33HtJO1FCCVnk2RqqOVZH5DxKU13siT"
+  models:
+    - name: "bailian/deepseek-v4-flash"
+      weight: 1.0
+  temperature: 0.7
+  max_tokens: 32768
+  timeout: 600

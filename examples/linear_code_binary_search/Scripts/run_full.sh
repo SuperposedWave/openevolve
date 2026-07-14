@@ -4,8 +4,7 @@ set -euo pipefail
 . /inspire/hdd/project/qproject-multireasoning/zhouzhixiang-240107010008/miniconda3/bin/activate
 conda activate openevolve
 cd /inspire/hdd/project/qproject-multireasoning/zhouzhixiang-240107010008/Project/openevolve-c-kernel
-
-export OPENAI_API_KEY=sk-c5bcdfcbc67a4652a00b0111a44ec52a
+. examples/linear_code_binary_search/Scripts/record_sqlite.sh
 
 LINEAR_CODE_N="${LINEAR_CODE_N:-42}"
 LINEAR_CODE_K="${LINEAR_CODE_K:-27}"
@@ -20,6 +19,7 @@ LINEAR_CODE_REPAIR_CANDIDATE_WINDOW="${LINEAR_CODE_REPAIR_CANDIDATE_WINDOW:-6553
 LINEAR_CODE_REPAIR_TABU_TENURE="${LINEAR_CODE_REPAIR_TABU_TENURE:-4}"
 LINEAR_CODE_NATIVE_MAX_INITIAL_VALUES="${LINEAR_CODE_NATIVE_MAX_INITIAL_VALUES:-2000000000000}"
 LINEAR_CODE_C_RUN_TIMEOUT="${LINEAR_CODE_C_RUN_TIMEOUT:-2400}"
+EARLY_STOPPING_SHUTDOWN_MODE="${EARLY_STOPPING_SHUTDOWN_MODE:-terminate}"
 ITERATIONS="${ITERATIONS:-512}"
 
 INITIAL_PROGRAM="${INITIAL_PROGRAM:-examples/linear_code_binary_search/outputs/n30_k16_d7/n30_k16_d7/best/best_program.c}"
@@ -75,6 +75,9 @@ def resolve_llm_path(match):
 resolved_path.write_text(llm_path_re.sub(resolve_llm_path, resolved_text, count=1))
 PY
 
+linear_code_set_early_stopping_shutdown_mode "$RESOLVED_CONFIG" "$EARLY_STOPPING_SHUTDOWN_MODE"
+
+set +e
 LINEAR_CODE_PROFILE=1 \
 LINEAR_CODE_NATIVE_MAX_INITIAL_VALUES="$LINEAR_CODE_NATIVE_MAX_INITIAL_VALUES" \
 LINEAR_CODE_CANDIDATE_EXECUTOR=process \
@@ -96,3 +99,8 @@ python openevolve-run.py \
   --config "$RESOLVED_CONFIG" \
   --iterations "$ITERATIONS" \
   --output "$OUTPUT_DIR"
+openevolve_status=$?
+set -e
+
+linear_code_record_sqlite "$OUTPUT_DIR" "$OUTPUT_ROOT"
+exit "$openevolve_status"

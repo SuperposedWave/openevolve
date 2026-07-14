@@ -153,6 +153,58 @@ def evaluate(program_path):
         # Run the async test
         asyncio.run(run_test())
 
+    def test_early_stopping_terminate_mode_cancels_pending_work(self):
+        """Test early stopping terminate mode cancels pending futures and shuts down the pool."""
+
+        async def run_test():
+            self.config.early_stopping_patience = -1
+            self.config.convergence_threshold = 1.0
+            self.config.early_stopping_metric = "combined_score"
+            self.config.early_stopping_shutdown_mode = "terminate"
+            controller = ProcessParallelController(self.config, self.eval_file, self.database)
+            controller.executor = MagicMock()
+
+            solved_future = MagicMock()
+            pending_future = MagicMock()
+
+            solved_future.done.return_value = True
+            pending_future.done.return_value = False
+            solved_future.result.return_value = SerializableResult(
+                child_program_dict={
+                    "id": "solved_child",
+                    "code": "def evolved(): return 1",
+                    "language": "python",
+                    "parent_id": "test_0",
+                    "generation": 1,
+                    "metrics": {"combined_score": 1.0},
+                    "iteration_found": 1,
+                    "metadata": {"changes": "test", "island": 0},
+                },
+                parent_id="test_0",
+                iteration_time=0.1,
+                iteration=1,
+            )
+
+            with (
+                patch.object(
+                    controller,
+                    "_submit_iteration",
+                    side_effect=[solved_future, pending_future],
+                ),
+                patch.object(controller, "_shutdown_executor") as mock_shutdown_executor,
+            ):
+                await controller.run_evolution(start_iteration=1, max_iterations=2)
+
+            self.assertTrue(controller.early_stopping_triggered)
+            pending_future.cancel.assert_called_once()
+            mock_shutdown_executor.assert_called_once_with(
+                wait=False,
+                cancel_futures=True,
+                terminate_workers=True,
+            )
+
+        asyncio.run(run_test())
+
     def test_request_shutdown(self):
         """Test graceful shutdown request"""
         controller = ProcessParallelController(self.config, self.eval_file, self.database)

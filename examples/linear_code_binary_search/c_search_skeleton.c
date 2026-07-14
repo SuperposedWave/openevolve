@@ -67,6 +67,41 @@ typedef struct {
 } RepairReward;
 
 typedef struct {
+    int visits;
+    int has_best;
+    RepairReward best_reward;
+    uint64_t best_after_forbidden;
+    uint64_t success_count;
+    uint64_t total_constructed;
+    uint64_t total_dropped;
+    uint64_t total_steps;
+    uint64_t total_forbidden;
+} RepairRootStats;
+
+typedef struct {
+    Candidate *candidates;
+    uint64_t candidate_count;
+    const uint64_t *selected;
+    int selected_count;
+    int n;
+    int k;
+    int d;
+    int restart;
+    int repair_event_index;
+    uint64_t seed;
+    uint64_t dynamic_window;
+    uint64_t rollout_depth;
+    uint64_t drop_topk;
+    const uint64_t *tabu_masks;
+    int tabu_count;
+    int estimate_growth;
+    uint64_t simulation_start;
+    uint64_t simulation_end;
+    RepairRootStats *root_stats;
+    uint64_t dynamic_evaluations;
+} MctsRolloutJob;
+
+typedef struct {
     uint64_t *bits;
     uint64_t *touched_values;
     uint64_t touched_count;
@@ -916,6 +951,103 @@ static int reward_is_better(RepairReward candidate, RepairReward current, int ha
     return candidate.forbidden_count_value < current.forbidden_count_value;
 }
 
+static int ratio_greater(uint64_t left_num, uint64_t left_den, uint64_t right_num, uint64_t right_den) {
+    return (__uint128_t)left_num * (__uint128_t)right_den
+        > (__uint128_t)right_num * (__uint128_t)left_den;
+}
+
+static int ratio_less(uint64_t left_num, uint64_t left_den, uint64_t right_num, uint64_t right_den) {
+    return (__uint128_t)left_num * (__uint128_t)right_den
+        < (__uint128_t)right_num * (__uint128_t)left_den;
+}
+
+static int root_stats_is_better(
+    const RepairRootStats *candidate,
+    const RepairRootStats *current,
+    int has_current
+) {
+    if (!candidate || candidate->visits <= 0 || !candidate->has_best) {
+        return 0;
+    }
+    if (!has_current || !current || current->visits <= 0 || !current->has_best) {
+        return 1;
+    }
+    uint64_t candidate_visits = (uint64_t)candidate->visits;
+    uint64_t current_visits = (uint64_t)current->visits;
+    if (ratio_greater(candidate->success_count, candidate_visits, current->success_count, current_visits)) {
+        return 1;
+    }
+    if (ratio_greater(current->success_count, current_visits, candidate->success_count, candidate_visits)) {
+        return 0;
+    }
+    if (reward_is_better(candidate->best_reward, current->best_reward, current->has_best)) {
+        return 1;
+    }
+    if (reward_is_better(current->best_reward, candidate->best_reward, candidate->has_best)) {
+        return 0;
+    }
+    if (ratio_greater(candidate->total_constructed, candidate_visits, current->total_constructed, current_visits)) {
+        return 1;
+    }
+    if (ratio_greater(current->total_constructed, current_visits, candidate->total_constructed, candidate_visits)) {
+        return 0;
+    }
+    if (ratio_less(candidate->total_dropped, candidate_visits, current->total_dropped, current_visits)) {
+        return 1;
+    }
+    if (ratio_less(current->total_dropped, current_visits, candidate->total_dropped, candidate_visits)) {
+        return 0;
+    }
+    if (ratio_less(candidate->total_steps, candidate_visits, current->total_steps, current_visits)) {
+        return 1;
+    }
+    if (ratio_less(current->total_steps, current_visits, candidate->total_steps, candidate_visits)) {
+        return 0;
+    }
+    return ratio_less(candidate->total_forbidden, candidate_visits, current->total_forbidden, current_visits);
+}
+
+static void update_root_stats(
+    RepairRootStats *stats,
+    RepairReward reward,
+    uint64_t after_forbidden,
+    int original_selected_count
+) {
+    stats->visits++;
+    stats->total_constructed += (uint64_t)reward.constructed_count;
+    stats->total_dropped += (uint64_t)reward.dropped_count;
+    stats->total_steps += (uint64_t)reward.steps;
+    stats->total_forbidden += reward.forbidden_count_value;
+    if (reward.constructed_count >= original_selected_count) {
+        stats->success_count++;
+    }
+    if (reward_is_better(reward, stats->best_reward, stats->has_best)) {
+        stats->best_reward = reward;
+        stats->best_after_forbidden = after_forbidden;
+        stats->has_best = 1;
+    }
+}
+
+static void merge_root_stats(RepairRootStats *target, const RepairRootStats *source) {
+    if (!target || !source || source->visits <= 0) {
+        return;
+    }
+    target->visits += source->visits;
+    target->success_count += source->success_count;
+    target->total_constructed += source->total_constructed;
+    target->total_dropped += source->total_dropped;
+    target->total_steps += source->total_steps;
+    target->total_forbidden += source->total_forbidden;
+    if (
+        source->has_best
+        && reward_is_better(source->best_reward, target->best_reward, target->has_best)
+    ) {
+        target->best_reward = source->best_reward;
+        target->best_after_forbidden = source->best_after_forbidden;
+        target->has_best = 1;
+    }
+}
+
 static int rebuild_after_drop(
     DenseState *state,
     int r,
@@ -937,6 +1069,143 @@ static int rebuild_after_drop(
     return out_count;
 }
 
+static int drop_choice_is_better(
+    uint64_t candidate_legal_count,
+    uint64_t candidate_release,
+    uint32_t candidate_tie,
+    uint64_t current_legal_count,
+    uint64_t current_release,
+    uint32_t current_tie
+) {
+    return candidate_legal_count > current_legal_count
+        || (
+            candidate_legal_count == current_legal_count
+            && candidate_release > current_release
+        )
+        || (
+            candidate_legal_count == current_legal_count
+            && candidate_release == current_release
+            && candidate_tie > current_tie
+        );
+}
+
+static int choose_rollout_drop_index(
+    Candidate *candidates,
+    uint64_t candidate_count,
+    const uint64_t *selected,
+    int selected_count,
+    int r,
+    int d,
+    int restart,
+    int repair_event_index,
+    int step,
+    uint64_t before_forbidden_count,
+    uint64_t repair_candidate_window,
+    const uint64_t *tabu_masks,
+    int tabu_count,
+    uint64_t drop_topk,
+    uint64_t *rng_state
+) {
+    if (selected_count <= 0) {
+        return -1;
+    }
+    if (drop_topk == 0ULL) {
+        return (int)(rng_next(rng_state) % (uint64_t)selected_count);
+    }
+    if (drop_topk > (uint64_t)selected_count) {
+        drop_topk = (uint64_t)selected_count;
+    }
+
+    int *top_indices = (int *)calloc((size_t)drop_topk, sizeof(int));
+    uint64_t *top_legal_counts = (uint64_t *)calloc((size_t)drop_topk, sizeof(uint64_t));
+    uint64_t *top_releases = (uint64_t *)calloc((size_t)drop_topk, sizeof(uint64_t));
+    uint32_t *top_ties = (uint32_t *)calloc((size_t)drop_topk, sizeof(uint32_t));
+    if (!top_indices || !top_legal_counts || !top_releases || !top_ties) {
+        free(top_indices);
+        free(top_legal_counts);
+        free(top_releases);
+        free(top_ties);
+        return (int)(rng_next(rng_state) % (uint64_t)selected_count);
+    }
+
+    int top_count = 0;
+    for (int drop_index = 0; drop_index < selected_count; drop_index++) {
+        DenseState trial_state;
+        if (!init_state(&trial_state, r, d)) {
+            continue;
+        }
+        initialize_systematic_columns(&trial_state, r);
+        for (int i = 0; i < selected_count; i++) {
+            if (i != drop_index) {
+                add_column(&trial_state, selected[i]);
+            }
+        }
+
+        uint64_t after_forbidden_count = forbidden_count(&trial_state);
+        uint64_t forbidden_release = before_forbidden_count > after_forbidden_count
+            ? before_forbidden_count - after_forbidden_count
+            : 0ULL;
+        uint64_t legal_count = count_legal_candidates_in_prefix(
+            candidates,
+            candidate_count,
+            &trial_state,
+            repair_candidate_window,
+            selected,
+            selected_count,
+            tabu_masks,
+            tabu_count
+        );
+        uint32_t tie = deterministic_tiebreak(
+            selected[drop_index],
+            restart + repair_event_index + step + 4099
+        );
+        free_state(&trial_state);
+
+        int insert_at = top_count;
+        while (
+            insert_at > 0
+            && drop_choice_is_better(
+                legal_count,
+                forbidden_release,
+                tie,
+                top_legal_counts[insert_at - 1],
+                top_releases[insert_at - 1],
+                top_ties[insert_at - 1]
+            )
+        ) {
+            if ((uint64_t)insert_at < drop_topk) {
+                top_indices[insert_at] = top_indices[insert_at - 1];
+                top_legal_counts[insert_at] = top_legal_counts[insert_at - 1];
+                top_releases[insert_at] = top_releases[insert_at - 1];
+                top_ties[insert_at] = top_ties[insert_at - 1];
+            }
+            insert_at--;
+        }
+        if ((uint64_t)insert_at < drop_topk) {
+            top_indices[insert_at] = drop_index;
+            top_legal_counts[insert_at] = legal_count;
+            top_releases[insert_at] = forbidden_release;
+            top_ties[insert_at] = tie;
+            if ((uint64_t)top_count < drop_topk) {
+                top_count++;
+            }
+        }
+    }
+
+    int chosen_index = -1;
+    if (top_count > 0) {
+        chosen_index = top_indices[rng_next(rng_state) % (uint64_t)top_count];
+    }
+    free(top_indices);
+    free(top_legal_counts);
+    free(top_releases);
+    free(top_ties);
+    if (chosen_index < 0) {
+        chosen_index = (int)(rng_next(rng_state) % (uint64_t)selected_count);
+    }
+    return chosen_index;
+}
+
 static int rollout_after_first_drop(
     Candidate *candidates,
     uint64_t candidate_count,
@@ -951,6 +1220,7 @@ static int rollout_after_first_drop(
     uint64_t seed,
     uint64_t dynamic_window,
     uint64_t rollout_depth,
+    uint64_t drop_topk,
     const uint64_t *tabu_masks,
     int tabu_count,
     int estimate_growth,
@@ -1051,7 +1321,26 @@ static int rollout_after_first_drop(
         if (trial_count <= 0 || trial_tabu_count >= trial_tabu_capacity) {
             break;
         }
-        int drop_index = (int)(rng_next(&rng_state) % (uint64_t)trial_count);
+        int drop_index = choose_rollout_drop_index(
+            candidates,
+            candidate_count,
+            trial_selected,
+            trial_count,
+            r,
+            d,
+            restart,
+            repair_event_index,
+            steps,
+            current_forbidden_count,
+            dynamic_window,
+            trial_tabu,
+            trial_tabu_count,
+            drop_topk,
+            &rng_state
+        );
+        if (drop_index < 0) {
+            break;
+        }
         uint64_t dropped_mask = trial_selected[drop_index];
         for (int shift_index = drop_index + 1; shift_index < trial_count; shift_index++) {
             trial_selected[shift_index - 1] = trial_selected[shift_index];
@@ -1084,6 +1373,56 @@ static int rollout_after_first_drop(
     return 1;
 }
 
+static void run_mcts_rollout_range(MctsRolloutJob *job) {
+    if (!job || !job->root_stats) {
+        return;
+    }
+    uint64_t dynamic_evaluations = 0;
+    for (uint64_t simulation = job->simulation_start; simulation < job->simulation_end; simulation++) {
+        int drop_index = (int)(simulation % (uint64_t)job->selected_count);
+        RepairReward reward;
+        uint64_t after_forbidden = 0;
+        uint64_t evals = 0;
+        if (!rollout_after_first_drop(
+            job->candidates,
+            job->candidate_count,
+            job->selected,
+            job->selected_count,
+            drop_index,
+            job->n,
+            job->k,
+            job->d,
+            job->restart,
+            job->repair_event_index,
+            job->seed + simulation * 0x9e3779b97f4a7c15ULL,
+            job->dynamic_window,
+            job->rollout_depth,
+            job->drop_topk,
+            job->tabu_masks,
+            job->tabu_count,
+            job->estimate_growth,
+            &reward,
+            &after_forbidden,
+            &evals
+        )) {
+            continue;
+        }
+        dynamic_evaluations += evals;
+        update_root_stats(
+            &job->root_stats[drop_index],
+            reward,
+            after_forbidden,
+            job->selected_count
+        );
+    }
+    job->dynamic_evaluations = dynamic_evaluations;
+}
+
+static void *mcts_rollout_worker(void *arg) {
+    run_mcts_rollout_range((MctsRolloutJob *)arg);
+    return NULL;
+}
+
 static int choose_repair_drop_index_mcts(
     Candidate *candidates,
     uint64_t candidate_count,
@@ -1098,6 +1437,7 @@ static int choose_repair_drop_index_mcts(
     uint64_t dynamic_window,
     uint64_t rollout_depth,
     uint64_t simulations,
+    uint64_t drop_topk,
     const uint64_t *tabu_masks,
     int tabu_count,
     int estimate_growth,
@@ -1108,55 +1448,149 @@ static int choose_repair_drop_index_mcts(
     if (selected_count <= 0 || rollout_depth == 0 || simulations == 0) {
         return 0;
     }
-    RepairReward best_reward = {0, 0, 0, 0};
-    int has_best = 0;
-    int best_drop_index = -1;
-    uint64_t best_after_forbidden = 0;
+    RepairRootStats *root_stats = (RepairRootStats *)calloc(
+        (size_t)selected_count,
+        sizeof(RepairRootStats)
+    );
+    if (!root_stats) {
+        return 0;
+    }
     uint64_t total_dynamic_evaluations = 0;
+    uint64_t requested_workers = env_u64("LINEAR_CODE_REPAIR_MCTS_WORKERS", 1ULL);
+    if (requested_workers == 0ULL) {
+        long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+        requested_workers = cpu_count > 1 ? (uint64_t)cpu_count : 1ULL;
+    }
+    if (requested_workers > simulations) {
+        requested_workers = simulations;
+    }
+    if (requested_workers > 64ULL) {
+        requested_workers = 64ULL;
+    }
 
-    for (uint64_t simulation = 0; simulation < simulations; simulation++) {
-        int drop_index = (int)(simulation % (uint64_t)selected_count);
-        RepairReward reward;
-        uint64_t after_forbidden = 0;
-        uint64_t evals = 0;
-        if (!rollout_after_first_drop(
-            candidates,
-            candidate_count,
-            selected,
-            selected_count,
-            drop_index,
-            n,
-            k,
-            d,
-            restart,
-            repair_event_index,
-            seed + simulation * 0x9e3779b97f4a7c15ULL,
-            dynamic_window,
-            rollout_depth,
-            tabu_masks,
-            tabu_count,
-            estimate_growth,
-            &reward,
-            &after_forbidden,
-            &evals
-        )) {
-            continue;
+    if (requested_workers <= 1ULL) {
+        MctsRolloutJob job;
+        memset(&job, 0, sizeof(job));
+        job.candidates = candidates;
+        job.candidate_count = candidate_count;
+        job.selected = selected;
+        job.selected_count = selected_count;
+        job.n = n;
+        job.k = k;
+        job.d = d;
+        job.restart = restart;
+        job.repair_event_index = repair_event_index;
+        job.seed = seed;
+        job.dynamic_window = dynamic_window;
+        job.rollout_depth = rollout_depth;
+        job.drop_topk = drop_topk;
+        job.tabu_masks = tabu_masks;
+        job.tabu_count = tabu_count;
+        job.estimate_growth = estimate_growth;
+        job.simulation_start = 0;
+        job.simulation_end = simulations;
+        job.root_stats = root_stats;
+        run_mcts_rollout_range(&job);
+        total_dynamic_evaluations = job.dynamic_evaluations;
+    } else {
+        uint64_t worker_count = requested_workers;
+        pthread_t *threads = (pthread_t *)calloc((size_t)worker_count, sizeof(pthread_t));
+        MctsRolloutJob *jobs = (MctsRolloutJob *)calloc((size_t)worker_count, sizeof(MctsRolloutJob));
+        RepairRootStats *worker_stats = (RepairRootStats *)calloc(
+            (size_t)(worker_count * (uint64_t)selected_count),
+            sizeof(RepairRootStats)
+        );
+        if (!threads || !jobs || !worker_stats) {
+            free(threads);
+            free(jobs);
+            free(worker_stats);
+            free(root_stats);
+            return 0;
         }
-        total_dynamic_evaluations += evals;
-        if (reward_is_better(reward, best_reward, has_best)) {
-            best_reward = reward;
+
+        uint64_t chunk_size = (simulations + worker_count - 1ULL) / worker_count;
+        uint64_t created = 0;
+        for (uint64_t worker_index = 0; worker_index < worker_count; worker_index++) {
+            uint64_t start = worker_index * chunk_size;
+            uint64_t end = start + chunk_size;
+            if (start >= simulations) {
+                break;
+            }
+            if (end > simulations) {
+                end = simulations;
+            }
+            MctsRolloutJob *job = &jobs[worker_index];
+            job->candidates = candidates;
+            job->candidate_count = candidate_count;
+            job->selected = selected;
+            job->selected_count = selected_count;
+            job->n = n;
+            job->k = k;
+            job->d = d;
+            job->restart = restart;
+            job->repair_event_index = repair_event_index;
+            job->seed = seed;
+            job->dynamic_window = dynamic_window;
+            job->rollout_depth = rollout_depth;
+            job->drop_topk = drop_topk;
+            job->tabu_masks = tabu_masks;
+            job->tabu_count = tabu_count;
+            job->estimate_growth = estimate_growth;
+            job->simulation_start = start;
+            job->simulation_end = end;
+            job->root_stats = &worker_stats[worker_index * (uint64_t)selected_count];
+            if (pthread_create(&threads[worker_index], NULL, mcts_rollout_worker, job) != 0) {
+                for (uint64_t join_index = 0; join_index < created; join_index++) {
+                    pthread_join(threads[join_index], NULL);
+                }
+                free(threads);
+                free(jobs);
+                free(worker_stats);
+                free(root_stats);
+                return 0;
+            }
+            created++;
+        }
+
+        for (uint64_t worker_index = 0; worker_index < created; worker_index++) {
+            pthread_join(threads[worker_index], NULL);
+            total_dynamic_evaluations += jobs[worker_index].dynamic_evaluations;
+            RepairRootStats *local_stats = &worker_stats[worker_index * (uint64_t)selected_count];
+            for (int drop_index = 0; drop_index < selected_count; drop_index++) {
+                merge_root_stats(&root_stats[drop_index], &local_stats[drop_index]);
+            }
+        }
+
+        free(threads);
+        free(jobs);
+        free(worker_stats);
+    }
+
+    int has_best_root = 0;
+    int best_drop_index = -1;
+    for (int drop_index = 0; drop_index < selected_count; drop_index++) {
+        if (root_stats_is_better(
+            &root_stats[drop_index],
+            best_drop_index >= 0 ? &root_stats[best_drop_index] : NULL,
+            has_best_root
+        )) {
             best_drop_index = drop_index;
-            best_after_forbidden = after_forbidden;
-            has_best = 1;
+            has_best_root = 1;
         }
     }
 
-    if (!has_best || best_reward.constructed_count < selected_count) {
+    if (
+        !has_best_root
+        || best_drop_index < 0
+        || root_stats[best_drop_index].best_reward.constructed_count < selected_count
+    ) {
+        free(root_stats);
         return 0;
     }
     *drop_index_out = best_drop_index;
-    *after_forbidden_count_out = best_after_forbidden;
+    *after_forbidden_count_out = root_stats[best_drop_index].best_after_forbidden;
     *dynamic_evaluations_out = total_dynamic_evaluations;
+    free(root_stats);
     return 1;
 }
 
@@ -1272,6 +1706,7 @@ int oe_linear_code_run(
     int repair_mcts_enabled = env_equals("LINEAR_CODE_REPAIR_MODE", "mcts");
     uint64_t repair_mcts_simulations = env_u64("LINEAR_CODE_REPAIR_MCTS_SIMULATIONS", 64ULL);
     uint64_t repair_mcts_depth = env_u64("LINEAR_CODE_REPAIR_MCTS_DEPTH", 4ULL);
+    uint64_t repair_mcts_drop_topk = env_u64("LINEAR_CODE_REPAIR_MCTS_DROP_TOPK", 2ULL);
     int estimate_dynamic_growth = !env_equals("LINEAR_CODE_DYNAMIC_GROWTH_ESTIMATE", "0");
     uint64_t repair_tabu_cap_u64 = repair_tabu_tenure;
     uint64_t max_reasonable_tabu = (uint64_t)k + repair_max_events * repair_drop_count + 1ULL;
@@ -1400,6 +1835,7 @@ int oe_linear_code_run(
                                 dynamic_window,
                                 repair_mcts_depth,
                                 repair_mcts_simulations,
+                                repair_mcts_drop_topk,
                                 tabu_masks,
                                 tabu_count,
                                 estimate_dynamic_growth,
