@@ -827,7 +827,7 @@ class ProcessParallelController:
 
                             else:
                                 # Event-based early stopping
-                                if current_score == self.config.convergence_threshold:
+                                if current_score >= self.config.convergence_threshold:
                                     best_score = current_score
                                     logger.info(
                                         f"🛑 Early stopping (event-based) triggered at iteration {completed_iteration}: "

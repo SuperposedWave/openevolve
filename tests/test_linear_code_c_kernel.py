@@ -94,6 +94,52 @@ class TestLinearCodeCKernel(unittest.TestCase):
         selected = tuple(int(bits, 2) for bits in search_result["selected_free_columns"])
         self.assertTrue(self.search_core.validate_free_columns(8, selected, 5))
 
+    def test_restart_workers_parallel_path_returns_valid_code(self):
+        """Restart-level parallelism should preserve valid C-kernel output."""
+        env = {
+            "LINEAR_CODE_N": "20",
+            "LINEAR_CODE_K": "10",
+            "LINEAR_CODE_D": "5",
+            "LINEAR_CODE_RESTARTS": "4",
+            "LINEAR_CODE_RESTART_WORKERS": "4",
+            "LINEAR_CODE_MAX_CANDIDATES": "5000",
+            "LINEAR_CODE_DYNAMIC_WINDOW": "128",
+            "LINEAR_CODE_REPAIR_EVENTS": "1",
+            "LINEAR_CODE_REPAIR_MODE": "mcts",
+            "LINEAR_CODE_REPAIR_MCTS_SIMULATIONS": "4",
+            "LINEAR_CODE_REPAIR_MCTS_DEPTH": "2",
+            "LINEAR_CODE_REPAIR_MCTS_WORKERS": "1",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            result = self.evaluator.evaluate(str(EXAMPLE_DIR / "initial_program.c"))
+
+        self.assertEqual(result.metrics["success_rate"], 1.0)
+        search_result = json.loads(result.artifacts["search_result"])
+        selected = tuple(int(bits, 2) for bits in search_result["selected_free_columns"])
+        self.assertTrue(self.search_core.validate_free_columns(10, selected, 5))
+
+    def test_dynamic_workers_parallel_path_returns_valid_code(self):
+        """Dynamic-window candidate scoring should be parallelizable inside one restart."""
+        env = {
+            "LINEAR_CODE_N": "20",
+            "LINEAR_CODE_K": "10",
+            "LINEAR_CODE_D": "5",
+            "LINEAR_CODE_RESTARTS": "1",
+            "LINEAR_CODE_RESTART_WORKERS": "1",
+            "LINEAR_CODE_MAX_CANDIDATES": "5000",
+            "LINEAR_CODE_DYNAMIC_WINDOW": "128",
+            "LINEAR_CODE_DYNAMIC_WORKERS": "4",
+            "LINEAR_CODE_DYNAMIC_GROWTH_ESTIMATE": "0",
+            "LINEAR_CODE_REPAIR_EVENTS": "0",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            result = self.evaluator.evaluate(str(EXAMPLE_DIR / "initial_program.c"))
+
+        self.assertEqual(result.metrics["success_rate"], 1.0)
+        search_result = json.loads(result.artifacts["search_result"])
+        selected = tuple(int(bits, 2) for bits in search_result["selected_free_columns"])
+        self.assertTrue(self.search_core.validate_free_columns(10, selected, 5))
+
     def test_missing_required_symbols_returns_low_score(self):
         """A C file without the fixed priority block should fail cleanly."""
         source = "double unrelated(void) { return 0.0; }\n"

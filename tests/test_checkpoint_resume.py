@@ -33,6 +33,10 @@ class MockEvaluator:
             "combined_score": 0.6 + (self.call_count * 0.05) % 0.4,
         }
 
+    def get_pending_artifacts(self, program_id):
+        """Mock artifact retrieval."""
+        return {}
+
 
 class TestCheckpointResume(unittest.TestCase):
     """Tests for checkpoint resume functionality"""
@@ -124,6 +128,42 @@ def evaluate(program_path):
                 self.assertEqual(mock_evaluator.call_count, 1)
 
         # Run the async test
+        asyncio.run(run_test())
+
+    def test_initial_program_target_score_skips_evolution(self):
+        """Test that evolution is skipped when the initial program already reaches the target."""
+
+        class SolvedEvaluator(MockEvaluator):
+            async def evaluate_program(self, code, program_id):
+                self.call_count += 1
+                return {"score": 1.0, "combined_score": 1.0}
+
+        async def run_test():
+            self.config.early_stopping_patience = -1
+            self.config.convergence_threshold = 1.0
+            self.config.early_stopping_metric = "combined_score"
+            with patch("openevolve.controller.Evaluator") as mock_evaluator_class:
+                mock_evaluator = SolvedEvaluator()
+                mock_evaluator_class.return_value = mock_evaluator
+
+                controller = OpenEvolve(
+                    initial_program_path=self.test_program_path,
+                    evaluation_file=self.evaluator_path,
+                    config=self.config,
+                    output_dir=self.test_dir,
+                )
+
+                with patch(
+                    "openevolve.controller.ProcessParallelController"
+                ) as mock_controller_class:
+                    result = await controller.run(iterations=120)
+
+                self.assertIsNotNone(result)
+                self.assertEqual(result.metrics["combined_score"], 1.0)
+                self.assertEqual(len(controller.database.programs), 1)
+                self.assertEqual(mock_evaluator.call_count, 1)
+                mock_controller_class.assert_not_called()
+
         asyncio.run(run_test())
 
     def test_duplicate_content_prevention(self):

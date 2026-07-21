@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -93,11 +94,70 @@ class CKernelCallResult:
     error: str = ""
 
 
+def _verbose_progress_enabled() -> bool:
+    raw_value = os.environ.get("LINEAR_CODE_VERBOSE_PROGRESS", "")
+    return raw_value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _verbose_progress(message: str, *args) -> None:
+    if not _verbose_progress_enabled():
+        return
+    if args:
+        message = message % args
+    print(f"[linear-code-runner] {message}", file=sys.stderr, flush=True)
+
+
+def _verbose_summary(
+    *,
+    metrics: Sequence[float],
+    constructed_columns: int,
+    target_columns: int,
+    c_return_code: int,
+    compile_seconds: float,
+    run_call_seconds: float,
+    evaluation_seconds: float,
+) -> None:
+    if not _verbose_progress_enabled():
+        return
+    timing = {
+        "compile": compile_seconds,
+        "run_call": run_call_seconds,
+        "evaluation_total": evaluation_seconds,
+        "c_run_total": metrics[METRIC_C_RUN_SECONDS],
+        "candidate_generation": metrics[METRIC_CANDIDATE_GENERATION_SECONDS],
+        "candidate_scoring": metrics[METRIC_CANDIDATE_SCORING_SECONDS],
+        "restart_sort_total": metrics[METRIC_RESTART_SORT_SECONDS],
+        "state_init_total": metrics[METRIC_STATE_INIT_SECONDS],
+        "greedy_scan_total": metrics[METRIC_GREEDY_SCAN_SECONDS],
+        "forbidden_count_total": metrics[METRIC_FORBIDDEN_COUNT_SECONDS],
+    }
+    print(
+        "[linear-code-runner] evaluation summary: "
+        f"return_code={c_return_code} constructed={constructed_columns}/{target_columns} "
+        f"dynamic_evals={int(metrics[METRIC_SAMPLE_ATTEMPTS])} "
+        f"repair_events={int(metrics[METRIC_BACKTRACK_EVENTS])} "
+        f"blocked={int(metrics[METRIC_BLOCKED_CANDIDATES])} "
+        f"forbidden={int(metrics[METRIC_FORBIDDEN_COUNT])}",
+        file=sys.stderr,
+        flush=True,
+    )
+    for name, seconds in timing.items():
+        print(f"[linear-code-runner] timing {name}: {seconds:.3f}s", file=sys.stderr, flush=True)
+
+
 def evaluate_c_program_path(program_path: str) -> EvaluationResult:
     """Evaluate a C priority function with the fixed search skeleton."""
     instance = instance_from_env()
     started_at = time.perf_counter()
     program = Path(program_path)
+    _verbose_progress(
+        "evaluate start: program=%s n=%d k=%d d=%d restarts=%d",
+        program,
+        instance.n,
+        instance.k,
+        instance.target_distance,
+        instance.restarts,
+    )
 
     if instance.r > C_KERNEL_R_LIMIT:
         return _failure_result(
@@ -113,13 +173,16 @@ def evaluate_c_program_path(program_path: str) -> EvaluationResult:
     with tempfile.TemporaryDirectory(prefix="linear_code_c_kernel_") as tmp_dir:
         shared_object = Path(tmp_dir) / "kernel.so"
         compile_started_at = time.perf_counter()
+        _verbose_progress("compile start: output=%s", shared_object)
         compile_error = _compile_c_kernel(program, shared_object)
         compile_seconds = time.perf_counter() - compile_started_at
+        _verbose_progress("compile done: seconds=%.3f status=%s", compile_seconds, "ok" if not compile_error else "failed")
         if compile_error:
             return _failure_result("compile_error", compile_error, started_at)
 
         seed = _env_seed()
         run_call_started_at = time.perf_counter()
+        _verbose_progress("c kernel call start: seed=%d timeout=%d", seed, _env_int("LINEAR_CODE_C_RUN_TIMEOUT", RUN_TIMEOUT_SECONDS))
         call_result = _run_kernel_with_timeout(
             shared_object,
             instance.n,
@@ -129,6 +192,12 @@ def evaluate_c_program_path(program_path: str) -> EvaluationResult:
             seed,
         )
         run_call_seconds = time.perf_counter() - run_call_started_at
+        _verbose_progress(
+            "c kernel call done: seconds=%.3f status=%s return_code=%d",
+            run_call_seconds,
+            call_result.status,
+            call_result.return_code,
+        )
 
     elapsed_seconds = time.perf_counter() - started_at
     if call_result.status != "ok":
@@ -153,6 +222,15 @@ def evaluate_c_program_path(program_path: str) -> EvaluationResult:
         metrics=metrics,
         c_return_code=call_result.return_code,
         c_error=call_result.error,
+        compile_seconds=compile_seconds,
+        run_call_seconds=run_call_seconds,
+        evaluation_seconds=elapsed_seconds,
+    )
+    _verbose_summary(
+        metrics=metrics,
+        constructed_columns=constructed_columns,
+        target_columns=instance.k,
+        c_return_code=call_result.return_code,
         compile_seconds=compile_seconds,
         run_call_seconds=run_call_seconds,
         evaluation_seconds=elapsed_seconds,
@@ -406,6 +484,9 @@ def _success_artifacts(
         "backtrack_events": int(metrics[METRIC_BACKTRACK_EVENTS]),
         "repair_mode": os.environ.get("LINEAR_CODE_REPAIR_MODE", "greedy"),
         "dynamic_growth_estimate": os.environ.get("LINEAR_CODE_DYNAMIC_GROWTH_ESTIMATE", "1"),
+        "dynamic_workers": os.environ.get("LINEAR_CODE_DYNAMIC_WORKERS", "1"),
+        "candidate_workers": os.environ.get("LINEAR_CODE_CANDIDATE_WORKERS", "auto"),
+        "restart_workers": os.environ.get("LINEAR_CODE_RESTART_WORKERS", "1"),
         "repair_mcts_simulations": _env_int("LINEAR_CODE_REPAIR_MCTS_SIMULATIONS", 64),
         "repair_mcts_depth": _env_int("LINEAR_CODE_REPAIR_MCTS_DEPTH", 4),
         "repair_mcts_workers": os.environ.get("LINEAR_CODE_REPAIR_MCTS_WORKERS", "1"),

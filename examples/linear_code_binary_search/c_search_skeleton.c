@@ -9,6 +9,8 @@
  */
 
 #include <stdint.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -35,6 +37,9 @@
 #define BASELINE_R_LIMIT 60
 #define BASELINE_MAX_CANDIDATES 1000000000ULL
 
+static double g_verbose_started_at = 0.0;
+static pthread_mutex_t g_verbose_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 typedef struct {
     uint64_t mask;
     double score;
@@ -58,6 +63,30 @@ typedef struct {
     int k;
     int d;
 } ScoreJob;
+
+typedef struct {
+    Candidate *candidates;
+    const uint64_t *legal_indices;
+    uint64_t start;
+    uint64_t end;
+    DenseState *state;
+    int n;
+    int k;
+    int d;
+    int step;
+    int restart;
+    uint64_t current_forbidden_count;
+    uint64_t generated_count;
+    int estimate_growth;
+    uint64_t scratch_touched_cap;
+    int found;
+    double best_score;
+    uint32_t best_tie;
+    uint64_t best_mask;
+    uint64_t best_growth;
+    uint64_t evaluations;
+    int status;
+} DynamicJob;
 
 typedef struct {
     int constructed_count;
@@ -99,6 +128,7 @@ typedef struct {
     uint64_t simulation_end;
     RepairRootStats *root_stats;
     uint64_t dynamic_evaluations;
+    double elapsed_seconds;
 } MctsRolloutJob;
 
 typedef struct {
@@ -109,6 +139,42 @@ typedef struct {
     uint64_t word_count;
     int overflowed;
 } ScratchSet;
+
+typedef struct {
+    int restart;
+    int count;
+    uint64_t blocked;
+    uint64_t forbidden_count;
+    uint64_t dynamic_evaluations;
+    uint64_t repair_events;
+    double restart_sort_seconds;
+    double state_init_seconds;
+    double greedy_scan_seconds;
+    double forbidden_count_seconds;
+    uint64_t *selected;
+    int status;
+} RestartResult;
+
+typedef struct {
+    Candidate *base_candidates;
+    uint64_t candidate_count;
+    int n;
+    int k;
+    int d;
+    int restart;
+    uint64_t seed;
+    uint64_t dynamic_window;
+    uint64_t repair_max_events;
+    uint64_t repair_drop_count;
+    uint64_t repair_candidate_window;
+    uint64_t repair_tabu_tenure;
+    int repair_mcts_enabled;
+    uint64_t repair_mcts_simulations;
+    uint64_t repair_mcts_depth;
+    uint64_t repair_mcts_drop_topk;
+    int estimate_dynamic_growth;
+    RestartResult *result;
+} RestartJob;
 
 extern double oe_linear_code_priority(
     uint64_t column_mask,
@@ -128,6 +194,35 @@ static double monotonic_seconds(void) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (double)now.tv_sec + (double)now.tv_nsec * 1e-9;
+}
+
+static int verbose_progress_enabled(void) {
+    const char *raw_value = getenv("LINEAR_CODE_VERBOSE_PROGRESS");
+    if (!raw_value || !raw_value[0]) {
+        return 0;
+    }
+    return strcmp(raw_value, "0") != 0
+        && strcmp(raw_value, "false") != 0
+        && strcmp(raw_value, "False") != 0
+        && strcmp(raw_value, "no") != 0
+        && strcmp(raw_value, "off") != 0;
+}
+
+static void verbose_progress_log(const char *format, ...) {
+    if (!verbose_progress_enabled()) {
+        return;
+    }
+    double started_at = g_verbose_started_at > 0.0 ? g_verbose_started_at : monotonic_seconds();
+    double elapsed = monotonic_seconds() - started_at;
+    pthread_mutex_lock(&g_verbose_log_mutex);
+    fprintf(stderr, "[linear-code-c +%.3fs] ", elapsed);
+    va_list args;
+    va_start(args, format);
+    vfprintf(stderr, format, args);
+    va_end(args);
+    fputc('\n', stderr);
+    fflush(stderr);
+    pthread_mutex_unlock(&g_verbose_log_mutex);
 }
 
 static int popcount64(uint64_t value) {
@@ -680,7 +775,18 @@ static void *score_candidate_worker(void *arg) {
 
 static int score_candidates(Candidate *candidates, uint64_t candidate_count, int n, int k, int d) {
     long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+    uint64_t requested_workers = env_u64("LINEAR_CODE_CANDIDATE_WORKERS", UINT64_MAX);
     int thread_count = cpu_count > 1 ? (int)cpu_count : 1;
+    if (requested_workers != UINT64_MAX) {
+        if (requested_workers == 0ULL) {
+            thread_count = cpu_count > 1 ? (int)cpu_count : 1;
+        } else {
+            thread_count = (int)requested_workers;
+        }
+    }
+    if (thread_count < 1) {
+        thread_count = 1;
+    }
     if (thread_count > 16) {
         thread_count = 16;
     }
@@ -735,6 +841,87 @@ static int score_candidates(Candidate *candidates, uint64_t candidate_count, int
     return 1;
 }
 
+static int dynamic_choice_is_better(
+    double candidate_score,
+    uint32_t candidate_tie,
+    uint64_t candidate_mask,
+    double current_score,
+    uint32_t current_tie,
+    uint64_t current_mask,
+    int has_current
+) {
+    return !has_current
+        || candidate_score > current_score
+        || (candidate_score == current_score && candidate_tie > current_tie)
+        || (
+            candidate_score == current_score
+            && candidate_tie == current_tie
+            && candidate_mask > current_mask
+        );
+}
+
+static void run_dynamic_candidate_range(DynamicJob *job) {
+    if (!job) {
+        return;
+    }
+    ScratchSet scratch;
+    memset(&scratch, 0, sizeof(scratch));
+    ScratchSet *scratch_ptr = NULL;
+    if (job->estimate_growth) {
+        if (!init_scratch_set(&scratch, job->state->word_count, job->scratch_touched_cap)) {
+            job->status = -1;
+            return;
+        }
+        scratch_ptr = &scratch;
+    }
+
+    for (uint64_t pos = job->start; pos < job->end; pos++) {
+        Candidate *candidate = &job->candidates[job->legal_indices[pos]];
+        uint64_t mask = candidate->mask;
+        uint64_t growth = job->estimate_growth
+            ? estimate_forbidden_growth(job->state, mask, scratch_ptr)
+            : 0ULL;
+        uint64_t overlap = job->estimate_growth && job->generated_count > growth
+            ? job->generated_count - growth
+            : 0ULL;
+        double dynamic_score = oe_linear_code_priority(
+            mask,
+            job->n,
+            job->k,
+            job->d,
+            job->step,
+            popcount64(mask),
+            job->current_forbidden_count,
+            growth,
+            overlap
+        );
+        uint32_t tie = deterministic_tiebreak(mask, job->restart + job->step + 1);
+        job->evaluations++;
+        if (dynamic_choice_is_better(
+            dynamic_score,
+            tie,
+            mask,
+            job->best_score,
+            job->best_tie,
+            job->best_mask,
+            job->found
+        )) {
+            job->found = 1;
+            job->best_score = dynamic_score;
+            job->best_tie = tie;
+            job->best_mask = mask;
+            job->best_growth = growth;
+        }
+    }
+
+    free_scratch_set(&scratch);
+}
+
+static void *dynamic_candidate_worker(void *arg) {
+    run_dynamic_candidate_range((DynamicJob *)arg);
+    return NULL;
+}
+
 static int choose_dynamic_candidate(
     Candidate *candidates,
     uint64_t candidate_count,
@@ -762,6 +949,14 @@ static int choose_dynamic_candidate(
     int found = 0;
     uint64_t legal_seen = 0;
     uint64_t generated_count = estimate_growth ? generated_values_for_add(state) : 0ULL;
+    uint64_t legal_target = window_size == 0ULL ? 1ULL : window_size;
+    if (legal_target > candidate_count) {
+        legal_target = candidate_count;
+    }
+    uint64_t *legal_indices = (uint64_t *)calloc((size_t)legal_target, sizeof(uint64_t));
+    if (!legal_indices) {
+        return 0;
+    }
 
     for (uint64_t i = 0; i < candidate_count; i++) {
         uint64_t mask = candidates[i].mask;
@@ -772,39 +967,138 @@ static int choose_dynamic_candidate(
             (*blocked_out)++;
             continue;
         }
-        uint64_t growth = estimate_growth ? estimate_forbidden_growth(state, mask, scratch) : 0ULL;
-        uint64_t overlap = estimate_growth && generated_count > growth ? generated_count - growth : 0;
-        double dynamic_score = oe_linear_code_priority(
-            mask,
-            n,
-            k,
-            d,
-            step,
-            popcount64(mask),
-            current_forbidden_count,
-            growth,
-            overlap
-        );
-        uint32_t tie = deterministic_tiebreak(mask, restart + step + 1);
-        (*dynamic_evaluations_out)++;
-        if (
-            !found
-            || dynamic_score > best_score
-            || (dynamic_score == best_score && tie > best_tie)
-            || (dynamic_score == best_score && tie == best_tie && mask > best_mask)
-        ) {
-            found = 1;
-            best_score = dynamic_score;
-            best_tie = tie;
-            best_mask = mask;
-            best_growth = growth;
-        }
-        legal_seen++;
-        if (legal_seen >= window_size) {
+        legal_indices[legal_seen++] = i;
+        if (legal_seen >= legal_target) {
             break;
         }
     }
 
+    if (legal_seen == 0) {
+        free(legal_indices);
+        return 0;
+    }
+
+    long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+    uint64_t requested_workers = env_u64("LINEAR_CODE_DYNAMIC_WORKERS", 1ULL);
+    if (requested_workers == 0ULL) {
+        requested_workers = cpu_count > 1 ? (uint64_t)cpu_count : 1ULL;
+    }
+    if (requested_workers > legal_seen) {
+        requested_workers = legal_seen;
+    }
+    if (requested_workers > 64ULL) {
+        requested_workers = 64ULL;
+    }
+
+    if (requested_workers <= 1ULL) {
+        DynamicJob job;
+        memset(&job, 0, sizeof(job));
+        job.candidates = candidates;
+        job.legal_indices = legal_indices;
+        job.start = 0;
+        job.end = legal_seen;
+        job.state = state;
+        job.n = n;
+        job.k = k;
+        job.d = d;
+        job.step = step;
+        job.restart = restart;
+        job.current_forbidden_count = current_forbidden_count;
+        job.generated_count = generated_count;
+        job.estimate_growth = estimate_growth;
+        job.scratch_touched_cap = scratch ? scratch->touched_cap : env_u64("LINEAR_CODE_GROWTH_SCRATCH_TOUCHED_CAP", 1048576ULL);
+        run_dynamic_candidate_range(&job);
+        if (job.status != 0 || !job.found) {
+            free(legal_indices);
+            return 0;
+        }
+        found = job.found;
+        best_score = job.best_score;
+        best_tie = job.best_tie;
+        best_mask = job.best_mask;
+        best_growth = job.best_growth;
+        *dynamic_evaluations_out += job.evaluations;
+    } else {
+        pthread_t *threads = (pthread_t *)calloc((size_t)requested_workers, sizeof(pthread_t));
+        DynamicJob *jobs = (DynamicJob *)calloc((size_t)requested_workers, sizeof(DynamicJob));
+        if (!threads || !jobs) {
+            free(threads);
+            free(jobs);
+            free(legal_indices);
+            return 0;
+        }
+        uint64_t chunk_size = (legal_seen + requested_workers - 1ULL) / requested_workers;
+        uint64_t created = 0;
+        for (uint64_t worker = 0; worker < requested_workers; worker++) {
+            uint64_t start = worker * chunk_size;
+            uint64_t end = start + chunk_size;
+            if (start >= legal_seen) {
+                break;
+            }
+            if (end > legal_seen) {
+                end = legal_seen;
+            }
+            DynamicJob *job = &jobs[worker];
+            job->candidates = candidates;
+            job->legal_indices = legal_indices;
+            job->start = start;
+            job->end = end;
+            job->state = state;
+            job->n = n;
+            job->k = k;
+            job->d = d;
+            job->step = step;
+            job->restart = restart;
+            job->current_forbidden_count = current_forbidden_count;
+            job->generated_count = generated_count;
+            job->estimate_growth = estimate_growth;
+            job->scratch_touched_cap = scratch ? scratch->touched_cap : env_u64("LINEAR_CODE_GROWTH_SCRATCH_TOUCHED_CAP", 1048576ULL);
+            if (pthread_create(&threads[worker], NULL, dynamic_candidate_worker, job) != 0) {
+                for (uint64_t join_index = 0; join_index < created; join_index++) {
+                    pthread_join(threads[join_index], NULL);
+                }
+                free(threads);
+                free(jobs);
+                free(legal_indices);
+                return 0;
+            }
+            created++;
+        }
+
+        for (uint64_t worker = 0; worker < created; worker++) {
+            pthread_join(threads[worker], NULL);
+            DynamicJob *job = &jobs[worker];
+            if (job->status != 0) {
+                free(threads);
+                free(jobs);
+                free(legal_indices);
+                return 0;
+            }
+            *dynamic_evaluations_out += job->evaluations;
+            if (
+                job->found
+                && dynamic_choice_is_better(
+                    job->best_score,
+                    job->best_tie,
+                    job->best_mask,
+                    best_score,
+                    best_tie,
+                    best_mask,
+                    found
+                )
+            ) {
+                found = 1;
+                best_score = job->best_score;
+                best_tie = job->best_tie;
+                best_mask = job->best_mask;
+                best_growth = job->best_growth;
+            }
+        }
+        free(threads);
+        free(jobs);
+    }
+
+    free(legal_indices);
     if (!found) {
         return 0;
     }
@@ -1377,6 +1671,7 @@ static void run_mcts_rollout_range(MctsRolloutJob *job) {
     if (!job || !job->root_stats) {
         return;
     }
+    double worker_started_at = monotonic_seconds();
     uint64_t dynamic_evaluations = 0;
     for (uint64_t simulation = job->simulation_start; simulation < job->simulation_end; simulation++) {
         int drop_index = (int)(simulation % (uint64_t)job->selected_count);
@@ -1416,6 +1711,7 @@ static void run_mcts_rollout_range(MctsRolloutJob *job) {
         );
     }
     job->dynamic_evaluations = dynamic_evaluations;
+    job->elapsed_seconds = monotonic_seconds() - worker_started_at;
 }
 
 static void *mcts_rollout_worker(void *arg) {
@@ -1448,6 +1744,7 @@ static int choose_repair_drop_index_mcts(
     if (selected_count <= 0 || rollout_depth == 0 || simulations == 0) {
         return 0;
     }
+    double mcts_started_at = monotonic_seconds();
     RepairRootStats *root_stats = (RepairRootStats *)calloc(
         (size_t)selected_count,
         sizeof(RepairRootStats)
@@ -1467,6 +1764,17 @@ static int choose_repair_drop_index_mcts(
     if (requested_workers > 64ULL) {
         requested_workers = 64ULL;
     }
+    verbose_progress_log(
+        "mcts repair start: selected=%d simulations=%llu depth=%llu workers=%llu drop_topk=%llu dynamic_window=%llu tabu=%d estimate_growth=%d",
+        selected_count,
+        (unsigned long long)simulations,
+        (unsigned long long)rollout_depth,
+        (unsigned long long)requested_workers,
+        (unsigned long long)drop_topk,
+        (unsigned long long)dynamic_window,
+        tabu_count,
+        estimate_growth
+    );
 
     if (requested_workers <= 1ULL) {
         MctsRolloutJob job;
@@ -1492,6 +1800,13 @@ static int choose_repair_drop_index_mcts(
         job.root_stats = root_stats;
         run_mcts_rollout_range(&job);
         total_dynamic_evaluations = job.dynamic_evaluations;
+        verbose_progress_log(
+            "mcts worker done: simulations=[%llu,%llu) dynamic_evals=%llu elapsed=%.3fs",
+            (unsigned long long)job.simulation_start,
+            (unsigned long long)job.simulation_end,
+            (unsigned long long)job.dynamic_evaluations,
+            job.elapsed_seconds
+        );
     } else {
         uint64_t worker_count = requested_workers;
         pthread_t *threads = (pthread_t *)calloc((size_t)worker_count, sizeof(pthread_t));
@@ -1555,6 +1870,14 @@ static int choose_repair_drop_index_mcts(
         for (uint64_t worker_index = 0; worker_index < created; worker_index++) {
             pthread_join(threads[worker_index], NULL);
             total_dynamic_evaluations += jobs[worker_index].dynamic_evaluations;
+            verbose_progress_log(
+                "mcts worker %llu done: simulations=[%llu,%llu) dynamic_evals=%llu elapsed=%.3fs",
+                (unsigned long long)worker_index,
+                (unsigned long long)jobs[worker_index].simulation_start,
+                (unsigned long long)jobs[worker_index].simulation_end,
+                (unsigned long long)jobs[worker_index].dynamic_evaluations,
+                jobs[worker_index].elapsed_seconds
+            );
             RepairRootStats *local_stats = &worker_stats[worker_index * (uint64_t)selected_count];
             for (int drop_index = 0; drop_index < selected_count; drop_index++) {
                 merge_root_stats(&root_stats[drop_index], &local_stats[drop_index]);
@@ -1584,14 +1907,425 @@ static int choose_repair_drop_index_mcts(
         || best_drop_index < 0
         || root_stats[best_drop_index].best_reward.constructed_count < selected_count
     ) {
+        verbose_progress_log(
+            "mcts repair failed: best_drop=%d has_best=%d dynamic_evals=%llu elapsed=%.3fs",
+            best_drop_index,
+            has_best_root,
+            (unsigned long long)total_dynamic_evaluations,
+            monotonic_seconds() - mcts_started_at
+        );
         free(root_stats);
         return 0;
     }
     *drop_index_out = best_drop_index;
     *after_forbidden_count_out = root_stats[best_drop_index].best_after_forbidden;
     *dynamic_evaluations_out = total_dynamic_evaluations;
+    verbose_progress_log(
+        "mcts repair done: best_drop=%d visits=%d best_constructed=%d best_dropped=%d best_steps=%d after_forbidden=%llu dynamic_evals=%llu elapsed=%.3fs",
+        best_drop_index,
+        root_stats[best_drop_index].visits,
+        root_stats[best_drop_index].best_reward.constructed_count,
+        root_stats[best_drop_index].best_reward.dropped_count,
+        root_stats[best_drop_index].best_reward.steps,
+        (unsigned long long)root_stats[best_drop_index].best_after_forbidden,
+        (unsigned long long)total_dynamic_evaluations,
+        monotonic_seconds() - mcts_started_at
+    );
     free(root_stats);
     return 1;
+}
+
+static void run_restart_job(RestartJob *job) {
+    RestartResult *result = job->result;
+    uint64_t *selected_storage = result->selected;
+    memset(result, 0, sizeof(*result));
+    result->selected = selected_storage;
+    result->restart = job->restart;
+    result->status = 0;
+    verbose_progress_log(
+        "restart %d start: candidates=%llu dynamic_window=%llu repair_events=%llu",
+        job->restart,
+        (unsigned long long)job->candidate_count,
+        (unsigned long long)job->dynamic_window,
+        (unsigned long long)job->repair_max_events
+    );
+
+    Candidate *candidates = (Candidate *)calloc((size_t)job->candidate_count, sizeof(Candidate));
+    if (!candidates) {
+        result->status = -20;
+        verbose_progress_log("restart %d failed: candidate copy allocation", job->restart);
+        return;
+    }
+    memcpy(candidates, job->base_candidates, (size_t)job->candidate_count * sizeof(Candidate));
+
+    double stage_started_at = monotonic_seconds();
+    for (uint64_t i = 0; i < job->candidate_count; i++) {
+        candidates[i].tie = deterministic_tiebreak(candidates[i].mask, job->restart);
+    }
+    qsort(candidates, (size_t)job->candidate_count, sizeof(Candidate), compare_candidates_desc);
+    result->restart_sort_seconds += monotonic_seconds() - stage_started_at;
+    verbose_progress_log(
+        "restart %d sorted candidates in %.3fs",
+        job->restart,
+        result->restart_sort_seconds
+    );
+
+    stage_started_at = monotonic_seconds();
+    DenseState state;
+    int r = job->n - job->k;
+    if (!init_state(&state, r, job->d)) {
+        free(candidates);
+        result->status = -10;
+        verbose_progress_log("restart %d failed: state allocation", job->restart);
+        return;
+    }
+    initialize_systematic_columns(&state, r);
+    result->state_init_seconds += monotonic_seconds() - stage_started_at;
+    uint64_t current_forbidden_count = forbidden_count(&state);
+    verbose_progress_log(
+        "restart %d initialized DenseState in %.3fs",
+        job->restart,
+        result->state_init_seconds
+    );
+
+    uint64_t *current_selected = (uint64_t *)calloc((size_t)job->k, sizeof(uint64_t));
+    if (!current_selected) {
+        free_state(&state);
+        free(candidates);
+        result->status = -11;
+        verbose_progress_log("restart %d failed: selection allocation", job->restart);
+        return;
+    }
+
+    ScratchSet scratch;
+    memset(&scratch, 0, sizeof(scratch));
+    if (job->dynamic_window > 0 && job->estimate_dynamic_growth) {
+        uint64_t scratch_touched_cap = env_u64("LINEAR_CODE_GROWTH_SCRATCH_TOUCHED_CAP", 1048576ULL);
+        if (!init_scratch_set(&scratch, state.word_count, scratch_touched_cap)) {
+            free(current_selected);
+            free_state(&state);
+            free(candidates);
+            result->status = -12;
+            verbose_progress_log("restart %d failed: scratch allocation", job->restart);
+            return;
+        }
+    }
+
+    uint64_t max_reasonable_tabu = (uint64_t)job->k + job->repair_max_events * job->repair_drop_count + 1ULL;
+    uint64_t repair_tabu_cap_u64 = job->repair_tabu_tenure;
+    if (repair_tabu_cap_u64 > max_reasonable_tabu) {
+        repair_tabu_cap_u64 = max_reasonable_tabu;
+    }
+    uint64_t *tabu_masks = NULL;
+    int tabu_count = 0;
+    int tabu_next = 0;
+    int tabu_capacity = (int)repair_tabu_cap_u64;
+    if (job->dynamic_window > 0 && job->repair_max_events > 0 && tabu_capacity > 0) {
+        tabu_masks = (uint64_t *)calloc((size_t)tabu_capacity, sizeof(uint64_t));
+        if (!tabu_masks) {
+            free_scratch_set(&scratch);
+            free(current_selected);
+            free_state(&state);
+            free(candidates);
+            result->status = -13;
+            verbose_progress_log("restart %d failed: tabu allocation", job->restart);
+            return;
+        }
+    }
+
+    int current_count = 0;
+    int current_repair_events = 0;
+    uint64_t blocked = 0;
+    int best_count = 0;
+    uint64_t best_blocked = 0;
+    uint64_t best_forbidden_count = current_forbidden_count;
+
+    stage_started_at = monotonic_seconds();
+    if (job->dynamic_window > 0) {
+        while (current_count < job->k) {
+            uint64_t mask = 0;
+            uint64_t growth = 0;
+            uint64_t dynamic_evaluations = 0;
+            uint64_t blocked_before_step = blocked;
+            double step_started_at = monotonic_seconds();
+            verbose_progress_log(
+                "restart %d step %d start: forbidden=%llu blocked_total=%llu",
+                job->restart,
+                current_count,
+                (unsigned long long)current_forbidden_count,
+                (unsigned long long)blocked
+            );
+            if (!choose_dynamic_candidate(
+                candidates,
+                job->candidate_count,
+                &state,
+                job->n,
+                job->k,
+                job->d,
+                current_count,
+                job->restart,
+                current_forbidden_count,
+                job->dynamic_window,
+                tabu_masks,
+                tabu_count,
+                &scratch,
+                job->estimate_dynamic_growth,
+                &mask,
+                &growth,
+                &blocked,
+                &dynamic_evaluations
+            )) {
+                int repaired = 0;
+                verbose_progress_log(
+                    "restart %d step %d no candidate: scanned_blocked_delta=%llu dynamic_evals=%llu elapsed=%.3fs",
+                    job->restart,
+                    current_count,
+                    (unsigned long long)(blocked - blocked_before_step),
+                    (unsigned long long)dynamic_evaluations,
+                    monotonic_seconds() - step_started_at
+                );
+                if (
+                    job->repair_max_events == 0
+                    || (uint64_t)current_repair_events >= job->repair_max_events
+                    || current_count <= 0
+                ) {
+                    verbose_progress_log(
+                        "restart %d step %d stop: repair unavailable repair_events=%d/%llu",
+                        job->restart,
+                        current_count,
+                        current_repair_events,
+                        (unsigned long long)job->repair_max_events
+                    );
+                    break;
+                }
+                for (
+                    uint64_t drop_event = 0;
+                    drop_event < job->repair_drop_count
+                        && (uint64_t)current_repair_events < job->repair_max_events
+                        && current_count > 0;
+                    drop_event++
+                ) {
+                    int drop_index = -1;
+                    uint64_t repaired_forbidden_count = 0;
+                    uint64_t repair_dynamic_evaluations = 0;
+                    int chose_repair = 0;
+                    double repair_started_at = monotonic_seconds();
+                    verbose_progress_log(
+                        "restart %d repair event %d start: current_columns=%d mode=%s",
+                        job->restart,
+                        current_repair_events,
+                        current_count,
+                        job->repair_mcts_enabled ? "mcts" : "greedy"
+                    );
+                    if (job->repair_mcts_enabled) {
+                        chose_repair = choose_repair_drop_index_mcts(
+                            candidates,
+                            job->candidate_count,
+                            current_selected,
+                            current_count,
+                            job->n,
+                            job->k,
+                            job->d,
+                            job->restart,
+                            current_repair_events,
+                            job->seed,
+                            job->dynamic_window,
+                            job->repair_mcts_depth,
+                            job->repair_mcts_simulations,
+                            job->repair_mcts_drop_topk,
+                            tabu_masks,
+                            tabu_count,
+                            job->estimate_dynamic_growth,
+                            &drop_index,
+                            &repaired_forbidden_count,
+                            &repair_dynamic_evaluations
+                        );
+                        result->dynamic_evaluations += repair_dynamic_evaluations;
+                    }
+                    if (!chose_repair) {
+                        double fallback_started_at = monotonic_seconds();
+                        verbose_progress_log(
+                            "restart %d repair event %d fallback greedy drop start",
+                            job->restart,
+                            current_repair_events
+                        );
+                        chose_repair = choose_repair_drop_index(
+                            candidates,
+                            job->candidate_count,
+                            current_selected,
+                            current_count,
+                            r,
+                            job->d,
+                            job->restart,
+                            current_repair_events,
+                            current_forbidden_count,
+                            job->repair_candidate_window,
+                            tabu_masks,
+                            tabu_count,
+                            &drop_index,
+                            &repaired_forbidden_count
+                        );
+                        verbose_progress_log(
+                            "restart %d repair event %d fallback greedy drop %s: drop_index=%d after_forbidden=%llu elapsed=%.3fs",
+                            job->restart,
+                            current_repair_events,
+                            chose_repair ? "done" : "failed",
+                            drop_index,
+                            (unsigned long long)repaired_forbidden_count,
+                            monotonic_seconds() - fallback_started_at
+                        );
+                    }
+                    if (!chose_repair) {
+                        verbose_progress_log(
+                            "restart %d repair event %d failed: elapsed=%.3fs",
+                            job->restart,
+                            current_repair_events,
+                            monotonic_seconds() - repair_started_at
+                        );
+                        break;
+                    }
+                    uint64_t dropped_mask = current_selected[drop_index];
+                    for (int shift_index = drop_index + 1; shift_index < current_count; shift_index++) {
+                        current_selected[shift_index - 1] = current_selected[shift_index];
+                    }
+                    current_count--;
+                    if (tabu_capacity > 0) {
+                        tabu_masks[tabu_next] = dropped_mask;
+                        tabu_next = (tabu_next + 1) % tabu_capacity;
+                        if (tabu_count < tabu_capacity) {
+                            tabu_count++;
+                        }
+                    }
+                    DenseState rebuilt_state;
+                    if (!rebuild_state_from_selection(
+                        &rebuilt_state,
+                        r,
+                        job->d,
+                        current_selected,
+                        current_count
+                    )) {
+                        free(tabu_masks);
+                        free_scratch_set(&scratch);
+                        free(current_selected);
+                        free_state(&state);
+                        free(candidates);
+                        result->status = -14;
+                        verbose_progress_log("restart %d failed: repair rebuild", job->restart);
+                        return;
+                    }
+                    free_state(&state);
+                    state = rebuilt_state;
+                    current_forbidden_count = repaired_forbidden_count;
+                    current_repair_events++;
+                    result->repair_events++;
+                    repaired = 1;
+                    verbose_progress_log(
+                        "restart %d repair event %d done: dropped_index=%d dropped_mask=%llu columns=%d forbidden=%llu repair_dynamic_evals=%llu elapsed=%.3fs",
+                        job->restart,
+                        current_repair_events - 1,
+                        drop_index,
+                        (unsigned long long)dropped_mask,
+                        current_count,
+                        (unsigned long long)current_forbidden_count,
+                        (unsigned long long)repair_dynamic_evaluations,
+                        monotonic_seconds() - repair_started_at
+                    );
+                }
+                if (!repaired) {
+                    verbose_progress_log(
+                        "restart %d step %d stop: repair did not recover",
+                        job->restart,
+                        current_count
+                    );
+                    break;
+                }
+                continue;
+            }
+
+            verbose_progress_log(
+                "restart %d step %d candidate chosen: mask=%llu weight=%d dynamic_evals=%llu blocked_delta=%llu scan_and_score=%.3fs",
+                job->restart,
+                current_count,
+                (unsigned long long)mask,
+                popcount64(mask),
+                (unsigned long long)dynamic_evaluations,
+                (unsigned long long)(blocked - blocked_before_step),
+                monotonic_seconds() - step_started_at
+            );
+            double add_started_at = monotonic_seconds();
+            add_column(&state, mask);
+            if (job->estimate_dynamic_growth) {
+                current_forbidden_count += growth;
+            } else {
+                current_forbidden_count = forbidden_count(&state);
+            }
+            current_selected[current_count++] = mask;
+            result->dynamic_evaluations += dynamic_evaluations;
+            verbose_progress_log(
+                "restart %d step %d add done: columns=%d/%d forbidden=%llu growth=%llu add_and_count=%.3fs total_step=%.3fs",
+                job->restart,
+                current_count - 1,
+                current_count,
+                job->k,
+                (unsigned long long)current_forbidden_count,
+                (unsigned long long)growth,
+                monotonic_seconds() - add_started_at,
+                monotonic_seconds() - step_started_at
+            );
+            if (current_count > best_count) {
+                best_count = current_count;
+                best_blocked = blocked;
+                best_forbidden_count = current_forbidden_count;
+                memcpy(result->selected, current_selected, (size_t)current_count * sizeof(uint64_t));
+            }
+        }
+    } else {
+        for (uint64_t i = 0; i < job->candidate_count && current_count < job->k; i++) {
+            uint64_t mask = candidates[i].mask;
+            if (can_add(&state, mask)) {
+                add_column(&state, mask);
+                current_selected[current_count++] = mask;
+            } else {
+                blocked++;
+            }
+        }
+    }
+    result->greedy_scan_seconds += monotonic_seconds() - stage_started_at;
+
+    if (current_count > best_count) {
+        best_count = current_count;
+        best_blocked = blocked;
+        stage_started_at = monotonic_seconds();
+        best_forbidden_count = forbidden_count(&state);
+        result->forbidden_count_seconds += monotonic_seconds() - stage_started_at;
+        memcpy(result->selected, current_selected, (size_t)current_count * sizeof(uint64_t));
+    }
+
+    result->count = best_count;
+    result->blocked = best_blocked;
+    result->forbidden_count = best_forbidden_count;
+    verbose_progress_log(
+        "restart %d done: columns=%d/%d blocked=%llu repair_events=%llu dynamic_evals=%llu greedy_scan=%.3fs forbidden=%llu",
+        job->restart,
+        result->count,
+        job->k,
+        (unsigned long long)result->blocked,
+        (unsigned long long)result->repair_events,
+        (unsigned long long)result->dynamic_evaluations,
+        result->greedy_scan_seconds,
+        (unsigned long long)result->forbidden_count
+    );
+
+    free(tabu_masks);
+    free_scratch_set(&scratch);
+    free(current_selected);
+    free_state(&state);
+    free(candidates);
+}
+
+static void *restart_worker(void *arg) {
+    run_restart_job((RestartJob *)arg);
+    return NULL;
 }
 
 int oe_linear_code_run(
@@ -1608,6 +2342,7 @@ int oe_linear_code_run(
     int error_cap
 ) {
     double c_run_started_at = monotonic_seconds();
+    g_verbose_started_at = c_run_started_at;
     if (metrics_out && metrics_cap > 0) {
         for (int i = 0; i < metrics_cap; i++) {
             metrics_out[i] = 0.0;
@@ -1633,6 +2368,15 @@ int oe_linear_code_run(
     if (restarts <= 0) {
         restarts = 1;
     }
+    verbose_progress_log(
+        "run start: n=%d k=%d d=%d r=%d restarts=%d seed=%llu",
+        n,
+        k,
+        d,
+        r,
+        restarts,
+        (unsigned long long)seed
+    );
 
     uint64_t total_candidate_count = candidate_count_for_instance(r, d);
     uint64_t max_candidates = env_u64("LINEAR_CODE_MAX_CANDIDATES", BASELINE_MAX_CANDIDATES);
@@ -1650,6 +2394,13 @@ int oe_linear_code_run(
         write_error(error_out, error_cap, "empty candidate set");
         return -5;
     }
+    verbose_progress_log(
+        "candidate sizing: total=%llu selected=%llu mode=%s max_candidates=%llu",
+        (unsigned long long)total_candidate_count,
+        (unsigned long long)candidate_count,
+        use_sampled_candidates ? "sampled" : "full",
+        (unsigned long long)max_candidates
+    );
     Candidate *candidates = (Candidate *)calloc((size_t)candidate_count, sizeof(Candidate));
     if (!candidates) {
         write_error(error_out, error_cap, "candidate allocation failed");
@@ -1657,22 +2408,37 @@ int oe_linear_code_run(
     }
 
     double stage_started_at = monotonic_seconds();
+    verbose_progress_log("candidate generation start");
     uint64_t generated_count = use_sampled_candidates
         ? generate_sampled_candidate_masks(candidates, candidate_count, total_candidate_count, r, d, seed)
         : generate_candidate_masks(candidates, r, d);
     metrics_out[METRIC_CANDIDATE_GENERATION_SECONDS] = monotonic_seconds() - stage_started_at;
+    verbose_progress_log(
+        "candidate generation done: generated=%llu seconds=%.3f",
+        (unsigned long long)generated_count,
+        metrics_out[METRIC_CANDIDATE_GENERATION_SECONDS]
+    );
     if (generated_count != candidate_count) {
         free(candidates);
         write_error(error_out, error_cap, "candidate generation count mismatch");
         return -7;
     }
     stage_started_at = monotonic_seconds();
+    verbose_progress_log(
+        "candidate scoring start: candidates=%llu workers=%llu",
+        (unsigned long long)candidate_count,
+        (unsigned long long)env_u64("LINEAR_CODE_CANDIDATE_WORKERS", 0ULL)
+    );
     if (!score_candidates(candidates, candidate_count, n, k, d)) {
         free(candidates);
         write_error(error_out, error_cap, "candidate scoring failed");
         return -8;
     }
     metrics_out[METRIC_CANDIDATE_SCORING_SECONDS] = monotonic_seconds() - stage_started_at;
+    verbose_progress_log(
+        "candidate scoring done: seconds=%.3f",
+        metrics_out[METRIC_CANDIDATE_SCORING_SECONDS]
+    );
 
     uint64_t *best_selected = (uint64_t *)calloc((size_t)k, sizeof(uint64_t));
     if (!best_selected) {
@@ -1715,244 +2481,174 @@ int oe_linear_code_run(
     }
     uint64_t total_dynamic_evaluations = 0;
     uint64_t total_repair_events = 0;
+    uint64_t requested_restart_workers = env_u64("LINEAR_CODE_RESTART_WORKERS", 1ULL);
+    if (requested_restart_workers == 0ULL) {
+        long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+        requested_restart_workers = cpu_count > 1 ? (uint64_t)cpu_count : 1ULL;
+    }
+    if (requested_restart_workers > (uint64_t)restarts) {
+        requested_restart_workers = (uint64_t)restarts;
+    }
+    if (requested_restart_workers > 64ULL) {
+        requested_restart_workers = 64ULL;
+    }
+    uint64_t restart_parallel_candidate_limit = env_u64(
+        "LINEAR_CODE_RESTART_PARALLEL_MAX_CANDIDATES",
+        2000000ULL
+    );
+    if (candidate_count > restart_parallel_candidate_limit) {
+        requested_restart_workers = 1ULL;
+    }
+    verbose_progress_log(
+        "restart scheduling: restarts=%d workers=%llu parallel_candidate_limit=%llu dynamic_workers=%llu mcts_workers=%llu",
+        restarts,
+        (unsigned long long)requested_restart_workers,
+        (unsigned long long)restart_parallel_candidate_limit,
+        (unsigned long long)env_u64("LINEAR_CODE_DYNAMIC_WORKERS", 1ULL),
+        (unsigned long long)env_u64("LINEAR_CODE_REPAIR_MCTS_WORKERS", 1ULL)
+    );
+
+    RestartResult *restart_results = (RestartResult *)calloc((size_t)restarts, sizeof(RestartResult));
+    uint64_t *restart_selected = (uint64_t *)calloc((size_t)restarts * (size_t)k, sizeof(uint64_t));
+    if (!restart_results || !restart_selected) {
+        free(restart_results);
+        free(restart_selected);
+        free(best_selected);
+        free(candidates);
+        write_error(error_out, error_cap, "restart result allocation failed");
+        return -15;
+    }
     for (int restart = 0; restart < restarts; restart++) {
-        for (uint64_t i = 0; i < candidate_count; i++) {
-            candidates[i].tie = deterministic_tiebreak(candidates[i].mask, restart);
-        }
-        stage_started_at = monotonic_seconds();
-        qsort(candidates, (size_t)candidate_count, sizeof(Candidate), compare_candidates_desc);
-        metrics_out[METRIC_RESTART_SORT_SECONDS] += monotonic_seconds() - stage_started_at;
+        restart_results[restart].selected = &restart_selected[(size_t)restart * (size_t)k];
+    }
 
-        stage_started_at = monotonic_seconds();
-        DenseState state;
-        if (!init_state(&state, r, d)) {
-            free(candidates);
+    int next_restart = 0;
+    while (next_restart < restarts && best_count < k) {
+        uint64_t batch_workers = requested_restart_workers;
+        if (batch_workers < 1ULL) {
+            batch_workers = 1ULL;
+        }
+        if (batch_workers > (uint64_t)(restarts - next_restart)) {
+            batch_workers = (uint64_t)(restarts - next_restart);
+        }
+        verbose_progress_log(
+            "restart batch start: first_restart=%d workers=%llu current_best=%d/%d",
+            next_restart,
+            (unsigned long long)batch_workers,
+            best_count,
+            k
+        );
+
+        RestartJob *jobs = (RestartJob *)calloc((size_t)batch_workers, sizeof(RestartJob));
+        pthread_t *threads = NULL;
+        if (batch_workers > 1ULL) {
+            threads = (pthread_t *)calloc((size_t)batch_workers, sizeof(pthread_t));
+        }
+        if (!jobs || (batch_workers > 1ULL && !threads)) {
+            free(jobs);
+            free(threads);
+            free(restart_selected);
+            free(restart_results);
             free(best_selected);
-            write_error(error_out, error_cap, "state allocation failed");
-            return -10;
-        }
-        initialize_systematic_columns(&state, r);
-        metrics_out[METRIC_STATE_INIT_SECONDS] += monotonic_seconds() - stage_started_at;
-        uint64_t current_forbidden_count = forbidden_count(&state);
-        uint64_t *current_selected = (uint64_t *)calloc((size_t)k, sizeof(uint64_t));
-        if (!current_selected) {
-            free_state(&state);
             free(candidates);
-            free(best_selected);
-            write_error(error_out, error_cap, "selection allocation failed");
-            return -11;
+            write_error(error_out, error_cap, "restart worker allocation failed");
+            return -16;
         }
-        ScratchSet scratch;
-        memset(&scratch, 0, sizeof(scratch));
-        if (dynamic_window > 0 && estimate_dynamic_growth) {
-            uint64_t scratch_touched_cap = env_u64("LINEAR_CODE_GROWTH_SCRATCH_TOUCHED_CAP", 1048576ULL);
-            if (!init_scratch_set(&scratch, state.word_count, scratch_touched_cap)) {
-                free(current_selected);
-                free_state(&state);
-                free(candidates);
+
+        uint64_t created = 0;
+        for (uint64_t worker = 0; worker < batch_workers; worker++) {
+            int restart = next_restart + (int)worker;
+            RestartJob *job = &jobs[worker];
+            job->base_candidates = candidates;
+            job->candidate_count = candidate_count;
+            job->n = n;
+            job->k = k;
+            job->d = d;
+            job->restart = restart;
+            job->seed = seed;
+            job->dynamic_window = dynamic_window;
+            job->repair_max_events = repair_max_events;
+            job->repair_drop_count = repair_drop_count;
+            job->repair_candidate_window = repair_candidate_window;
+            job->repair_tabu_tenure = repair_tabu_tenure;
+            job->repair_mcts_enabled = repair_mcts_enabled;
+            job->repair_mcts_simulations = repair_mcts_simulations;
+            job->repair_mcts_depth = repair_mcts_depth;
+            job->repair_mcts_drop_topk = repair_mcts_drop_topk;
+            job->estimate_dynamic_growth = estimate_dynamic_growth;
+            job->result = &restart_results[restart];
+            if (batch_workers <= 1ULL) {
+                run_restart_job(job);
+                created++;
+            } else if (pthread_create(&threads[worker], NULL, restart_worker, job) == 0) {
+                created++;
+            } else {
+                for (uint64_t join_index = 0; join_index < created; join_index++) {
+                    pthread_join(threads[join_index], NULL);
+                }
+                free(jobs);
+                free(threads);
+                free(restart_selected);
+                free(restart_results);
                 free(best_selected);
-                write_error(error_out, error_cap, "dynamic scratch allocation failed");
-                return -12;
-            }
-        }
-        uint64_t *tabu_masks = NULL;
-        int tabu_count = 0;
-        int tabu_next = 0;
-        int tabu_capacity = (int)repair_tabu_cap_u64;
-        if (dynamic_window > 0 && repair_max_events > 0 && tabu_capacity > 0) {
-            tabu_masks = (uint64_t *)calloc((size_t)tabu_capacity, sizeof(uint64_t));
-            if (!tabu_masks) {
-                free_scratch_set(&scratch);
-                free(current_selected);
-                free_state(&state);
                 free(candidates);
-                free(best_selected);
-                write_error(error_out, error_cap, "repair tabu allocation failed");
-                return -13;
+                write_error(error_out, error_cap, "restart worker creation failed");
+                return -17;
             }
         }
 
-        int current_count = 0;
-        int current_repair_events = 0;
-        uint64_t blocked = 0;
-        stage_started_at = monotonic_seconds();
-        if (dynamic_window > 0) {
-            while (current_count < k) {
-                uint64_t mask = 0;
-                uint64_t growth = 0;
-                uint64_t dynamic_evaluations = 0;
-                if (!choose_dynamic_candidate(
-                    candidates,
-                    candidate_count,
-                    &state,
-                    n,
-                    k,
-                    d,
-                    current_count,
-                    restart,
-                    current_forbidden_count,
-                    dynamic_window,
-                    tabu_masks,
-                    tabu_count,
-                    &scratch,
-                    estimate_dynamic_growth,
-                    &mask,
-                    &growth,
-                    &blocked,
-                    &dynamic_evaluations
-                )) {
-                    int repaired = 0;
-                    if (
-                        repair_max_events == 0
-                        || (uint64_t)current_repair_events >= repair_max_events
-                        || current_count <= 0
-                    ) {
-                        break;
-                    }
-                    for (
-                        uint64_t drop_event = 0;
-                        drop_event < repair_drop_count
-                            && (uint64_t)current_repair_events < repair_max_events
-                            && current_count > 0;
-                        drop_event++
-                    ) {
-                        int drop_index = -1;
-                        uint64_t repaired_forbidden_count = 0;
-                        uint64_t repair_dynamic_evaluations = 0;
-                        int chose_repair = 0;
-                        if (repair_mcts_enabled) {
-                            chose_repair = choose_repair_drop_index_mcts(
-                                candidates,
-                                candidate_count,
-                                current_selected,
-                                current_count,
-                                n,
-                                k,
-                                d,
-                                restart,
-                                current_repair_events,
-                                seed,
-                                dynamic_window,
-                                repair_mcts_depth,
-                                repair_mcts_simulations,
-                                repair_mcts_drop_topk,
-                                tabu_masks,
-                                tabu_count,
-                                estimate_dynamic_growth,
-                                &drop_index,
-                                &repaired_forbidden_count,
-                                &repair_dynamic_evaluations
-                            );
-                            total_dynamic_evaluations += repair_dynamic_evaluations;
-                        }
-                        if (!chose_repair) {
-                            chose_repair = choose_repair_drop_index(
-                                candidates,
-                                candidate_count,
-                                current_selected,
-                                current_count,
-                                r,
-                                d,
-                                restart,
-                                current_repair_events,
-                                current_forbidden_count,
-                                repair_candidate_window,
-                                tabu_masks,
-                                tabu_count,
-                                &drop_index,
-                                &repaired_forbidden_count
-                            );
-                        }
-                        if (!chose_repair) {
-                            break;
-                        }
-                        uint64_t dropped_mask = current_selected[drop_index];
-                        for (int shift_index = drop_index + 1; shift_index < current_count; shift_index++) {
-                            current_selected[shift_index - 1] = current_selected[shift_index];
-                        }
-                        current_count--;
-                        if (tabu_capacity > 0) {
-                            tabu_masks[tabu_next] = dropped_mask;
-                            tabu_next = (tabu_next + 1) % tabu_capacity;
-                            if (tabu_count < tabu_capacity) {
-                                tabu_count++;
-                            }
-                        }
-                        DenseState rebuilt_state;
-                        if (!rebuild_state_from_selection(
-                            &rebuilt_state,
-                            r,
-                            d,
-                            current_selected,
-                            current_count
-                        )) {
-                            free(tabu_masks);
-                            free_scratch_set(&scratch);
-                            free(current_selected);
-                            free_state(&state);
-                            free(candidates);
-                            free(best_selected);
-                            write_error(error_out, error_cap, "repair rebuild failed");
-                            return -14;
-                        }
-                        free_state(&state);
-                        state = rebuilt_state;
-                        current_forbidden_count = repaired_forbidden_count;
-                        current_repair_events++;
-                        total_repair_events++;
-                        repaired = 1;
-                    }
-                    if (!repaired) {
-                        break;
-                    }
-                    continue;
-                }
-                add_column(&state, mask);
-                if (estimate_dynamic_growth) {
-                    current_forbidden_count += growth;
-                } else {
-                    current_forbidden_count = forbidden_count(&state);
-                }
-                current_selected[current_count++] = mask;
-                total_dynamic_evaluations += dynamic_evaluations;
-                if (current_count > best_count) {
-                    best_count = current_count;
-                    best_restart = restart;
-                    best_blocked = blocked;
-                    best_forbidden_count = current_forbidden_count;
-                    memcpy(best_selected, current_selected, (size_t)current_count * sizeof(uint64_t));
-                }
-            }
-        } else {
-            for (uint64_t i = 0; i < candidate_count && current_count < k; i++) {
-                uint64_t mask = candidates[i].mask;
-                if (can_add(&state, mask)) {
-                    add_column(&state, mask);
-                    current_selected[current_count++] = mask;
-                } else {
-                    blocked++;
-                }
+        if (batch_workers > 1ULL) {
+            for (uint64_t worker = 0; worker < created; worker++) {
+                pthread_join(threads[worker], NULL);
             }
         }
-        metrics_out[METRIC_GREEDY_SCAN_SECONDS] += monotonic_seconds() - stage_started_at;
 
-        if (current_count > best_count) {
-            best_count = current_count;
-            best_restart = restart;
-            best_blocked = blocked;
-            stage_started_at = monotonic_seconds();
-            best_forbidden_count = forbidden_count(&state);
-            metrics_out[METRIC_FORBIDDEN_COUNT_SECONDS] += monotonic_seconds() - stage_started_at;
-            memcpy(best_selected, current_selected, (size_t)current_count * sizeof(uint64_t));
+        for (uint64_t worker = 0; worker < created; worker++) {
+            int restart = next_restart + (int)worker;
+            RestartResult *result = &restart_results[restart];
+            if (result->status != 0) {
+                free(jobs);
+                free(threads);
+                free(restart_selected);
+                free(restart_results);
+                free(best_selected);
+                free(candidates);
+                write_error(error_out, error_cap, "restart worker failed");
+                return result->status;
+            }
+            metrics_out[METRIC_RESTART_SORT_SECONDS] += result->restart_sort_seconds;
+            metrics_out[METRIC_STATE_INIT_SECONDS] += result->state_init_seconds;
+            metrics_out[METRIC_GREEDY_SCAN_SECONDS] += result->greedy_scan_seconds;
+            metrics_out[METRIC_FORBIDDEN_COUNT_SECONDS] += result->forbidden_count_seconds;
+            total_dynamic_evaluations += result->dynamic_evaluations;
+            total_repair_events += result->repair_events;
+            if (result->count > best_count) {
+                best_count = result->count;
+                best_restart = result->restart;
+                best_blocked = result->blocked;
+                best_forbidden_count = result->forbidden_count;
+                memcpy(best_selected, result->selected, (size_t)result->count * sizeof(uint64_t));
+            }
         }
-        free(tabu_masks);
-        free_scratch_set(&scratch);
-        free(current_selected);
-        free_state(&state);
-        if (best_count == k) {
+        verbose_progress_log(
+            "restart batch done: first_restart=%d completed=%llu best=%d/%d best_restart=%d",
+            next_restart,
+            (unsigned long long)created,
+            best_count,
+            k,
+            best_restart
+        );
+
+        next_restart += (int)created;
+        free(jobs);
+        free(threads);
+        if (created == 0) {
             break;
         }
     }
+
+    free(restart_selected);
+    free(restart_results);
 
     for (int i = 0; i < best_count; i++) {
         selected_out[i] = best_selected[i];
@@ -1967,6 +2663,20 @@ int oe_linear_code_run(
     metrics_out[METRIC_BLOCKED_CANDIDATES] = (double)best_blocked;
     metrics_out[METRIC_FORBIDDEN_COUNT] = (double)best_forbidden_count;
     metrics_out[METRIC_C_RUN_SECONDS] = monotonic_seconds() - c_run_started_at;
+    verbose_progress_log(
+        "run done: success=%d best=%d/%d best_restart=%d candidate_gen=%.3f candidate_score=%.3f restart_sort=%.3f state_init=%.3f greedy_scan=%.3f forbidden_count=%.3f c_total=%.3f",
+        best_count == k ? 1 : 0,
+        best_count,
+        k,
+        best_restart,
+        metrics_out[METRIC_CANDIDATE_GENERATION_SECONDS],
+        metrics_out[METRIC_CANDIDATE_SCORING_SECONDS],
+        metrics_out[METRIC_RESTART_SORT_SECONDS],
+        metrics_out[METRIC_STATE_INIT_SECONDS],
+        metrics_out[METRIC_GREEDY_SCAN_SECONDS],
+        metrics_out[METRIC_FORBIDDEN_COUNT_SECONDS],
+        metrics_out[METRIC_C_RUN_SECONDS]
+    );
 
     free(best_selected);
     free(candidates);

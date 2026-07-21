@@ -262,6 +262,36 @@ class OpenEvolve:
         with open(self.initial_program_path, "r") as f:
             return f.read()
 
+    def _initial_stop_reason(
+        self, metrics: Dict[str, Any], target_score: Optional[float]
+    ) -> Optional[str]:
+        """Return a human-readable reason if the initial program already satisfies a stop target."""
+        combined_score = metrics.get("combined_score")
+        if (
+            target_score is not None
+            and isinstance(combined_score, (int, float))
+            and not isinstance(combined_score, bool)
+            and combined_score >= target_score
+        ):
+            return f"combined_score={combined_score:.4f} >= target_score={target_score:.4f}"
+
+        if (
+            self.config.early_stopping_patience is None
+            or self.config.early_stopping_patience >= 0
+        ):
+            return None
+
+        metric_name = self.config.early_stopping_metric
+        metric_value = metrics.get(metric_name)
+        if not isinstance(metric_value, (int, float)) or isinstance(metric_value, bool):
+            return None
+        if metric_value >= self.config.convergence_threshold:
+            return (
+                f"{metric_name}={metric_value:.4f} >= "
+                f"convergence_threshold={self.config.convergence_threshold:.4f}"
+            )
+        return None
+
     async def run(
         self,
         iterations: Optional[int] = None,
@@ -279,7 +309,7 @@ class OpenEvolve:
         Returns:
             Best program found
         """
-        max_iterations = iterations or self.config.max_iterations
+        max_iterations = self.config.max_iterations if iterations is None else iterations
 
         # Determine starting iteration
         start_iteration = 0
@@ -338,11 +368,30 @@ class OpenEvolve:
                         f"For better evolution results, please modify your evaluator to return a 'combined_score' "
                         f"metric that properly weights different aspects of program performance."
                     )
+
+            initial_stop_reason = self._initial_stop_reason(initial_metrics, target_score)
+            if initial_stop_reason:
+                logger.info(
+                    f"Initial program already reached the target ({initial_stop_reason}); "
+                    "skipping evolution."
+                )
+                self._save_best_program(initial_program)
+                return initial_program
         else:
             logger.info(
                 f"Skipping initial program addition (resuming from iteration {start_iteration} "
                 f"with {len(self.database.programs)} existing programs)"
             )
+
+        if max_iterations <= 0:
+            best_program = self.database.get_best_program()
+            if best_program:
+                logger.info(
+                    f"No evolution iterations requested. Best program has metrics: "
+                    f"{format_metrics_safe(best_program.metrics)}"
+                )
+                self._save_best_program(best_program)
+            return best_program
 
         # Initialize improved parallel processing
         try:
