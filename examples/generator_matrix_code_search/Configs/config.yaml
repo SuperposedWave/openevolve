@@ -1,0 +1,134 @@
+# Configuration for evolving the Python priority function for generator-matrix
+# binary linear-code construction.
+#
+# Example:
+#   GEN_MATRIX_CODE_N=20 GEN_MATRIX_CODE_K=10 GEN_MATRIX_CODE_D=5 \
+#   openevolve-run examples/generator_matrix_code_search/initial_program.py \
+#   examples/generator_matrix_code_search/evaluator.py \
+#   --config examples/generator_matrix_code_search/Configs/config.yaml
+
+max_iterations: 120
+checkpoint_interval: 10
+log_level: "INFO"
+random_seed: 123
+
+language: "python"
+file_suffix: ".py"
+diff_based_evolution: true
+max_code_length: 20000
+
+llm_config_path: "llm_config.yaml"
+
+prompt:
+  system_message: |
+    Current target:
+    - n = 20
+    - k = 10
+    - d = 5
+    - r = n - k = 10
+
+    You are improving a deterministic Python scoring function for binary
+    linear-code construction from the generator matrix
+
+      G = [I_k | p_1 p_2 ... p_r].
+
+    The fixed evaluator keeps message deficits for every non-zero message m
+    with wt(m) < d:
+
+      deficit[m] = d - wt(m) - parity_hits(m)
+
+    A candidate parity column p covers m when dot(m,p)=1. The fixed skeleton
+    computes coverage features, ranks candidate columns, updates deficits, and
+    verifies the exact minimum distance from G. Your code only scores one
+    candidate parity column.
+
+    The fixed skeleton also applies a hard feasibility check. After accepting a
+    column, if a message would still need more future covers than there are
+    remaining parity columns, that candidate is rejected before priority() is
+    used. In other words, priority() ranks feasible candidates; it does not need
+    to rescue candidates that already make the target impossible.
+
+    Your file provides this function:
+
+      priority(
+          column_mask,
+          n,
+          k,
+          d,
+          step,
+          column_weight,
+          covered_deficit_sum,
+          covered_critical_count,
+          uncovered_critical_count,
+          feasible_next_count,
+          min_row_weight_after,
+          max_row_weight_after,
+          avg_pair_balance_after,
+      )
+
+    Dynamic arguments:
+    - step: number of parity columns already selected
+    - column_weight: Hamming weight of this k-bit parity column
+    - covered_deficit_sum: total currently positive deficit covered by this column
+    - covered_critical_count: urgent messages covered by this column
+    - uncovered_critical_count: urgent messages not covered by this column
+    - feasible_next_count: estimated number of next-step columns that would
+      satisfy the next hard feasibility constraints after accepting this column
+    - min_row_weight_after / max_row_weight_after: row parity weights if accepted
+    - avg_pair_balance_after: mean absolute row-weight imbalance if accepted
+
+    You may change only the code inside:
+
+      # EVOLVE-BLOCK-START
+      ...
+      # EVOLVE-BLOCK-END
+
+    Hard rules:
+    - keep a callable priority() function
+    - do not change code outside the EVOLVE-BLOCK
+    - do not read or write files
+    - do not start processes
+    - do not use networking
+    - do not rely on stdout or stdin
+    - keep scoring deterministic and side-effect free
+    - use only function arguments and local arithmetic
+    - return a finite numeric score
+
+    Useful heuristic ideas:
+    - cover high total deficit, but avoid starving urgent messages
+    - strongly punish uncovered_critical_count late in the fill
+    - prefer candidates with larger feasible_next_count when coverage is similar
+    - prefer column weights near k/2 unless a repair-like late phase needs bias
+    - keep row weights balanced across message coordinates
+    - avoid coarse bucket scores; return fine-grained deterministic scores
+    - use column_mask-derived deterministic tie breakers for diversity
+  num_top_programs: 5
+  num_diverse_programs: 3
+  include_artifacts: false
+  max_artifact_bytes: 12000
+
+database:
+  population_size: 36
+  archive_size: 12
+  num_islands: 6
+  elite_selection_ratio: 0.2
+  exploration_ratio: 0.45
+  exploitation_ratio: 0.35
+  feature_dimensions: ["constructed_columns", "coverage_progress"]
+  feature_bins: 6
+  migration_interval: 4
+  migration_rate: 0.25
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 900
+  max_retries: 1
+  cascade_evaluation: false
+  parallel_evaluations: 2
+  use_llm_feedback: false
+  enable_artifacts: true
+
+early_stopping_patience: -1
+convergence_threshold: 1.0
+early_stopping_metric: "combined_score"
+early_stopping_shutdown_mode: "terminate"
