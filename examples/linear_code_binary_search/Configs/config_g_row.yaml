@@ -1,0 +1,134 @@
+# Configuration for evolving a Python legal-row ranker for G=[I_k|P] search.
+# Example:
+#   LINEAR_CODE_N=50 LINEAR_CODE_K=20 LINEAR_CODE_D=12 \
+#   LINEAR_CODE_G_ROW_RESTARTS=8 \
+#   LINEAR_CODE_G_ROW_MAX_ATTEMPTS_PER_STEP=50000 \
+#   LINEAR_CODE_G_ROW_LEGAL_POOL_TARGET=8 \
+#   LINEAR_CODE_G_ROW_REPAIR_EVENTS=8 \
+#   LINEAR_CODE_G_ROW_REPAIR_DROP_COUNT=2 \
+#   python ../../openevolve-run.py initial_program_g_row.py evaluator_g_row.py \
+#     --config Configs/config_g_row.yaml --iterations 40
+
+max_iterations: 80
+checkpoint_interval: 10
+log_level: "INFO"
+random_seed: 123
+
+language: "python"
+file_suffix: ".py"
+diff_based_evolution: true
+max_code_length: 20000
+
+llm_config_path: "llm_config_Boyue.yaml"
+
+prompt:
+  system_message: |
+    Current target:
+    - n = 50
+    - k = 20
+    - d = 12
+    - r = n - k = 30
+
+    You are improving a deterministic Python scoring function for binary
+    linear-code construction from the systematic generator-matrix view:
+
+      G = [I_k | P]
+
+    The fixed evaluator adds rows of P one at a time.  For every existing
+    selected-row subset xor a of size s, a candidate row x is accepted only if:
+
+      (s + 1) + wt(a ^ x) >= d
+
+    This hard legality check is exact and is handled by the evaluator.  Your
+    priority() function only ranks candidate rows that already passed legality.
+
+    Your file provides:
+
+      priority(
+          row_mask,
+          n,
+          k,
+          d,
+          step,
+          row_weight,
+          min_margin,
+          near_margin_count,
+          checked_constraints,
+          legal_seen,
+          attempts,
+          selected_count,
+          total_layer_count,
+          max_layer_count,
+          restart,
+      )
+
+    Argument meanings:
+    - row_mask: r-bit candidate row x for P
+    - step / selected_count: number of P rows already selected
+    - row_weight: Hamming weight of row_mask
+    - min_margin: minimum value of wt(a ^ x) - (d - (s + 1)) across checks
+    - near_margin_count: number of constraints whose margin is near the boundary
+    - checked_constraints: number of subset-xor constraints tested for this row
+    - legal_seen: how many legal candidates have been seen in the current pool
+    - attempts: random candidate attempts used so far at this step
+    - total_layer_count / max_layer_count: sizes of the subset-xor state
+    - restart: restart index
+
+    If the fill gets stuck, the fixed evaluator may run a lightweight repair:
+    it drops a few selected rows, rebuilds the exact subset-xor layers, keeps
+    dropped rows tabu for a short tenure, and continues filling.  Your priority
+    still only ranks rows that have already passed the hard legality check.
+
+    You may change only code inside:
+
+      # EVOLVE-BLOCK-START
+      ...
+      # EVOLVE-BLOCK-END
+
+    Hard rules:
+    - keep priority() and get_priority_function()
+    - do not change code outside the EVOLVE-BLOCK
+    - do not import packages inside the EVOLVE-BLOCK
+    - do not read or write files
+    - do not start processes
+    - do not use networking
+    - do not rely on stdout or stdin
+    - keep scoring deterministic and side-effect free
+    - return a finite float
+
+    Useful heuristic ideas:
+    - avoid rows that barely satisfy too many constraints late in the fill
+    - keep enough randomness/novelty so the construction does not become too rigid
+    - balance row weight around r/2 or around d-1 depending on fill phase
+    - late steps may need to prefer scarcity-adapted rows rather than maximum margin
+    - avoid coarse bucket scores; include deterministic row_mask-based tie breaking
+  num_top_programs: 5
+  num_diverse_programs: 3
+  include_artifacts: false
+  max_artifact_bytes: 10240
+
+database:
+  population_size: 32
+  archive_size: 12
+  num_islands: 8
+  elite_selection_ratio: 0.2
+  exploration_ratio: 0.45
+  exploitation_ratio: 0.35
+  feature_dimensions: ["row_progress", "constructed_rows"]
+  feature_bins: 6
+  migration_interval: 4
+  migration_rate: 0.25
+  similarity_threshold: 0.99
+
+evaluator:
+  timeout: 180
+  max_retries: 1
+  cascade_evaluation: false
+  parallel_evaluations: 4
+  use_llm_feedback: false
+  enable_artifacts: true
+
+early_stopping_patience: -1
+convergence_threshold: 1.0
+early_stopping_metric: "combined_score"
+early_stopping_shutdown_mode: "terminate"

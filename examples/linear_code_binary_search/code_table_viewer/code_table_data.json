@@ -477473,6 +477473,29 @@
         },
         {
           "actualDistance": 13,
+          "generation": 2,
+          "iteration": 10,
+          "metrics": {
+            "combined_score": 0.752,
+            "constructed_rows": 15.0,
+            "dropped_rows": 16.0,
+            "evaluation_time_seconds": 28.962299697101116,
+            "exact_minimum_distance": 13.0,
+            "exact_violation_count": 0.0,
+            "repair_events": 8.0,
+            "row_progress": 0.75,
+            "success_rate": 0.0,
+            "target_rows": 20.0,
+            "total_attempts": 974488.0
+          },
+          "sourceRoot": "outputs",
+          "sourceRun": "n50_k20_d13/g_row_20260721T175609Z",
+          "status": "partial",
+          "targetDistance": 13,
+          "timestamp": 1784657882.277152
+        },
+        {
+          "actualDistance": 13,
           "generation": 0,
           "iteration": 0,
           "metrics": {
@@ -489607,7 +489630,7 @@
       "unsearched": 30262,
       "upper_failed_after_found": 38
     },
-    "generatedAt": "2026-07-20T01:01:26.896246+00:00",
+    "generatedAt": "2026-07-22T05:47:33.484433+00:00",
     "recordName": "ECCRecord.json",
     "scannedRootNames": [
       "batch_runs",
@@ -489621,7 +489644,7 @@
       "outputs"
     ],
     "sqlite": {
-      "attempts": 1266,
+      "attempts": 1267,
       "bounds": 32896
     },
     "totalCells": 32896

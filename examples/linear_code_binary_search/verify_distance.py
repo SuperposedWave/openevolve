@@ -9,7 +9,8 @@ import os
 from pathlib import Path
 
 from evaluator import evaluate
-from search_core import actual_minimum_distance, instance_from_env, make_instance
+from fast_p_evaluator import evaluate_parity_rows_gray
+from search_core import instance_from_env, make_instance
 
 
 @contextmanager
@@ -24,6 +25,46 @@ def patched_env(updates: dict[str, str]):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+def _env_int(name: str, default: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        return max(int(raw_value), 1)
+    except ValueError:
+        return default
+
+
+def _load_or_run_g_verification(
+    artifacts: dict[str, str],
+    selected: tuple[int, ...],
+    r: int,
+    d: int,
+) -> dict[str, object]:
+    saved = json.loads(artifacts.get("g_verification", "{}"))
+    if saved.get("verified"):
+        return saved
+    max_k = _env_int("LINEAR_CODE_G_VERIFY_MAX_K", 24)
+    if not selected:
+        return {"verified": False, "reason": "empty_selection", "max_k": max_k}
+    if len(selected) > max_k:
+        return {
+            "verified": False,
+            "reason": "dimension_above_g_verify_max_k",
+            "row_count": len(selected),
+            "max_k": max_k,
+        }
+    exact = evaluate_parity_rows_gray(selected, r=r, target_distance=d)
+    return {
+        "verified": True,
+        "success": exact.success,
+        "minimum_distance": exact.minimum_distance,
+        "violation_count": exact.violation_count,
+        "minimum_margin": exact.minimum_margin,
+        "evaluated_messages": exact.evaluated_messages,
+    }
 
 
 def main() -> None:
@@ -69,7 +110,13 @@ def main() -> None:
     selected_bits = search_result.get("selected_free_columns", [])
     selected = tuple(int(bits, 2) for bits in selected_bits)
     added_free_columns = int(search_result.get("added_free_columns", len(selected)))
-    d_actual = actual_minimum_distance(instance.r, selected)
+    g_verification = _load_or_run_g_verification(
+        result.artifacts,
+        selected,
+        instance.r,
+        instance.target_distance,
+    )
+    d_actual = g_verification.get("minimum_distance")
     matrix_rows = json.loads(result.artifacts.get("parity_check_matrix", "[]"))
     generator_rows = json.loads(result.artifacts.get("generator_matrix", "[]"))
     is_complete = added_free_columns == instance.k
@@ -101,11 +148,23 @@ def main() -> None:
             sort_keys=True,
         ),
     )
-    if is_complete:
+    if g_verification.get("verified") and is_complete:
         print(f"d_actual: {d_actual}")
-    else:
+        print("distance_verifier: G=[I_k|P] Gray-code message enumeration")
+    elif g_verification.get("verified"):
         print(f"d_partial: {d_actual}")
-        print("warning: construction is incomplete, so this distance only applies to the partial column set")
+        print("distance_verifier: G=[I_k|P] Gray-code message enumeration")
+        print("warning: construction is incomplete, so this distance only applies to the partial row set")
+    else:
+        print(
+            "d_actual: skipped"
+            if is_complete
+            else "d_partial: skipped"
+        )
+        print(
+            "warning: G-side verification skipped:",
+            json.dumps(g_verification, sort_keys=True),
+        )
 
     print(f"H shape: {instance.r} x {added_free_columns + instance.r}")
     print("H rows:" if is_complete else "Partial H rows:")

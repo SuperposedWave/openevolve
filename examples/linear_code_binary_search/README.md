@@ -124,6 +124,87 @@ To inspect the baseline without running evolution:
 LINEAR_CODE_N=7 LINEAR_CODE_K=4 LINEAR_CODE_D=3 python verify_distance.py initial_program.c
 ```
 
+To quickly re-evaluate saved `selected_free_columns` as rows of `P` in
+`G=[I_k|P]`, use the Gray-code parity-map evaluator:
+
+```bash
+python fast_p_evaluator.py outputs/n50_k20_d13/.../best/best_program_info.json --pretty
+```
+
+This checks every non-zero message `u` through `wt(u) + wt(uP)` and reports the
+exact minimum distance, violation count, and minimum margin. For partial C-kernel
+constructions it evaluates the filled subcode dimension, i.e. the number of
+saved `selected_free_columns`.
+
+The C-kernel runner now also records this G-side check automatically as the
+`g_verification` artifact whenever the filled dimension is at most
+`LINEAR_CODE_G_VERIFY_MAX_K` (default `24`). For complete constructions in that
+range, success is gated by the G-side exact check.
+
+To keep the C-kernel candidate ordering, repair, and restart machinery but use
+the generator-side incremental legality condition directly, set:
+
+```bash
+LINEAR_CODE_LEGALITY_ENGINE=g_layers
+```
+
+In this mode the kernel maintains subset-xor layers for the selected rows of
+`P` and accepts a candidate row `x` only when every existing subset xor `a` of
+size `s` satisfies `(s + 1) + wt(a ^ x) >= d`. This is equivalent to the
+systematic `H=[P^T|I_r]` forbidden-column condition, but it avoids materializing
+the identity-column forbidden union as the legality source. The reported
+`forbidden_count` is then the subset-xor union size used by this engine, so it is
+best compared only against other `g_layers` runs.
+
+There is also an experimental G-side row-legality search that adds rows of `P`
+one at a time with an exact hard constraint:
+
+```bash
+python g_row_legal_search.py \
+  --n 50 --k 20 --d 12 \
+  --restarts 10 \
+  --max-attempts-per-step 50000 \
+  --legal-pool-target 1 \
+  --no-steps --pretty
+```
+
+For an existing subset xor `a` of size `s`, a new row `x` is accepted only when
+`(s + 1) + wt(a ^ x) >= d`. This gives the generator-matrix row search an
+incremental exact legality check analogous to the C-kernel forbidden-xor layers.
+
+To put that row-legality search inside OpenEvolve, evolve the Python legal-row
+ranker:
+
+```bash
+LINEAR_CODE_N=50 LINEAR_CODE_K=20 LINEAR_CODE_D=12 \
+LINEAR_CODE_RESTARTS=8 \
+LINEAR_CODE_G_ROW_MAX_ATTEMPTS_PER_STEP=50000 \
+LINEAR_CODE_G_ROW_LEGAL_POOL_TARGET=8 \
+LINEAR_CODE_G_ROW_REPAIR_EVENTS=8 \
+LINEAR_CODE_G_ROW_REPAIR_DROP_COUNT=2 \
+python ../../openevolve-run.py \
+  initial_program_g_row.py \
+  evaluator_g_row.py \
+  --config Configs/config_g_row.yaml \
+  --iterations 40
+```
+
+`LINEAR_CODE_G_ROW_LEGAL_POOL_TARGET=1` reproduces the fast randomized
+"first legal row" baseline, but gives the evolved priority no real choice.
+Use a larger pool such as `8` or `16` when you want OpenEvolve to improve row
+ranking.
+When a restart gets stuck, the G-row evaluator can run a lightweight repair by
+dropping selected rows, rebuilding the exact subset-xor state, and continuing.
+Control it with `LINEAR_CODE_G_ROW_REPAIR_EVENTS`,
+`LINEAR_CODE_G_ROW_REPAIR_DROP_COUNT`, `LINEAR_CODE_G_ROW_REPAIR_STRATEGY`
+(`recent`, `random`, or `tight`), and `LINEAR_CODE_G_ROW_REPAIR_TABU_TENURE`.
+
+The same launch is available as a script:
+
+```bash
+examples/linear_code_binary_search/Scripts/run_g_row.sh
+```
+
 Single-run inspection writes the constructed parity-check and generator matrices
 to `matrix_verification.txt` by default. Override the path with
 `LINEAR_CODE_MATRIX_OUTPUT`; exhaustive distance reporting is skipped when the

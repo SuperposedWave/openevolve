@@ -48,9 +48,15 @@ typedef struct {
 
 typedef struct {
     uint64_t **layers;
+    uint64_t **layer_values;
     uint64_t *forbidden_union;
     uint64_t *layer_counts;
+    uint64_t *layer_value_caps;
     int max_subset_size;
+    int r;
+    int d;
+    int g_layer_legality;
+    int sparse_layers_valid;
     uint64_t value_count;
     uint64_t word_count;
 } DenseState;
@@ -375,6 +381,11 @@ static int env_equals(const char *name, const char *expected_value) {
     return raw_value && strcmp(raw_value, expected_value) == 0;
 }
 
+static int use_g_layer_legality(void) {
+    return env_equals("LINEAR_CODE_LEGALITY_ENGINE", "g_layers")
+        || env_equals("LINEAR_CODE_LEGALITY_ENGINE", "g");
+}
+
 static uint64_t mix64(uint64_t value) {
     value ^= value >> 30;
     value *= 0xbf58476d1ce4e5b9ULL;
@@ -399,15 +410,53 @@ static void free_state(DenseState *state) {
         }
         free(state->layers);
     }
+    if (state->layer_values) {
+        for (int i = 0; i <= state->max_subset_size; i++) {
+            free(state->layer_values[i]);
+        }
+        free(state->layer_values);
+    }
     free(state->forbidden_union);
     free(state->layer_counts);
+    free(state->layer_value_caps);
     state->layers = NULL;
+    state->layer_values = NULL;
     state->forbidden_union = NULL;
     state->layer_counts = NULL;
+    state->layer_value_caps = NULL;
+}
+
+static void append_sparse_layer_value(DenseState *state, int subset_size, uint64_t value) {
+    if (!state->g_layer_legality || !state->sparse_layers_valid) {
+        return;
+    }
+    uint64_t index = state->layer_counts[subset_size];
+    if (index >= state->layer_value_caps[subset_size]) {
+        uint64_t old_cap = state->layer_value_caps[subset_size];
+        uint64_t new_cap = old_cap > 0ULL ? old_cap * 2ULL : 16ULL;
+        while (new_cap <= index) {
+            new_cap *= 2ULL;
+        }
+        uint64_t *new_values = (uint64_t *)realloc(
+            state->layer_values[subset_size],
+            (size_t)new_cap * sizeof(uint64_t)
+        );
+        if (!new_values) {
+            state->sparse_layers_valid = 0;
+            return;
+        }
+        state->layer_values[subset_size] = new_values;
+        state->layer_value_caps[subset_size] = new_cap;
+    }
+    state->layer_values[subset_size][index] = value;
 }
 
 static int init_state(DenseState *state, int r, int d) {
     memset(state, 0, sizeof(*state));
+    state->r = r;
+    state->d = d;
+    state->g_layer_legality = use_g_layer_legality();
+    state->sparse_layers_valid = state->g_layer_legality;
     state->max_subset_size = d - 2;
     if (state->max_subset_size < 0) {
         state->max_subset_size = 0;
@@ -428,6 +477,14 @@ static int init_state(DenseState *state, int r, int d) {
         free_state(state);
         return 0;
     }
+    if (state->g_layer_legality) {
+        state->layer_values = (uint64_t **)calloc((size_t)state->max_subset_size + 1U, sizeof(uint64_t *));
+        state->layer_value_caps = (uint64_t *)calloc((size_t)state->max_subset_size + 1U, sizeof(uint64_t));
+        if (!state->layer_values || !state->layer_value_caps) {
+            free_state(state);
+            return 0;
+        }
+    }
     for (int i = 0; i <= state->max_subset_size; i++) {
         state->layers[i] = (uint64_t *)calloc((size_t)state->word_count, sizeof(uint64_t));
         if (!state->layers[i]) {
@@ -437,11 +494,28 @@ static int init_state(DenseState *state, int r, int d) {
     }
     set_bit(state->layers[0], 0);
     set_bit(state->forbidden_union, 0);
+    append_sparse_layer_value(state, 0, 0);
     state->layer_counts[0] = 1;
     return 1;
 }
 
 static void add_column(DenseState *state, uint64_t column_mask) {
+    if (state->g_layer_legality && state->sparse_layers_valid) {
+        for (int subset_size = state->max_subset_size; subset_size >= 1; subset_size--) {
+            uint64_t source_count = state->layer_counts[subset_size - 1];
+            uint64_t *previous_values = state->layer_values[subset_size - 1];
+            uint64_t *target = state->layers[subset_size];
+            for (uint64_t index = 0; index < source_count; index++) {
+                uint64_t new_value = previous_values[index] ^ column_mask;
+                if (set_bit_if_new(target, new_value)) {
+                    append_sparse_layer_value(state, subset_size, new_value);
+                    state->layer_counts[subset_size]++;
+                }
+                set_bit(state->forbidden_union, new_value);
+            }
+        }
+        return;
+    }
     for (int subset_size = state->max_subset_size; subset_size >= 1; subset_size--) {
         uint64_t *previous = state->layers[subset_size - 1];
         uint64_t *target = state->layers[subset_size];
@@ -471,6 +545,52 @@ static void add_column(DenseState *state, uint64_t column_mask) {
 }
 
 static int can_add(DenseState *state, uint64_t column_mask) {
+    if (state->g_layer_legality) {
+        if (state->sparse_layers_valid) {
+            for (int subset_size = 0; subset_size <= state->max_subset_size; subset_size++) {
+                int threshold = state->d - (subset_size + 1);
+                if (threshold <= 0) {
+                    continue;
+                }
+                uint64_t count = state->layer_counts[subset_size];
+                uint64_t *values = state->layer_values[subset_size];
+                for (uint64_t index = 0; index < count; index++) {
+                    if (popcount64(values[index] ^ column_mask) < threshold) {
+                        return 0;
+                    }
+                }
+            }
+            return 1;
+        }
+        for (int subset_size = 0; subset_size <= state->max_subset_size; subset_size++) {
+            int threshold = state->d - (subset_size + 1);
+            if (threshold <= 0) {
+                continue;
+            }
+            uint64_t *layer = state->layers[subset_size];
+            for (uint64_t word_index = 0; word_index < state->word_count; word_index++) {
+                uint64_t bits = layer[word_index];
+                while (bits) {
+#if defined(__GNUC__) || defined(__clang__)
+                    int offset = __builtin_ctzll(bits);
+#else
+                    int offset = 0;
+                    uint64_t probe = bits;
+                    while ((probe & 1ULL) == 0) {
+                        probe >>= 1;
+                        offset++;
+                    }
+#endif
+                    uint64_t value = (word_index << 6) + (uint64_t)offset;
+                    if (popcount64(value ^ column_mask) < threshold) {
+                        return 0;
+                    }
+                    bits &= bits - 1ULL;
+                }
+            }
+        }
+        return 1;
+    }
     return !get_bit(state->forbidden_union, column_mask);
 }
 
@@ -571,7 +691,9 @@ static int rebuild_state_from_selection(
     if (!init_state(state, r, d)) {
         return 0;
     }
-    initialize_systematic_columns(state, r);
+    if (!state->g_layer_legality) {
+        initialize_systematic_columns(state, r);
+    }
     for (int i = 0; i < selected_count; i++) {
         add_column(state, selected[i]);
     }
@@ -1169,7 +1291,9 @@ static int choose_repair_drop_index(
         if (!init_state(&trial_state, r, d)) {
             return 0;
         }
-        initialize_systematic_columns(&trial_state, r);
+        if (!trial_state.g_layer_legality) {
+            initialize_systematic_columns(&trial_state, r);
+        }
         for (int i = 0; i < selected_count; i++) {
             if (i != drop_index) {
                 add_column(&trial_state, selected[i]);
@@ -1428,7 +1552,9 @@ static int choose_rollout_drop_index(
         if (!init_state(&trial_state, r, d)) {
             continue;
         }
-        initialize_systematic_columns(&trial_state, r);
+        if (!trial_state.g_layer_legality) {
+            initialize_systematic_columns(&trial_state, r);
+        }
         for (int i = 0; i < selected_count; i++) {
             if (i != drop_index) {
                 add_column(&trial_state, selected[i]);
@@ -1979,7 +2105,9 @@ static void run_restart_job(RestartJob *job) {
         verbose_progress_log("restart %d failed: state allocation", job->restart);
         return;
     }
-    initialize_systematic_columns(&state, r);
+    if (!state.g_layer_legality) {
+        initialize_systematic_columns(&state, r);
+    }
     result->state_init_seconds += monotonic_seconds() - stage_started_at;
     uint64_t current_forbidden_count = forbidden_count(&state);
     verbose_progress_log(

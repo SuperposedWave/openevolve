@@ -34,6 +34,18 @@ class TestLinearCodeBinarySearchUtilities(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.search_core = _load_module("linear_code_search_core", EXAMPLE_DIR / "search_core.py")
+        cls.fast_p_evaluator = _load_module(
+            "linear_code_fast_p_evaluator",
+            EXAMPLE_DIR / "fast_p_evaluator.py",
+        )
+        cls.g_row_legal_search = _load_module(
+            "linear_code_g_row_legal_search",
+            EXAMPLE_DIR / "g_row_legal_search.py",
+        )
+        cls.evaluator_g_row = _load_module(
+            "linear_code_evaluator_g_row",
+            EXAMPLE_DIR / "evaluator_g_row.py",
+        )
         cls.evaluator = _load_module("linear_code_evaluator", EXAMPLE_DIR / "evaluator.py")
         cls.run_batch = _load_module("linear_code_run_batch", EXAMPLE_DIR / "run_batch.py")
         cls.verify_distance = _load_module(
@@ -106,6 +118,83 @@ class TestLinearCodeBinarySearchUtilities(unittest.TestCase):
                 ) % 2
                 self.assertEqual(overlap, 0)
 
+    def test_gray_parity_map_distance_matches_parity_check_validation(self):
+        """Fast P-row evaluation should match the existing H-column distance check."""
+        r = 3
+        free_columns = (0b011, 0b101, 0b110, 0b111)
+        expected = self.search_core.actual_minimum_distance(r, free_columns)
+
+        result = self.fast_p_evaluator.evaluate_parity_rows_gray(
+            free_columns,
+            r=r,
+            target_distance=3,
+        )
+
+        self.assertEqual(result.minimum_distance, expected)
+        self.assertEqual(result.evaluated_messages, (1 << len(free_columns)) - 1)
+        self.assertEqual(result.violation_count, 0)
+        self.assertTrue(result.success)
+
+    def test_fast_p_evaluator_loads_best_program_artifacts(self):
+        """The fast evaluator should consume saved C-kernel selected_free_columns."""
+        payload = {
+            "artifacts": {
+                "search_result": json.dumps(
+                    {
+                        "selected_free_columns": ["011", "101", "110", "111"],
+                    }
+                ),
+                "matrix_summary": json.dumps({"r": 3, "d": 3}),
+            }
+        }
+        with mock.patch("pathlib.Path.read_text", return_value=json.dumps(payload)):
+            selected, r, d = self.fast_p_evaluator.load_selected_free_columns(
+                Path("best_program_info.json")
+            )
+
+        self.assertEqual(selected, ["011", "101", "110", "111"])
+        self.assertEqual(r, 3)
+        self.assertEqual(d, 3)
+
+    def test_g_row_incremental_search_builds_small_code(self):
+        """G-row hard legality should construct a small systematic code exactly."""
+        config = self.g_row_legal_search.RowSearchConfig(
+            n=8,
+            k=4,
+            d=4,
+            restarts=2,
+            max_attempts_per_step=2000,
+            legal_pool_target=1,
+            seed=1,
+        )
+
+        result = self.g_row_legal_search.search_rows(config)
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.rows), 4)
+        self.assertEqual(result.exact_minimum_distance, 4)
+        self.assertEqual(result.exact_violation_count, 0)
+        self.assertTrue(self.search_core.validate_free_columns(4, result.rows, 4))
+
+    def test_g_row_evaluator_runs_python_priority(self):
+        """The G-row evaluator should expose an OpenEvolve-compatible entry point."""
+        env = {
+            "LINEAR_CODE_N": "8",
+            "LINEAR_CODE_K": "4",
+            "LINEAR_CODE_D": "4",
+            "LINEAR_CODE_RESTARTS": "2",
+            "LINEAR_CODE_G_ROW_MAX_ATTEMPTS_PER_STEP": "2000",
+            "LINEAR_CODE_G_ROW_LEGAL_POOL_TARGET": "1",
+            "LINEAR_CODE_RANDOM_SEED": "1",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            result = self.evaluator_g_row.evaluate(str(EXAMPLE_DIR / "initial_program_g_row.py"))
+
+        self.assertEqual(result.metrics["success_rate"], 1.0)
+        search_result = json.loads(result.artifacts["search_result"])
+        selected = tuple(int(bits, 2) for bits in search_result["row_bits"])
+        self.assertTrue(self.search_core.validate_free_columns(4, selected, 4))
+
     def test_evaluator_rejects_python_programs(self):
         """The linear-code evaluator should no longer run Python priority programs."""
         result = self.evaluator.evaluate(str(EXAMPLE_DIR / "missing_python_path.py"))
@@ -176,6 +265,7 @@ class TestLinearCodeBinarySearchUtilities(unittest.TestCase):
                         task,
                         EXAMPLE_DIR / "Configs" / "config_c_kernel.yaml",
                         Path(os.environ.get("TMPDIR", "/tmp")) / "linear_code_test_output",
+                        run_name="test_run",
                         iterations=1,
                         force=True,
                     )

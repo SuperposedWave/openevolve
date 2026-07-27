@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from multiprocessing import get_context
 from pathlib import Path
 from queue import Empty
@@ -32,6 +32,7 @@ except Exception:
     _EVAL_RESULT_SPEC.loader.exec_module(_EVAL_RESULT_MODULE)
     EvaluationResult = _EVAL_RESULT_MODULE.EvaluationResult
 
+from fast_p_evaluator import evaluate_parity_rows_gray
 from search_core import (
     format_mask,
     generator_matrix_rows,
@@ -206,7 +207,17 @@ def evaluate_c_program_path(program_path: str) -> EvaluationResult:
     metrics = call_result.metrics + (0.0,) * max(0, METRIC_COUNT - len(call_result.metrics))
     selected = tuple(int(value) for value in call_result.selected[: instance.k])
     constructed_columns = min(len(selected), instance.k)
-    is_success = call_result.return_code == 0 and constructed_columns == instance.k
+    kernel_success = call_result.return_code == 0 and constructed_columns == instance.k
+    g_verification = _g_side_verification(
+        selected=selected,
+        r=instance.r,
+        d=instance.target_distance,
+        constructed_columns=constructed_columns,
+    )
+    g_verified = bool(g_verification.get("verified", False))
+    is_success = kernel_success and (
+        not g_verified or bool(g_verification.get("success", False))
+    )
     progress = constructed_columns / instance.k
     combined_score = 1.0 if is_success else progress
 
@@ -218,6 +229,8 @@ def evaluate_c_program_path(program_path: str) -> EvaluationResult:
         restarts=instance.restarts,
         selected=selected,
         success=is_success,
+        kernel_success=kernel_success,
+        g_verification=g_verification,
         constructed_columns=constructed_columns,
         metrics=metrics,
         c_return_code=call_result.return_code,
@@ -247,6 +260,9 @@ def evaluate_c_program_path(program_path: str) -> EvaluationResult:
             "target_distance": instance.target_distance,
             "n": instance.n,
             "k": instance.k,
+            "g_verified": float(g_verified),
+            "g_minimum_distance": float(g_verification.get("minimum_distance") or 0),
+            "g_violation_count": float(g_verification.get("violation_count") or 0),
             "evaluation_time_seconds": elapsed_seconds,
         },
         artifacts=artifacts,
@@ -443,6 +459,41 @@ def _call_kernel_worker(
     result_queue.put(payload)
 
 
+def _g_side_verification(
+    *,
+    selected: tuple[int, ...],
+    r: int,
+    d: int,
+    constructed_columns: int,
+) -> dict[str, object]:
+    max_k = _env_int("LINEAR_CODE_G_VERIFY_MAX_K", 24)
+    if constructed_columns <= 0:
+        return {
+            "verified": False,
+            "skipped": True,
+            "reason": "empty_selection",
+            "max_k": max_k,
+        }
+    if constructed_columns > max_k:
+        return {
+            "verified": False,
+            "skipped": True,
+            "reason": "dimension_above_g_verify_max_k",
+            "row_count": constructed_columns,
+            "max_k": max_k,
+        }
+    exact = evaluate_parity_rows_gray(
+        selected[:constructed_columns],
+        r=r,
+        target_distance=d,
+    )
+    payload = asdict(exact)
+    payload["verified"] = True
+    payload["skipped"] = False
+    payload["success"] = exact.success
+    return payload
+
+
 def _success_artifacts(
     *,
     instance_name: str,
@@ -452,6 +503,8 @@ def _success_artifacts(
     restarts: int,
     selected: tuple[int, ...],
     success: bool,
+    kernel_success: bool,
+    g_verification: dict[str, object],
     constructed_columns: int,
     metrics: Sequence[float],
     c_return_code: int,
@@ -466,8 +519,13 @@ def _success_artifacts(
     selected_bits = [format_mask(mask, r) for mask in selected]
     search_result = {
         "success": success,
+        "kernel_success": kernel_success,
+        "g_verified": bool(g_verification.get("verified", False)),
+        "g_success": g_verification.get("success"),
+        "g_minimum_distance": g_verification.get("minimum_distance"),
+        "g_violation_count": g_verification.get("violation_count"),
         "search_mode": "c_kernel",
-        "legality_engine": "c_kernel",
+        "legality_engine": os.environ.get("LINEAR_CODE_LEGALITY_ENGINE", "h_forbidden"),
         "native_r_limit": 0,
         "forbidden_count": int(metrics[METRIC_FORBIDDEN_COUNT]),
         "restart": int(metrics[METRIC_RESTART_INDEX]),
@@ -512,6 +570,9 @@ def _success_artifacts(
     matrix_summary = {
         "form": "H=[P^T|I_r], G=[I_k|P]",
         "complete": constructed_columns == k,
+        "verified_by": "G=[I_k|P] Gray-code message enumeration",
+        "d_actual": g_verification.get("minimum_distance"),
+        "violation_count": g_verification.get("violation_count"),
         "n": n,
         "k": k,
         "d": d,
@@ -528,6 +589,7 @@ def _success_artifacts(
             sort_keys=True,
         ),
         "search_result": json.dumps(search_result, sort_keys=True),
+        "g_verification": json.dumps(g_verification, sort_keys=True),
         "matrix_summary": json.dumps(matrix_summary, sort_keys=True),
         "parity_check_matrix": json.dumps(list(parity_rows)),
         "generator_matrix": json.dumps(list(generator_rows)),
